@@ -34,6 +34,8 @@ isProject: false
 
 # Backtest PoC Infrastructure Implementation Plan
 
+> **Code Style:** All code should be as simple, concise, and intuitive as possible. Prefer clarity over cleverness. Minimize abstractions unless they provide clear value.
+
 ## Architecture Overview
 
 ```mermaid
@@ -190,7 +192,7 @@ class DataCatalog:
 }
 ```
 
-**Initial snapshot creation:** Convert existing `data/*.parquet` and `data/*.pkl` files to the new snapshot format.
+**Initial snapshot creation:** Convert existing `data/*.parquet` and `data/*.pkl` files to the new snapshot format (see [Demo Dataset Preparation](#demo-dataset-preparation) section).
 
 ---
 
@@ -420,9 +422,108 @@ yfinance>=0.2
 
 ## Demo Dataset Preparation
 
-1. Create initial snapshot from existing `data/` files
-2. Include US region (full), optionally add one non-US region (even limited)
-3. Prepare 1-2 real test signals + generate 3 baselines
+### Source Data
+
+Files in `data/` (gitignored):
+
+
+| File                 | Size   | Content          |
+| -------------------- | ------ | ---------------- |
+| `ret.parquet`        | 1.9 GB | Daily returns    |
+| `risk.parquet`       | 2.5 GB | Risk factors     |
+| `descriptor.parquet` | 1.8 GB | Universe flags   |
+| `trading_date.pkl`   | 188 KB | Trading calendar |
+| `signal_sample.pkl`  | 332 MB | Sample signal    |
+
+
+### Create Snapshot from Existing Data
+
+**File:** `poc/data/create_snapshot.py`
+
+```python
+def create_snapshot_from_existing(source_dir='data', snapshot_id=None, output_dir='snapshots'):
+    """Copy data/ files into versioned snapshot with manifest."""
+    source = Path(source_dir)
+    snapshot_id = snapshot_id or f"{datetime.now().strftime('%Y-%m-%d')}-US-v1"
+    snapshot_path = Path(output_dir) / snapshot_id
+    snapshot_path.mkdir(parents=True, exist_ok=True)
+    
+    ret_df = pd.read_parquet(source / 'ret.parquet')
+    risk_df = pd.read_parquet(source / 'risk.parquet')
+    datefile = pd.read_pickle(source / 'trading_date.pkl')
+    
+    ret_df.to_parquet(snapshot_path / 'ret.parquet', index=False)
+    risk_df.to_parquet(snapshot_path / 'risk.parquet', index=False)
+    datefile.to_parquet(snapshot_path / 'trading_date.parquet', index=False)
+    
+    manifest = {
+        'snapshot_id': snapshot_id,
+        'created_at': datetime.now().isoformat(),
+        'files': {
+            'ret': {'rows': len(ret_df), 'securities': ret_df['security_id'].nunique()},
+            'risk': {'rows': len(risk_df)},
+            'trading_date': {'rows': len(datefile)}
+        }
+    }
+    json.dump(manifest, open(snapshot_path / 'manifest.json', 'w'), indent=2)
+    return snapshot_path
+
+
+def create_lightweight_snapshot(source_dir='data', n_securities=100, start_date='2020-01-01'):
+    """Create smaller snapshot filtered by top N securities and date range."""
+    ret_df = pd.read_parquet(Path(source_dir) / 'ret.parquet')
+    ret_df = ret_df[ret_df['date'] >= start_date]
+    
+    top_securities = ret_df.groupby('security_id')['adv'].median().nlargest(n_securities).index
+    ret_df = ret_df[ret_df['security_id'].isin(top_securities)]
+    # ... same pattern for risk_df, datefile
+```
+
+### Baseline Signal Generation
+
+**File:** `poc/baselines/library.py`
+
+```python
+def generate_reversal_signal(catalog: DataCatalog, lookback: int = 5) -> pd.DataFrame:
+    """Short-term reversal: -1 * past N-day return."""
+    ret = catalog.get_retfile().sort_values(['security_id', 'date'])
+    ret['signal'] = -ret.groupby('security_id')['ret'].transform(
+        lambda x: (1 + x).rolling(lookback).apply(lambda y: y.prod() - 1, raw=True)
+    )
+    return ret[['security_id', 'date', 'signal']].rename(columns={'date': 'date_sig'}).dropna()
+
+
+def generate_momentum_signal(catalog: DataCatalog, lookback=252, skip=21) -> pd.DataFrame:
+    """12-1 momentum: past 12m return excluding last 1m."""
+    ret = catalog.get_retfile().sort_values(['security_id', 'date'])
+    rolling_ret = lambda x, n: (1 + x).rolling(n).apply(lambda y: y.prod() - 1, raw=True)
+    ret['signal'] = ret.groupby('security_id')['ret'].transform(rolling_ret, lookback) \
+                  - ret.groupby('security_id')['ret'].transform(rolling_ret, skip)
+    return ret[['security_id', 'date', 'signal']].rename(columns={'date': 'date_sig'}).dropna()
+
+
+def generate_value_signal(catalog: DataCatalog) -> pd.DataFrame:
+    """Value signal from risk file."""
+    return catalog.get_otherfile()[['security_id', 'date', 'value']].rename(
+        columns={'date': 'date_sig', 'value': 'signal'}
+    )
+
+BASELINE_REGISTRY = {
+    'reversal_5d': generate_reversal_signal,
+    'momentum_12_1': generate_momentum_signal,
+    'value': generate_value_signal,
+}
+```
+
+### Quick Start
+
+```bash
+# Create lightweight snapshot
+python -c "from poc.data.create_snapshot import create_lightweight_snapshot; create_lightweight_snapshot()"
+
+# Verify
+ls snapshots/ && cat snapshots/*/manifest.json
+```
 
 ---
 
