@@ -24,6 +24,20 @@ from poc.tracking import log_run, get_run_history
 st.set_page_config(page_title="Backtest Suite Runner", page_icon="📊", layout="wide")
 
 
+def filter_catalog(catalog: dict, start_date: str, end_date: str) -> dict:
+    """Filter catalog data to date range for faster testing."""
+    filtered = catalog.copy()
+    filtered['ret'] = catalog['ret'][
+        (catalog['ret']['date'] >= start_date) & 
+        (catalog['ret']['date'] <= end_date)
+    ].copy()
+    filtered['risk'] = catalog['risk'][
+        (catalog['risk']['date'] >= start_date) & 
+        (catalog['risk']['date'] <= end_date)
+    ].copy()
+    return filtered
+
+
 def main():
     st.title("📊 Backtest Suite Runner")
     
@@ -48,10 +62,16 @@ def main():
         
         # Suite configuration
         st.subheader("Suite Options")
-        lags = st.multiselect("Lags", [0, 1, 2, 3, 5], default=[0, 1, 2])
-        resid_opts = st.multiselect("Residualize", ['off', 'industry', 'all'], default=['off', 'industry'])
-        include_baselines = st.checkbox("Include Baselines", value=True)
+        lags = st.multiselect("Lags", [0, 1, 2, 3, 5], default=[0, 1])
+        resid_opts = st.multiselect("Residualize", ['off', 'industry', 'all'], default=['off'])
+        include_baselines = st.checkbox("Include Baselines", value=False)
         log_to_mlflow = st.checkbox("Log to MLflow", value=True)
+        
+        # Date range for faster testing
+        st.subheader("Date Range")
+        st.caption("Limit data for faster runs")
+        start_date = st.date_input("Start", value=pd.Timestamp('2018-01-01'))
+        end_date = st.date_input("End", value=pd.Timestamp('2018-06-30'))
     
     # Main area - tabs
     tab1, tab2, tab3 = st.tabs(["Run Suite", "Results", "History"])
@@ -60,12 +80,16 @@ def main():
     with tab1:
         st.header("Upload Signal")
         
-        uploaded = st.file_uploader("Upload signal file (parquet or csv)", type=['parquet', 'csv', 'pkl'])
+        uploaded = st.file_uploader(
+            "Drag & drop your signal file here", 
+            type=['parquet', 'csv', 'pkl', 'pickle'],
+            help="Supported formats: .parquet, .csv, .pkl. Must have columns: security_id, date_sig, date_avail, signal"
+        )
         signal_name = st.text_input("Signal Name", value="my_signal")
         
         col1, col2 = st.columns([1, 3])
         with col1:
-            run_button = st.button("🚀 Run Suite", type="primary", use_container_width=True)
+            run_button = st.button("🚀 Run Suite", type="primary")
         
         if run_button and uploaded:
             with st.spinner("Running backtest suite..."):
@@ -73,19 +97,35 @@ def main():
                     # Load signal
                     if uploaded.name.endswith('.parquet'):
                         signal_df = pd.read_parquet(uploaded)
-                    elif uploaded.name.endswith('.pkl'):
-                        signal_df = pd.read_pickle(uploaded)
+                    elif uploaded.name.endswith('.pkl') or uploaded.name.endswith('.pickle'):
+                        import pickle
+                        signal_df = pickle.load(uploaded)
                     else:
                         signal_df = pd.read_csv(uploaded, parse_dates=['date_sig', 'date_avail'])
                     
-                    st.info(f"Loaded signal: {len(signal_df)} rows")
+                    # Filter signal to date range
+                    start_str = str(start_date)
+                    end_str = str(end_date)
+                    signal_df['date_sig'] = pd.to_datetime(signal_df['date_sig'])
+                    signal_df = signal_df[
+                        (signal_df['date_sig'] >= start_str) & 
+                        (signal_df['date_sig'] <= end_str)
+                    ]
+                    st.info(f"Signal: {len(signal_df):,} rows ({start_str} to {end_str})")
                     
-                    # Load catalog
+                    # Load and filter catalog
                     catalog = load_catalog(f"snapshots/{snapshot}")
+                    catalog = filter_catalog(catalog, start_str, end_str)
+                    st.info(f"Data: {len(catalog['ret']):,} returns, {len(catalog['risk']):,} risk rows")
                     
                     # Run suite
                     grid = {'lags': lags, 'residualize': resid_opts}
-                    result = run_suite(signal_df, catalog, grid=grid, include_baselines=include_baselines)
+                    result = run_suite(
+                        signal_df, catalog, grid=grid, 
+                        include_baselines=include_baselines,
+                        baseline_start_date=start_str,
+                        baseline_end_date=end_str,
+                    )
                     
                     # Store in session state
                     st.session_state['result'] = result
@@ -130,7 +170,7 @@ def main():
                     'max_dd': '{:.2%}',
                     'turnover': '{:.2%}',
                 }),
-                use_container_width=True
+                width='stretch'
             )
             
             # Cumulative return plot
@@ -148,7 +188,7 @@ def main():
                 combined = pd.concat(daily_data)
                 fig = px.line(combined, x='date', y='cumret', color='config', 
                              title='Cumulative Return by Config')
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
             
             # Correlations
             st.subheader("Baseline Correlations")
@@ -185,9 +225,9 @@ def main():
             available_cols = [c for c in display_cols if c in runs_df.columns]
             
             if available_cols:
-                st.dataframe(runs_df[available_cols], use_container_width=True)
+                st.dataframe(runs_df[available_cols], width='stretch')
             else:
-                st.dataframe(runs_df, use_container_width=True)
+                st.dataframe(runs_df, width='stretch')
             
             st.markdown("[Open MLflow UI](http://localhost:5000)")
 

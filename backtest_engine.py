@@ -361,8 +361,10 @@ class Backtest:
         benchmark="sp500",
         ff_result=False,
         ff_model="ff3",
+        verbose=False,
     ):
 
+        self.verbose = verbose
         self.infile = infile
         self.retfile = retfile
         self.otherfile = otherfile
@@ -951,14 +953,17 @@ class Backtest:
 
         if self.input_type != "weight":
             port = self.portfolio_ls(sigfile, byvar)
-            print("finish generating portfolio")
+            if self.verbose:
+                print("finish generating portfolio")
             weight_file = self.gen_weight_ls(port, byvar)
 
         elif self.input_type == "weight":
-            print("finish generating portfolio")
+            if self.verbose:
+                print("finish generating portfolio")
             weight_file = self.gen_weight_ls(sigfile, byvar)
 
-        print("finish calculating weight")
+        if self.verbose:
+            print("finish calculating weight")
 
         # cor = self.cal_corr(sigfile, byvar)
 
@@ -1086,7 +1091,8 @@ class Backtest:
         if byvar == "overall":
             turnover["group"] = "overall"
 
-        print("cal turnover")
+        if self.verbose:
+            print("cal turnover")
 
         # calculate portfolio metrics: return, drawdown, factor exposure, industry exposure
         port = weight_file[["security_id", byvar, "date", "ret", "resret", "weight"]]
@@ -1235,7 +1241,8 @@ class Backtest:
         if byvar == "overall":
             exposure["group"] = "overall"
 
-        print("cal exposure")
+        if self.verbose:
+            print("cal exposure")
 
         # calculate return, sharpe and maximum drawdown
         if self.method == "long_only":
@@ -1426,7 +1433,8 @@ class Backtest:
         if byvar == "overall":
             annret["group"] = "overall"
 
-        print("cal return")
+        if self.verbose:
+            print("cal return")
 
         combo = annret.merge(turnover, on="group")
         combo = combo.merge(exposure, on="group")
@@ -1494,9 +1502,8 @@ class Backtest:
         )
         for byvar in self.byvar_list:
 
-            print(
-                f"""################    Start processing byvar: {byvar}   ####################"""
-            )
+            if self.verbose:
+                print(f"Processing byvar: {byvar}")
 
             if byvar not in ["overall", "year", "capyr"]:
                 temp = pd.merge_asof(
@@ -1565,7 +1572,8 @@ class Backtest:
                 combo = self.backtest(temp2, "vix")
                 result.append(combo)
             except:
-                print("Cannot get Vix data from yfinance")
+                if self.verbose:
+                    print("Cannot get Vix data from yfinance")
 
         result = pd.concat(result)
         result["turnover"] = result["turnover"] / 4

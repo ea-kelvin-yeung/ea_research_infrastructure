@@ -28,9 +28,11 @@ env/
 *.hdf5
 *.feather
 *.arrow
+*.db
 
 # Snapshots and artifacts
 snapshots/
 artifacts/
 mlruns/
 .cache/
+

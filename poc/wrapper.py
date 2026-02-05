@@ -137,6 +137,7 @@ def run_backtest(
         resid=resid,
         resid_style=resid_style,
         output='simple',
+        verbose=False,
     )
     
     # Run and extract results

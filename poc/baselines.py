@@ -164,6 +164,12 @@ def generate_all_baselines(
     }
 
 
+def clear_baseline_cache():
+    """Clear the baseline signal cache."""
+    memory.clear(warn=False)
+    print(f"Cleared baseline cache at {CACHE_DIR}")
+
+
 def compute_signal_correlation(signal_df: pd.DataFrame, baseline_df: pd.DataFrame) -> float:
     """
     Compute cross-sectional correlation between two signals.

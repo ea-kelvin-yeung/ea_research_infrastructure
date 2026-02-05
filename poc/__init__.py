@@ -25,5 +25,6 @@ from . import catalog
 from . import wrapper
 from . import baselines
 from . import suite
-from . import tracking
 from . import tearsheet
+# Note: tracking imported on-demand to avoid mlflow startup noise
+# Use: from poc.tracking import log_run

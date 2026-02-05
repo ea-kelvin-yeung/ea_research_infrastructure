@@ -10,13 +10,16 @@ Prerequisites:
     2. Have a signal file ready (or use the sample)
 """
 
+import warnings
+warnings.filterwarnings('ignore')
+
 import pandas as pd
 from pathlib import Path
 
 from poc.catalog import load_catalog, create_snapshot, list_snapshots
 from poc.suite import run_suite
 from poc.tearsheet import generate_tearsheet
-from poc.tracking import log_run
+# Note: poc.tracking imported lazily below to avoid mlflow import noise
 
 # Demo date range (3 months for fast testing)
 DEMO_START = '2018-01-01'
@@ -138,6 +141,7 @@ def main():
     # Optional: Log to MLflow
     try:
         print("\nLogging to MLflow...")
+        from poc.tracking import log_run  # Late import to avoid startup noise
         run_id = log_run(result, signal_name, catalog, tearsheet_path)
         print(f"  Run ID: {run_id}")
         print("  View at: http://localhost:5000 (run 'mlflow ui' first)")

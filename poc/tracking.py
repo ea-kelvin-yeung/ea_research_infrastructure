@@ -3,7 +3,17 @@ MLflow Tracking: Log suite runs for reproducibility.
 ~80 lines - simple logging, let MLflow handle the rest.
 """
 
+import logging
 import mlflow
+
+# Suppress alembic noise AFTER importing mlflow (alembic configures its handlers during import)
+for _logger_name in ['alembic', 'alembic.runtime', 'alembic.runtime.plugins', 
+                     'alembic.runtime.migration', 'mlflow.tracking']:
+    _logger = logging.getLogger(_logger_name)
+    _logger.handlers = []
+    _logger.setLevel(logging.ERROR)
+    _logger.propagate = False
+
 import subprocess
 from pathlib import Path
 from typing import Optional
