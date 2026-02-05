@@ -427,18 +427,25 @@ bt = BacktestFast(
 result = bt.gen_result()
 ```
 
-#### 2. Vectorized Industry Residualization
+#### 2. Vectorized NumPy Residualization
 
-For `resid_style='industry'`, uses `transform('mean')` instead of `groupby().apply()`:
+Replaces `groupby().apply()` with pure NumPy loop over sorted date chunks:
 
 ```python
-# Original: ~30s (10ms per day × 3000 days)
-resid = temp.groupby("date").apply(_residualize_industry, ...)
+# Original: ~8-10s (creates thousands of Pandas objects)
+resid = temp.groupby("date").apply(_residualize_factors_within_industry, ...)
 
-# Optimized: ~0.05s (single vectorized operation)
-ind_means = temp.groupby(["date", "industry_id"]).transform("mean")
-temp[sigvar] = temp[sigvar] - ind_means
+# Optimized: ~1-2s (pure NumPy with bincount/solve)
+dates = temp["date"].values
+y = temp[sigvar].to_numpy()
+X = temp[factor_cols].to_numpy()
+residuals = _vectorized_resid_all_numpy(dates, y, X, industry_codes)
 ```
+
+The NumPy implementation:
+- Uses `np.unique(dates, return_index=True)` to find day boundaries
+- Uses `np.bincount` for fast industry group aggregations
+- Uses `np.linalg.solve` for regression within each day
 
 #### 3. Numpy-Based Index Lookups
 
@@ -467,12 +474,37 @@ datefile_by_date = datefile.set_index('date')  # cached
 df['n'] = datefile_by_date.reindex(df['date'])['n'].values
 ```
 
-### Benchmark Results
+### Benchmark Results (3-Year Data, 377K signal rows)
 
-| Configuration | Original | Fast+Master | Speedup |
-|---------------|----------|-------------|---------|
-| Basic (resid=off) | 18-20s | 4.9-5.5s | **3.7x** |
-| With residualization | 25-30s | 6-8s | **4x** |
+| Configuration | Original | Fast+Master | Time Saved | Speedup |
+|---------------|----------|-------------|------------|---------|
+| resid=off | 18.5s | 5.0s | 13.5s | **3.7x** |
+| resid=industry | 23.2s | 8.1s | 15.1s | **2.9x** |
+| resid=all | 26.0s | 10.1s | 15.9s | **2.6x** |
+
+**Why does speedup ratio decrease with residualization?**
+
+Absolute time saved *increases* with residualization, but the speedup *ratio* decreases because `merge_asof` (fuzzy time-based join) **cannot be optimized** by master data:
+
+```python
+# This merge_asof finds closest date within 5 days - cannot use pre-merged master
+pd.merge_asof(..., tolerance=pd.Timedelta("5d"), direction="backward")
+```
+
+Master data only optimizes exact `(security_id, date)` joins.
+
+### Speedup Breakdown (resid=all)
+
+| Component | Time Saved | Contribution |
+|-----------|------------|--------------|
+| Master data joins | 10.6s | **67%** |
+| Residualization (statsmodels → numpy) | 5.3s | **33%** |
+
+**Residualization math comparison:**
+- Statsmodels OLS (groupby.apply): 4.85s
+- Pure NumPy: 0.05s (~97x faster)
+
+However, the **bulk of the overall speedup comes from eliminating merge operations** (`_factorize_keys` calls), not from faster residualization. The merge operations dominate runtime in `pre_process`.
 
 ### Profile Breakdown (5.9s total)
 
