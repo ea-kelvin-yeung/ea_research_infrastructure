@@ -74,11 +74,19 @@ def log_run(
             mlflow.log_params(first_result.config)
         
         # Metrics - log for each config
+        best_sharpe = None
         for config_key, result in suite_result.results.items():
             mlflow.log_metric(f'sharpe_{config_key}', result.sharpe)
             mlflow.log_metric(f'ann_ret_{config_key}', result.annual_return)
             mlflow.log_metric(f'max_dd_{config_key}', result.max_drawdown)
             mlflow.log_metric(f'turnover_{config_key}', result.turnover)
+            # Track best sharpe
+            if best_sharpe is None or result.sharpe > best_sharpe:
+                best_sharpe = result.sharpe
+        
+        # Log best sharpe across all configs
+        if best_sharpe is not None:
+            mlflow.log_metric('best_sharpe', best_sharpe)
         
         # Log baseline metrics
         for name, result in suite_result.baselines.items():

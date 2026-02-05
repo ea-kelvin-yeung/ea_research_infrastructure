@@ -45,20 +45,20 @@ def main():
     with st.sidebar:
         st.header("Configuration")
         
-        # Snapshot selection
+        # Data snapshot selection
         snapshots = list_snapshots('snapshots')
         if not snapshots:
-            st.warning("No snapshots found. Create one first.")
-            if st.button("Create Snapshot from data/"):
+            st.warning("No data snapshots found. Create one first.")
+            if st.button("Create Data Snapshot from data/"):
                 try:
                     create_snapshot('data', 'snapshots')
-                    st.success("Snapshot created!")
+                    st.success("Data snapshot created!")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Failed: {e}")
             return
         
-        snapshot = st.selectbox("Snapshot", snapshots)
+        selected_snapshot = st.selectbox("Data Snapshot", snapshots, help="Pre-built market data (returns, risk factors, dates)")
         
         # Suite configuration
         st.subheader("Suite Options")
@@ -122,7 +122,7 @@ def main():
                     ]
                     
                     # Load and filter catalog
-                    catalog = load_catalog(f"snapshots/{snapshot}")
+                    catalog = load_catalog(f"snapshots/{selected_snapshot}")
                     catalog = filter_catalog(catalog, start_str, end_str)
                     
                     # Apply universe filter if requested
@@ -309,7 +309,7 @@ def main():
             with col1:
                 st.metric("Signal", selected_run.get('tags.signal_name', 'N/A'))
             with col2:
-                st.metric("Snapshot", selected_run.get('tags.snapshot_id', 'N/A'))
+                st.metric("Data Snapshot", selected_run.get('tags.snapshot_id', 'N/A'))
             with col3:
                 sharpe = selected_run.get('metrics.best_sharpe', None)
                 st.metric("Best Sharpe", f"{sharpe:.2f}" if sharpe else "N/A")
