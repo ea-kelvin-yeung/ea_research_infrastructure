@@ -474,13 +474,63 @@ class BacktestFast:
         self.ff_result = ff_result
         self.ff_model = ff_model
         self._double_file_sorted = None
+        
+        # Pre-index datefile for fast lookups
+        self._datefile_by_date = None
+        self._datefile_by_n = None
+
+    def _get_datefile_by_date(self):
+        """Get datefile indexed by date for fast lookups."""
+        if self._datefile_by_date is None:
+            self._datefile_by_date = self.datefile.set_index('date')
+        return self._datefile_by_date
+    
+    def _get_datefile_by_n(self):
+        """Get datefile indexed by n for fast lookups."""
+        if self._datefile_by_n is None:
+            self._datefile_by_n = self.datefile.set_index('n')
+        return self._datefile_by_n
+    
+    def _fast_date_lookup(self, df, date_col, cols_to_add):
+        """
+        Fast lookup from datefile using index-based reindex.
+        
+        Much faster than merge because it uses numpy array indexing
+        instead of hash-based key matching.
+        """
+        datefile_indexed = self._get_datefile_by_date()
+        
+        # Use reindex to lookup values (avoids is_unique check)
+        lookup_result = datefile_indexed.reindex(df[date_col])
+        
+        for col in cols_to_add:
+            if col in lookup_result.columns:
+                df[col] = lookup_result[col].values
+        
+        return df
+    
+    def _fast_n_lookup(self, df, n_col, cols_to_add, rename_map=None):
+        """
+        Fast lookup from datefile by n using index-based reindex.
+        """
+        datefile_indexed = self._get_datefile_by_n()
+        
+        # Use reindex to lookup values
+        lookup_result = datefile_indexed.reindex(df[n_col])
+        
+        for col in cols_to_add:
+            if col in lookup_result.columns:
+                new_col = rename_map.get(col, col) if rename_map else col
+                df[new_col] = lookup_result[col].values
+        
+        return df
 
     def _fast_join_master(self, df, cols, how='inner'):
         """
-        Fast join using pre-indexed master_data.
+        Fast join using pre-indexed master_data with numpy get_indexer.
         
-        Uses index-based join instead of merge, which avoids the expensive
-        _factorize_keys operation that dominates merge time.
+        Uses get_indexer + numpy take instead of merge/join/reindex to
+        completely bypass pandas is_unique checks and hash-based key matching.
         
         Args:
             df: DataFrame with security_id and date columns
@@ -503,19 +553,28 @@ class BacktestFast:
         if not available_cols:
             return df
         
-        # Set index on df for fast join (use left join, then filter for inner)
-        df_indexed = df.set_index(['security_id', 'date'])
+        # Create MultiIndex from df's keys (vectorized)
+        idx = pd.MultiIndex.from_arrays(
+            [df['security_id'].values, df['date'].values],
+            names=['security_id', 'date']
+        )
         
-        # Join with master (index-based, much faster than merge)
-        # Always use left join to preserve df order, then filter if inner requested
-        result = df_indexed.join(self.master_data[available_cols], how='left')
+        # Get indexer positions (numpy array of positions, -1 for missing)
+        positions = self.master_data.index.get_indexer(idx)
+        
+        # Add columns using numpy take (much faster than reindex)
+        result = df.copy()
+        for col in available_cols:
+            col_values = self.master_data[col].values
+            # Use take with mode='clip' for safety, then set -1 positions to NaN
+            taken = np.take(col_values, np.clip(positions, 0, len(col_values) - 1))
+            taken = taken.astype(float)  # Ensure float for NaN support
+            taken[positions == -1] = np.nan
+            result[col] = taken
         
         # For inner join, drop rows where joined columns are NaN
         if how == 'inner':
             result = result.dropna(subset=available_cols)
-        
-        # Reset index
-        result = result.reset_index()
         
         return result
 
@@ -638,10 +697,10 @@ class BacktestFast:
         )
 
         if self.insample == "i1":
-            cor_file = cor_file.merge(self.datefile[["date", "insample"]], on="date")
+            cor_file = self._fast_date_lookup(cor_file, 'date', ['insample'])
             cor_file = cor_file[cor_file["insample"] == 1]
         elif self.insample == "i2":
-            cor_file = cor_file.merge(self.datefile[["date", "insample2"]], on="date")
+            cor_file = self._fast_date_lookup(cor_file, 'date', ['insample2'])
             cor_file = cor_file[cor_file["insample2"] == 1]
 
         cor = cor_file.groupby(["date", byvar], sort=False)[
@@ -1042,7 +1101,8 @@ class BacktestFast:
             weight_file.loc[weight_file["weight"] < 0, "weight"] = 0
 
         turnover = weight_file[["security_id", "date", byvar, "weight"]].copy()
-        turnover = turnover.merge(self.datefile[["date", "n"]], on="date")
+        # Fast date lookup instead of merge
+        turnover = self._fast_date_lookup(turnover, 'date', ['n'])
         # number of stocks with non-zero position
         turnover["numcos_l"] = np.where(turnover["weight"] > 0, 1, 0)
         turnover["numcos_s"] = np.where(turnover["weight"] < 0, 1, 0)
@@ -1084,7 +1144,8 @@ class BacktestFast:
         exits["numcos"] = np.nan
 
         turnover = pd.concat([turnover, exits], ignore_index=True, sort=False)
-        turnover = turnover.merge(self.datefile[["date", "n"]], on="n")
+        # Fast n lookup instead of merge
+        turnover = self._fast_n_lookup(turnover, 'n', ['date'])
         turnover["n_min"] = turnover.groupby(byvar, sort=False)["n"].transform("min")
         turnover["weight_diff"] = np.where(
             turnover["n"] == turnover["n_min"], 0, turnover["weight_diff"]
@@ -1167,10 +1228,10 @@ class BacktestFast:
             turnover_raw = turnover[["date", "turnover"]]
 
         if self.insample == "i1":
-            turnover = turnover.merge(self.datefile[["date", "insample"]], on="date")
+            turnover = self._fast_date_lookup(turnover, 'date', ['insample'])
             turnover = turnover[turnover["insample"] == 1]
         elif self.insample == "i2":
-            turnover = turnover.merge(self.datefile[["date", "insample2"]], on="date")
+            turnover = self._fast_date_lookup(turnover, 'date', ['insample2'])
             turnover = turnover[turnover["insample2"] == 1]
 
         turnover = (
@@ -1244,10 +1305,10 @@ class BacktestFast:
         port2 = port2.fillna(0)
 
         if self.insample == "i1":
-            port2 = port2.merge(self.datefile[["date", "insample"]], on="date")
+            port2 = self._fast_date_lookup(port2, 'date', ['insample'])
             port2 = port2[port2["insample"] == 1]
         elif self.insample == "i2":
-            port2 = port2.merge(self.datefile[["date", "insample2"]], on="date")
+            port2 = self._fast_date_lookup(port2, 'date', ['insample2'])
             port2 = port2[port2["insample2"] == 1]
 
         port2["cumret"] = port2.groupby(byvar, sort=False)["ret"].transform("cumsum")

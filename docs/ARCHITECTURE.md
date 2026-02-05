@@ -440,24 +440,48 @@ ind_means = temp.groupby(["date", "industry_id"]).transform("mean")
 temp[sigvar] = temp[sigvar] - ind_means
 ```
 
-#### 3. Fast Index-Based Joins
+#### 3. Numpy-Based Index Lookups
 
-Uses `DataFrame.join()` on pre-indexed master data instead of `merge()`:
+Uses `get_indexer()` + numpy `take()` instead of merge/join, bypassing pandas overhead:
 
 ```python
-# Original merge (slow - requires key hashing)
+# Original merge (slow - hash-based key matching + is_unique checks)
 df.merge(other, on=['security_id', 'date'])
 
-# Optimized join (fast - uses sorted index)
-df.set_index(['security_id', 'date']).join(master[cols])
+# Optimized (fast - direct numpy array indexing)
+idx = pd.MultiIndex.from_arrays([df['security_id'], df['date']])
+positions = master.index.get_indexer(idx)
+result[col] = np.take(master[col].values, positions)
+```
+
+#### 4. Pre-Indexed Datefile Lookups
+
+Datefile merges use pre-indexed lookups via `reindex()`:
+
+```python
+# Original (slow - merge on every call)
+df.merge(datefile[['date', 'n']], on='date')
+
+# Optimized (fast - cached index + direct lookup)
+datefile_by_date = datefile.set_index('date')  # cached
+df['n'] = datefile_by_date.reindex(df['date'])['n'].values
 ```
 
 ### Benchmark Results
 
 | Configuration | Original | Fast+Master | Speedup |
 |---------------|----------|-------------|---------|
-| Basic (resid=off) | 18-20s | 5-6s | **3.3x** |
-| With residualization | 25-30s | 7-8s | **3.5x** |
+| Basic (resid=off) | 18-20s | 4.9-5.5s | **3.7x** |
+| With residualization | 25-30s | 6-8s | **4x** |
+
+### Profile Breakdown (5.9s total)
+
+| Operation | Time | Notes |
+|-----------|------|-------|
+| `_fast_join_master` | 2.2s | Numpy get_indexer + take |
+| `_factorize_keys` | 2.6s | Remaining 13 merges (datefile, small DFs) |
+| groupby/transform | 0.5s | Weight calculations |
+| backtest() | 0.6s | Portfolio return aggregation |
 
 ### Equivalence Guarantee
 
