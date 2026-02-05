@@ -100,10 +100,19 @@ def log_run(
         suite_result.summary.to_csv(summary_path, index=False)
         mlflow.log_artifact(str(summary_path))
         
-        # Log daily series for main config
-        if 'lag0_residoff' in suite_result.results:
+        # Log daily series for all configs (combined)
+        daily_data = []
+        for config_key, result in suite_result.results.items():
+            if 'cumret' in result.daily.columns:
+                df = result.daily[['date', 'cumret']].copy()
+                df['config'] = config_key
+                daily_data.append(df)
+        
+        if daily_data:
+            import pandas as pd
+            combined_daily = pd.concat(daily_data, ignore_index=True)
             daily_path = Path('artifacts') / f"{signal_name}_daily.parquet"
-            suite_result.results['lag0_residoff'].daily.to_parquet(daily_path)
+            combined_daily.to_parquet(daily_path)
             mlflow.log_artifact(str(daily_path))
         
         run_id = mlflow.active_run().info.run_id

@@ -210,8 +210,10 @@ def main():
     with tab3:
         st.header("Run History")
         
-        if st.button("Refresh"):
-            st.rerun()
+        col1, col2 = st.columns([1, 4])
+        with col1:
+            if st.button("Refresh"):
+                st.rerun()
         
         runs = get_run_history()
         
@@ -220,14 +222,72 @@ def main():
         else:
             runs_df = pd.DataFrame(runs)
             
-            # Display key columns
-            display_cols = ['run_id', 'start_time', 'tags.signal_name', 'tags.snapshot_id']
-            available_cols = [c for c in display_cols if c in runs_df.columns]
-            
-            if available_cols:
-                st.dataframe(runs_df[available_cols], width='stretch')
+            # Create selection options
+            if 'tags.signal_name' in runs_df.columns:
+                runs_df['label'] = runs_df.apply(
+                    lambda r: f"{r.get('tags.signal_name', 'unknown')} - {str(r.get('start_time', ''))[:16]}", 
+                    axis=1
+                )
             else:
-                st.dataframe(runs_df, width='stretch')
+                runs_df['label'] = runs_df['run_id'].str[:12] + '...'
+            
+            # Select a run
+            selected_label = st.selectbox("Select a run to view", runs_df['label'].tolist())
+            selected_run = runs_df[runs_df['label'] == selected_label].iloc[0]
+            run_id = selected_run['run_id']
+            
+            # Show run details
+            st.subheader("Run Details")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Signal", selected_run.get('tags.signal_name', 'N/A'))
+            with col2:
+                st.metric("Snapshot", selected_run.get('tags.snapshot_id', 'N/A'))
+            with col3:
+                sharpe = selected_run.get('metrics.best_sharpe', None)
+                st.metric("Best Sharpe", f"{sharpe:.2f}" if sharpe else "N/A")
+            
+            # Load artifacts from MLflow
+            try:
+                import mlflow
+                client = mlflow.tracking.MlflowClient()
+                artifacts = client.list_artifacts(run_id)
+                artifact_names = [a.path for a in artifacts]
+                
+                # Load and display cumulative returns
+                st.subheader("Cumulative Returns")
+                daily_artifact = next((a for a in artifact_names if 'daily' in a and a.endswith('.parquet')), None)
+                if daily_artifact:
+                    local_path = client.download_artifacts(run_id, daily_artifact)
+                    daily_df = pd.read_parquet(local_path)
+                    if 'date' in daily_df.columns and 'cumret' in daily_df.columns:
+                        # Check if there's a config column for multiple lines
+                        if 'config' in daily_df.columns:
+                            fig = px.line(daily_df, x='date', y='cumret', color='config',
+                                         title='Cumulative Return by Config')
+                        else:
+                            fig = px.line(daily_df, x='date', y='cumret',
+                                         title='Cumulative Return')
+                        st.plotly_chart(fig, width='stretch')
+                    else:
+                        st.info("Daily data doesn't have cumret column")
+                else:
+                    st.info("No daily returns data found for this run.")
+                
+                # Load and display tearsheet
+                st.subheader("Tear Sheet")
+                tearsheet_artifact = next((a for a in artifact_names if 'tearsheet' in a), None)
+                if tearsheet_artifact:
+                    local_path = client.download_artifacts(run_id, tearsheet_artifact)
+                    with open(local_path) as f:
+                        st.components.v1.html(f.read(), height=800, scrolling=True)
+                else:
+                    st.warning("No tearsheet found for this run.")
+                    
+            except Exception as e:
+                st.warning(f"Could not load artifacts: {e}")
+                import traceback
+                st.code(traceback.format_exc())
             
             st.markdown("[Open MLflow UI](http://localhost:5000)")
 
