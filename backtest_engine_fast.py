@@ -1349,14 +1349,13 @@ class BacktestFast:
         )
 
         if "cap" not in turnover.columns:
-            # Use fast join if master_data available
-            if self.master_data is not None:
-                turnover = self._fast_join_master(turnover, ["cap"], how='inner')
-            else:
-                turnover = turnover.merge(
-                    self._get_otherfile_cols(["security_id", "date", "cap"]),
-                    on=["security_id", "date"],
-                )
+            # Use otherfile for cap lookup (same as original)
+            # Don't use master_data here - it's ret ∩ risk, but some exit rows
+            # may only exist in risk (otherfile)
+            turnover = turnover.merge(
+                self._get_otherfile_cols(["security_id", "date", "cap"]),
+                on=["security_id", "date"],
+            )
 
         if self.tc_model == "naive":
             turnover["tc"] = np.select(
