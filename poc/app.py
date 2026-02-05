@@ -23,6 +23,18 @@ from poc.tracking import log_run, get_run_history
 
 st.set_page_config(page_title="Backtest Suite Runner", page_icon="📊", layout="wide")
 
+# Custom CSS to reduce metric font size
+st.markdown("""
+<style>
+    [data-testid="stMetricValue"] {
+        font-size: 1.5rem;
+    }
+    [data-testid="stMetricLabel"] {
+        font-size: 0.9rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 
 def filter_catalog(catalog: dict, start_date: str, end_date: str) -> dict:
     """Filter catalog data to date range for faster testing."""
@@ -64,12 +76,11 @@ def main():
         st.subheader("Suite Options")
         lags = st.multiselect("Lags", [0, 1, 2, 3, 5], default=[0, 1])
         resid_opts = st.multiselect("Residualize", ['off', 'industry', 'all'], default=['off'])
-        include_baselines = st.checkbox("Include Baselines", value=False)
+        include_baselines = st.checkbox("Include Baselines", value=False, help="Run baseline backtests (required for PnL correlation)")
         log_to_mlflow = st.checkbox("Log to MLflow", value=True)
         
         # Date range for faster testing
         st.subheader("Date Range")
-        st.caption("Limit data for faster runs")
         start_date = st.date_input("Start", value=pd.Timestamp('2018-01-01'))
         end_date = st.date_input("End", value=pd.Timestamp('2018-06-30'))
         
@@ -77,9 +88,9 @@ def main():
         st.subheader("Universe Filter")
         universe_filter = st.radio(
             "Filter by universe",
-            ["All", "Universe only (=1)", "Non-universe (=0)"],
+            ["All Securities", "Investable Universe", "Non-Investable Universe"],
             index=0,
-            help="Filter signal to securities in/out of trading universe"
+            help="Filter signal to securities in/out of the investable trading universe"
         )
     
     # Main area - tabs
@@ -126,7 +137,7 @@ def main():
                     catalog = filter_catalog(catalog, start_str, end_str)
                     
                     # Apply universe filter if requested
-                    if universe_filter != "All":
+                    if universe_filter != "All Securities":
                         # Load descriptor for universe flags
                         desc_path = Path('data/descriptor.parquet')
                         if desc_path.exists():
@@ -135,7 +146,7 @@ def main():
                             desc = desc[(desc['as_of_date'] >= start_str) & (desc['as_of_date'] <= end_str)]
                             
                             # Filter by universe flag
-                            target_flag = 1 if "=1" in universe_filter else 0
+                            target_flag = 1 if universe_filter == "Investable Universe" else 0
                             universe_secs = desc[desc['universe_flag'] == target_flag][['security_id', 'as_of_date']].drop_duplicates()
                             
                             # Merge to filter signal
@@ -275,7 +286,7 @@ def main():
     
     # Tab 3: History
     with tab3:
-        st.header("Run History")
+        st.header("Past Experiments")
         
         col1, col2 = st.columns([1, 4])
         with col1:

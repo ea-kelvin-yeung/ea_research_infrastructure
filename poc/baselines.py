@@ -136,7 +136,6 @@ def generate_value_signal(
 # Registry of all baseline signals
 BASELINES: Dict[str, Callable] = {
     'reversal_5d': generate_reversal_signal,
-    'momentum_12_1': generate_momentum_signal,
     'value': generate_value_signal,
 }
 
@@ -159,7 +158,6 @@ def generate_all_baselines(
     """
     return {
         'reversal_5d': generate_reversal_signal(catalog, lookback=5, start_date=start_date, end_date=end_date),
-        'momentum_12_1': generate_momentum_signal(catalog, lookback=252, skip=21, start_date=start_date, end_date=end_date),
         'value': generate_value_signal(catalog, start_date=start_date, end_date=end_date),
     }
 
