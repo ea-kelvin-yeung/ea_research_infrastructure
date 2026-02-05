@@ -72,6 +72,15 @@ def main():
         st.caption("Limit data for faster runs")
         start_date = st.date_input("Start", value=pd.Timestamp('2018-01-01'))
         end_date = st.date_input("End", value=pd.Timestamp('2018-06-30'))
+        
+        # Universe filter
+        st.subheader("Universe Filter")
+        universe_filter = st.radio(
+            "Filter by universe",
+            ["All", "Universe only (=1)", "Non-universe (=0)"],
+            index=0,
+            help="Filter signal to securities in/out of trading universe"
+        )
     
     # Main area - tabs
     tab1, tab2, tab3 = st.tabs(["Run Suite", "Results", "History"])
@@ -111,11 +120,36 @@ def main():
                         (signal_df['date_sig'] >= start_str) & 
                         (signal_df['date_sig'] <= end_str)
                     ]
-                    st.info(f"Signal: {len(signal_df):,} rows ({start_str} to {end_str})")
                     
                     # Load and filter catalog
                     catalog = load_catalog(f"snapshots/{snapshot}")
                     catalog = filter_catalog(catalog, start_str, end_str)
+                    
+                    # Apply universe filter if requested
+                    if universe_filter != "All":
+                        # Load descriptor for universe flags
+                        desc_path = Path('data/descriptor.parquet')
+                        if desc_path.exists():
+                            desc = pd.read_parquet(desc_path, columns=['security_id', 'as_of_date', 'universe_flag'])
+                            desc['as_of_date'] = pd.to_datetime(desc['as_of_date'])
+                            desc = desc[(desc['as_of_date'] >= start_str) & (desc['as_of_date'] <= end_str)]
+                            
+                            # Filter by universe flag
+                            target_flag = 1 if "=1" in universe_filter else 0
+                            universe_secs = desc[desc['universe_flag'] == target_flag][['security_id', 'as_of_date']].drop_duplicates()
+                            
+                            # Merge to filter signal
+                            original_len = len(signal_df)
+                            signal_df = signal_df.merge(
+                                universe_secs.rename(columns={'as_of_date': 'date_sig'}),
+                                on=['security_id', 'date_sig'],
+                                how='inner'
+                            )
+                            st.info(f"Universe filter ({universe_filter}): {original_len:,} → {len(signal_df):,} rows")
+                        else:
+                            st.warning("descriptor.parquet not found, skipping universe filter")
+                    
+                    st.info(f"Signal: {len(signal_df):,} rows ({start_str} to {end_str})")
                     st.info(f"Data: {len(catalog['ret']):,} returns, {len(catalog['risk']):,} risk rows")
                     
                     # Run suite

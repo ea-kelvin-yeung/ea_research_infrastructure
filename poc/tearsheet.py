@@ -126,6 +126,10 @@ def compute_verdict(suite_result: SuiteResult) -> Dict:
     turnover = best.turnover
     max_dd = best.max_drawdown
     
+    # Handle NaN metrics
+    if np.isnan(sharpe):
+        return {'color': 'red', 'reasons': ['Best config has NaN Sharpe - insufficient data']}
+    
     # Check Sharpe decay with lag
     lag0_key = 'lag0_residoff'
     lag1_key = 'lag1_residoff'
@@ -135,7 +139,7 @@ def compute_verdict(suite_result: SuiteResult) -> Dict:
     if lag0_key in suite_result.results and lag2_key in suite_result.results:
         s0 = suite_result.results[lag0_key].sharpe
         s2 = suite_result.results[lag2_key].sharpe
-        if s0 > 0 and (s2 / s0) < 0.5:
+        if not np.isnan(s0) and not np.isnan(s2) and s0 > 0 and (s2 / s0) < 0.5:
             sharpe_decay = True
             reasons.append(f"Sharpe decays significantly with lag (lag0: {s0:.2f} -> lag2: {s2:.2f})")
     
@@ -144,7 +148,7 @@ def compute_verdict(suite_result: SuiteResult) -> Dict:
     if 'lag0_residoff' in suite_result.results and 'lag0_residindustry' in suite_result.results:
         s_off = suite_result.results['lag0_residoff'].sharpe
         s_on = suite_result.results['lag0_residindustry'].sharpe
-        if s_off > 0 and (s_on / s_off) < 0.5:
+        if not np.isnan(s_off) and not np.isnan(s_on) and s_off > 0 and (s_on / s_off) < 0.5:
             resid_sensitive = True
             reasons.append(f"Signal doesn't survive industry neutralization ({s_off:.2f} -> {s_on:.2f})")
     

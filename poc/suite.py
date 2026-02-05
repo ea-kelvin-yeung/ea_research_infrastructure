@@ -199,4 +199,8 @@ def get_best_config(suite_result: SuiteResult, metric: str = 'sharpe') -> str:
     signal_rows = suite_result.summary[suite_result.summary['type'] == 'signal']
     if len(signal_rows) == 0:
         return None
-    return signal_rows.loc[signal_rows[metric].idxmax(), 'config']
+    # Handle case where all values are NaN
+    valid_rows = signal_rows[signal_rows[metric].notna()]
+    if len(valid_rows) == 0:
+        return signal_rows['config'].iloc[0] if len(signal_rows) > 0 else None
+    return valid_rows.loc[valid_rows[metric].idxmax(), 'config']
