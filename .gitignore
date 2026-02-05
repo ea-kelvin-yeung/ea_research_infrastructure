@@ -36,3 +36,4 @@ artifacts/
 mlruns/
 .cache/
 
+mlflow.db

@@ -100,12 +100,21 @@ def log_run(
         suite_result.summary.to_csv(summary_path, index=False)
         mlflow.log_artifact(str(summary_path))
         
-        # Log daily series for all configs (combined)
+        # Log daily series for all configs + baselines (combined)
         daily_data = []
         for config_key, result in suite_result.results.items():
             if 'cumret' in result.daily.columns:
                 df = result.daily[['date', 'cumret']].copy()
                 df['config'] = config_key
+                df['type'] = 'signal'
+                daily_data.append(df)
+        
+        # Include baseline daily data
+        for name, result in suite_result.baselines.items():
+            if 'cumret' in result.daily.columns:
+                df = result.daily[['date', 'cumret']].copy()
+                df['config'] = name
+                df['type'] = 'baseline'
                 daily_data.append(df)
         
         if daily_data:

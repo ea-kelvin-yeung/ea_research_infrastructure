@@ -176,19 +176,52 @@ def main():
             # Cumulative return plot
             st.subheader("Cumulative Returns")
             
-            # Collect daily series from all configs
+            # Get available configs
+            signal_configs = list(result.results.keys())
+            baseline_configs = list(result.baselines.keys()) if result.baselines else []
+            
+            # Multiselect for which to show
+            col1, col2 = st.columns(2)
+            with col1:
+                selected_signals = st.multiselect(
+                    "Signal configs", signal_configs, 
+                    default=signal_configs, key="results_signals"
+                )
+            with col2:
+                selected_baselines = st.multiselect(
+                    "Baseline signals", baseline_configs,
+                    default=baseline_configs, key="results_baselines"
+                )
+            
+            # Collect daily series from selected configs
             daily_data = []
-            for key, res in result.results.items():
+            for key in selected_signals:
+                res = result.results[key]
                 if 'cumret' in res.daily.columns:
                     df = res.daily[['date', 'cumret']].copy()
-                    df['config'] = key
+                    df['config'] = f"📊 {key}"
+                    df['type'] = 'signal'
                     daily_data.append(df)
+            
+            # Add selected baselines
+            for name in selected_baselines:
+                if name in result.baselines:
+                    res = result.baselines[name]
+                    if 'cumret' in res.daily.columns:
+                        df = res.daily[['date', 'cumret']].copy()
+                        df['config'] = f"📈 {name}"
+                        df['type'] = 'baseline'
+                        daily_data.append(df)
             
             if daily_data:
                 combined = pd.concat(daily_data)
                 fig = px.line(combined, x='date', y='cumret', color='config', 
-                             title='Cumulative Return by Config')
+                             title='Cumulative Return: Signal vs Baselines',
+                             line_dash='type')
+                fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02))
                 st.plotly_chart(fig, width='stretch')
+            else:
+                st.info("Select at least one config to display")
             
             # Correlations
             st.subheader("Baseline Correlations")
@@ -256,18 +289,57 @@ def main():
                 
                 # Load and display cumulative returns
                 st.subheader("Cumulative Returns")
+                
                 daily_artifact = next((a for a in artifact_names if 'daily' in a and a.endswith('.parquet')), None)
                 if daily_artifact:
                     local_path = client.download_artifacts(run_id, daily_artifact)
                     daily_df = pd.read_parquet(local_path)
                     if 'date' in daily_df.columns and 'cumret' in daily_df.columns:
-                        # Check if there's a config column for multiple lines
+                        # Get all available configs
                         if 'config' in daily_df.columns:
-                            fig = px.line(daily_df, x='date', y='cumret', color='config',
-                                         title='Cumulative Return by Config')
+                            all_configs = daily_df['config'].unique().tolist()
+                            
+                            # Separate signals and baselines
+                            if 'type' in daily_df.columns:
+                                signal_configs = daily_df[daily_df['type'] == 'signal']['config'].unique().tolist()
+                                baseline_configs = daily_df[daily_df['type'] == 'baseline']['config'].unique().tolist()
+                            else:
+                                signal_configs = all_configs
+                                baseline_configs = []
+                            
+                            # Multiselect for configs
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                selected_signals = st.multiselect(
+                                    "Signal configs", signal_configs, 
+                                    default=signal_configs, key="hist_signals"
+                                )
+                            with col2:
+                                selected_baselines = st.multiselect(
+                                    "Baseline signals", baseline_configs,
+                                    default=baseline_configs, key="hist_baselines_multi"
+                                )
+                            
+                            selected_configs = selected_signals + selected_baselines
+                            filtered_df = daily_df[daily_df['config'].isin(selected_configs)]
+                            
+                            # Add emoji prefix for clarity
+                            if 'type' in filtered_df.columns and len(filtered_df) > 0:
+                                filtered_df = filtered_df.copy()
+                                filtered_df['label'] = filtered_df.apply(
+                                    lambda r: f"📊 {r['config']}" if r['type'] == 'signal' else f"📈 {r['config']}", 
+                                    axis=1
+                                )
+                                fig = px.line(filtered_df, x='date', y='cumret', color='label',
+                                             title='Cumulative Return: Signal vs Baselines',
+                                             line_dash='type')
+                            else:
+                                fig = px.line(filtered_df, x='date', y='cumret', color='config',
+                                             title='Cumulative Return by Config')
                         else:
                             fig = px.line(daily_df, x='date', y='cumret',
                                          title='Cumulative Return')
+                        fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02))
                         st.plotly_chart(fig, width='stretch')
                     else:
                         st.info("Daily data doesn't have cumret column")
