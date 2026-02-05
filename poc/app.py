@@ -75,7 +75,12 @@ def main():
         # Suite configuration
         st.subheader("Suite Options")
         lags = st.multiselect("Lags", [0, 1, 2, 3, 5], default=[0, 1])
-        resid_opts = st.multiselect("Residualize", ['off', 'industry', 'all'], default=['off'])
+        resid_opts = st.multiselect(
+            "Residualize", 
+            ['off', 'industry', 'factor', 'all'], 
+            default=['off'],
+            help="off=raw signal, industry=demean by industry, factor=regress on risk factors, all=both"
+        )
         include_baselines = st.checkbox("Include Baselines", value=False, help="Run baseline backtests (required for PnL correlation)")
         log_to_mlflow = st.checkbox("Log to MLflow", value=True)
         
