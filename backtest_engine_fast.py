@@ -8,7 +8,6 @@ Created on Wed Dec  2 13:47:34 2020
 
 import numpy as np
 import pandas as pd
-from statsmodels.formula.api import ols
 import statsmodels.api as sm
 import math
 import yfinance as yf
@@ -19,6 +18,17 @@ pd.options.mode.chained_assignment = None
 
 
 # %%
+
+def _fast_residualize(group, y_col, x_cols):
+    y = group[y_col].to_numpy(dtype="float64", copy=False)
+    if x_cols:
+        x_mat = group[x_cols].to_numpy(dtype="float64", copy=False)
+        x_mat = np.column_stack([np.ones(len(y), dtype="float64"), x_mat])
+        coef, _, _, _ = np.linalg.lstsq(x_mat, y, rcond=None)
+        resid = y - x_mat @ coef
+    else:
+        resid = y - y.mean()
+    return pd.Series(resid, index=group.index)
 """
 
 ##############################################################################
@@ -451,81 +461,57 @@ class BacktestFast:
                 raise RuntimeError(
                     "signal residualization only applies to numerical signal"
                 )
-            else:
-
-                temp = pd.merge_asof(
-                    temp.sort_values(by=["date_sig"]),
-                    self.otherfile[
-                        [
-                            "security_id",
-                            "date",
-                            "industry_id",
-                            "sector_id",
-                            "size",
-                            "value",
-                            "growth",
-                            "leverage",
-                            "volatility",
-                            "momentum",
-                            "yield",
-                        ]
-                    ]
-                    .rename(columns={"date": "date_sig", "yield": "yields"})
-                    .sort_values(by="date_sig"),
-                    by="security_id",
-                    on="date_sig",
-                    allow_exact_matches=True,
-                    direction="backward",
-                    tolerance=pd.Timedelta("5d"),
-                ).dropna()
-                temp = temp.sort_values(by=["date", "security_id"])
-                temp = temp.reset_index(drop=True)
-
-                resid_varlist = " + ".join(map(str, self.resid_varlist))
-
-                if self.resid_style == "all":
-
-                    def model(df):
-                        return (
-                            ols(
-                                formula=f"{self.sigvar} ~ {resid_varlist} + C(industry_id)",
-                                data=df,
-                            )
-                            .fit()
-                            .resid
-                        )
-
-                elif self.resid_style == "industry":
-
-                    def model(df):
-                        return (
-                            ols(formula=f"{self.sigvar} ~ C(industry_id)", data=df)
-                            .fit()
-                            .resid
-                        )
-
-                elif self.resid_style == "factor":
-
-                    def model(df):
-                        return (
-                            ols(formula=f"{self.sigvar} ~ {resid_varlist}", data=df)
-                            .fit()
-                            .resid
-                        )
-
-                fit = temp.groupby("date").apply(model)
-                fit = fit.reset_index().drop(columns=["date"]).set_index("level_1")
-                temp = temp.join(fit.rename(columns={0: f"{self.sigvar}_resid"}))
-                temp = temp[
+            temp = pd.merge_asof(
+                temp.sort_values(by=["date_sig"]),
+                self.otherfile[
                     [
                         "security_id",
-                        "date_sig",
                         "date",
-                        "ret",
-                        "resret",
-                        f"{self.sigvar}_resid",
+                        "industry_id",
+                        "sector_id",
+                        "size",
+                        "value",
+                        "growth",
+                        "leverage",
+                        "volatility",
+                        "momentum",
+                        "yield",
                     ]
-                ].rename(columns={f"{self.sigvar}_resid": self.sigvar})
+                ]
+                .rename(columns={"date": "date_sig", "yield": "yields"})
+                .sort_values(by="date_sig"),
+                by="security_id",
+                on="date_sig",
+                allow_exact_matches=True,
+                direction="backward",
+                tolerance=pd.Timedelta("5d"),
+            ).dropna()
+            temp = temp.sort_values(by=["date", "security_id"]).reset_index(drop=True)
+
+            resid_factor_cols = []
+            if self.resid_style in ["all", "factor"]:
+                resid_factor_cols = list(self.resid_varlist)
+
+            ind_cols = []
+            if self.resid_style in ["all", "industry"]:
+                temp["industry_id"] = temp["industry_id"].astype("category")
+                ind_dummies = pd.get_dummies(
+                    temp["industry_id"], prefix="ind", drop_first=True
+                )
+                ind_cols = ind_dummies.columns.tolist()
+                temp = pd.concat([temp, ind_dummies], axis=1)
+
+            x_cols = resid_factor_cols + ind_cols
+
+            def resid_group(df):
+                return _fast_residualize(df, self.sigvar, x_cols)
+
+            resid = temp.groupby("date", sort=False).apply(resid_group)
+            resid = resid.reset_index(level=0, drop=True)
+            temp[self.sigvar] = resid
+            temp = temp[
+                ["security_id", "date_sig", "date", "ret", "resret", self.sigvar]
+            ]
 
         temp["overall"] = 1
         temp["year"] = temp["date"].dt.year
@@ -545,9 +531,9 @@ class BacktestFast:
             cor_file = cor_file.merge(self.datefile[["date", "insample2"]], on="date")
             cor_file = cor_file[cor_file["insample2"] == 1]
 
-        cor = cor_file.groupby(["date", byvar])[[self.sigvar, "ret", "resret"]].corr(
-            method="spearman"
-        )
+        cor = cor_file.groupby(["date", byvar], sort=False)[
+            [self.sigvar, "ret", "resret"]
+        ].corr(method="spearman")
         cor = cor[cor[self.sigvar] == 1]
         cor["date"] = [x[0] for x in cor.index]
         cor[byvar] = [x[1] for x in cor.index]
@@ -555,7 +541,7 @@ class BacktestFast:
         cor = cor[["date", byvar, "ret", "resret"]].reset_index(drop=True)
 
         corn = cor_file[["date", byvar]].copy()
-        corn["n"] = corn.groupby(["date", byvar])["date"].transform("size")
+        corn["n"] = corn.groupby(["date", byvar], sort=False)["date"].transform("size")
         corn = corn.drop_duplicates().reset_index(drop=True)
         cor = pd.merge(cor, corn, on=["date", byvar])
         cor = cor[
@@ -565,8 +551,8 @@ class BacktestFast:
         cor = cor.drop("n", axis=1, inplace=False)
         cor = cor.drop(columns=["date"])
 
-        cor["retIC"] = cor.groupby(byvar)["ret"].transform("mean")
-        cor["resretIC"] = cor.groupby(byvar)["resret"].transform("mean")
+        cor["retIC"] = cor.groupby(byvar, sort=False)["ret"].transform("mean")
+        cor["resretIC"] = cor.groupby(byvar, sort=False)["resret"].transform("mean")
 
         cor = cor.drop(["ret", "resret"], axis=1, inplace=False)
         cor = (
@@ -606,69 +592,45 @@ class BacktestFast:
 
                 port = port.dropna()
 
-                port["rank"] = port.groupby(["date"])[self.double_var].transform(
-                    lambda x: x.rank(method="average")
-                )
-                port["group_size"] = port.groupby(["date"])[self.double_var].transform(
-                    "count"
-                )
+                grp_date = port.groupby("date", sort=False)[self.double_var]
+                rank = grp_date.rank(method="average")
+                group_size = grp_date.transform("count")
                 port["fractile_double"] = np.ceil(
-                    port.pop("rank") * self.double_frac / port.pop("group_size")
+                    rank * self.double_frac / group_size
                 )
 
-                port["group_size"] = port.groupby(["fractile_double", "date"])[
-                    self.sigvar
-                ].transform("count")
+                grp_fd = port.groupby(
+                    ["fractile_double", "date"], sort=False
+                )[self.sigvar]
+                group_size = grp_fd.transform("count")
+                rank = grp_fd.rank(method="max" if self.frac_stretch else "average")
+                percentile = np.ceil(rank * 100 / group_size)
                 if self.frac_stretch:
-                    port["rank"] = port.groupby(["fractile_double", "date"])[
-                        self.sigvar
-                    ].transform(lambda x: x.rank(method="max"))
-                    port["percentile"] = np.ceil(
-                        port.pop("rank") * 100 / port.pop("group_size")
+                    pct_group = percentile.groupby(
+                        [port["fractile_double"], port["date"]], sort=False
                     )
-                    port["percentile"] = port.groupby(["fractile_double", "date"])[
-                        "percentile"
-                    ].transform(
-                        lambda x: (x - x.min() + 1) * 100 / (x.max() - x.min() + 1)
+                    min_pct = pct_group.transform("min")
+                    max_pct = pct_group.transform("max")
+                    percentile = (percentile - min_pct + 1) * 100 / (
+                        max_pct - min_pct + 1
                     )
-                    port["fractile"] = np.ceil(
-                        port.pop("percentile") * n_fractile / 100
-                    )
-                else:
-                    port["rank"] = port.groupby(["fractile_double", "date"])[
-                        self.sigvar
-                    ].transform(lambda x: x.rank(method="average"))
-                    port["fractile"] = np.ceil(
-                        port.pop("rank") * n_fractile / port.pop("group_size")
-                    )
+                port["fractile"] = np.ceil(percentile * n_fractile / 100)
 
             # single sorting
             elif self.sort_method == "single":
 
-                port["group_size"] = port.groupby("date")[self.sigvar].transform(
-                    "count"
-                )
-
+                grp_date = port.groupby("date", sort=False)[self.sigvar]
+                group_size = grp_date.transform("count")
+                rank = grp_date.rank(method="max" if self.frac_stretch else "average")
+                percentile = np.ceil(rank * 100 / group_size)
                 if self.frac_stretch:
-                    port["rank"] = port.groupby("date")[self.sigvar].transform(
-                        lambda x: x.rank(method="max")
+                    pct_group = percentile.groupby(port["date"], sort=False)
+                    min_pct = pct_group.transform("min")
+                    max_pct = pct_group.transform("max")
+                    percentile = (percentile - min_pct + 1) * 100 / (
+                        max_pct - min_pct + 1
                     )
-                    port["percentile"] = np.ceil(
-                        port.pop("rank") * 100 / port.pop("group_size")
-                    )
-                    port["percentile"] = port.groupby(["date"])["percentile"].transform(
-                        lambda x: (x - x.min() + 1) * 100 / (x.max() - x.min() + 1)
-                    )
-                    port["fractile"] = np.ceil(
-                        port.pop("percentile") * n_fractile / 100
-                    )
-                else:
-                    port["rank"] = port.groupby("date")[self.sigvar].transform(
-                        lambda x: x.rank(method="average")
-                    )
-                    port["fractile"] = np.ceil(
-                        port.pop("rank") * n_fractile / port.pop("group_size")
-                    )
+                port["fractile"] = np.ceil(percentile * n_fractile / 100)
 
         elif self.input_type == "fractile":
             port["fractile"] = port[self.sigvar]
@@ -680,49 +642,54 @@ class BacktestFast:
         )
 
         if self.weight == "equal":
-            port["weight"] = port.groupby(["date", "fractile"])[
+            group_size = port.groupby(["date", "fractile"], sort=False)[
                 "security_id"
-            ].transform(lambda x: 1 / x.count())
+            ].transform("count")
+            port["weight"] = 1 / group_size
         elif self.weight == "value":
-            port["mcap_h"] = port.groupby(["date", "fractile"])["mcap"].transform(
-                lambda x: x.quantile(q=self.upper_pct / 100)
+            mcap_grp = port.groupby(["date", "fractile"], sort=False)["mcap"]
+            port["mcap_h"] = mcap_grp.transform(
+                "quantile", q=self.upper_pct / 100
             )
-            port["mcap_l"] = port.groupby(["date", "fractile"])["mcap"].transform(
-                lambda x: x.quantile(q=1 - self.upper_pct / 100)
+            port["mcap_l"] = mcap_grp.transform(
+                "quantile", q=1 - self.upper_pct / 100
             )
             port["mcap"] = np.select(
                 [port["mcap"] > port["mcap_h"], port["mcap"] < port["mcap_l"]],
                 [port["mcap_h"], port["mcap_l"]],
                 default=port["mcap"],
             )
-            port["weight"] = port.groupby(["date", "fractile"])["mcap"].transform(
-                lambda x: x / x.sum() * 1
-            )
+            mcap_sum = port.groupby(["date", "fractile"], sort=False)[
+                "mcap"
+            ].transform("sum")
+            port["weight"] = port["mcap"] / mcap_sum
         elif self.weight == "volume":
-            port["adv_h"] = port.groupby(["date", "fractile"])["adv"].transform(
-                lambda x: x.quantile(q=self.upper_pct / 100)
-            )
-            port["adv_l"] = port.groupby(["date", "fractile"])["adv"].transform(
-                lambda x: x.quantile(q=1 - self.upper_pct / 100)
-            )
+            adv_grp = port.groupby(["date", "fractile"], sort=False)["adv"]
+            port["adv_h"] = adv_grp.transform("quantile", q=self.upper_pct / 100)
+            port["adv_l"] = adv_grp.transform("quantile", q=1 - self.upper_pct / 100)
             port["adv"] = np.select(
                 [port["adv"] > port["adv_h"], port["adv"] < port["adv_l"]],
                 [port["adv_h"], port["adv_l"]],
                 default=port["adv"],
             )
-            port["weight"] = port.groupby(["date", "fractile"])["adv"].transform(
-                lambda x: x / x.sum() * 1
+            adv_sum = port.groupby(["date", "fractile"], sort=False)["adv"].transform(
+                "sum"
             )
+            port["weight"] = port["adv"] / adv_sum
         port2 = port[
             ["security_id", "date", "ret", "resret", "fractile", "weight"]
             + self.factor_list
         ]
 
         numcos = (
-            port2.groupby(["date", "fractile"])["security_id"].count().reset_index()
+            port2.groupby(["date", "fractile"], sort=False)["security_id"]
+            .count()
+            .reset_index()
         )
         numcos = numcos[numcos["fractile"].isin([1, n_fractile])]
-        numcos["numcos"] = numcos.groupby("date")["security_id"].transform("min")
+        numcos["numcos"] = numcos.groupby("date", sort=False)["security_id"].transform(
+            "min"
+        )
         numcos = numcos[["date", "numcos"]].drop_duplicates()
         port2 = port2.merge(numcos, on="date")
         port2 = port2[port2["numcos"] >= self.mincos]
@@ -741,18 +708,18 @@ class BacktestFast:
 
             port2[var] = port2[var] * port2["weight"]
 
-        check = port2.groupby(["date", "fractile"]).sum().reset_index()
+        check = port2.groupby(["date", "fractile"], sort=False).sum().reset_index()
         check2 = (
-            port2.groupby(["date", "fractile"])["security_id"]
+            port2.groupby(["date", "fractile"], sort=False)["security_id"]
             .count()
             .reset_index()
             .rename(columns={"security_id": "numcos"})
-            .groupby("fractile")
+            .groupby("fractile", sort=False)
             .mean()
             .reset_index()
         )
-        check3 = check.groupby(["fractile"])[["ret", "resret"]].mean() * 252
-        check = check.groupby("fractile")[
+        check3 = check.groupby(["fractile"], sort=False)[["ret", "resret"]].mean() * 252
+        check = check.groupby("fractile", sort=False)[
             ["size", "value", "growth", "leverage", "volatility", "momentum", "yield"]
         ].mean()
         check = check.merge(check2, on="fractile")
@@ -784,38 +751,30 @@ class BacktestFast:
 
                 temp = temp.dropna()
 
-                temp["rank"] = temp.groupby([byvar, "date"])[self.double_var].transform(
-                    lambda x: x.rank(method="average")
-                )
-                temp["group_size"] = temp.groupby([byvar, "date"])[
-                    self.double_var
-                ].transform("count")
+                grp_bd = temp.groupby([byvar, "date"], sort=False)[self.double_var]
+                rank = grp_bd.rank(method="average")
+                group_size = grp_bd.transform("count")
                 temp["fractile_double"] = np.ceil(
-                    temp.pop("rank") * self.double_frac / temp.pop("group_size")
+                    rank * self.double_frac / group_size
                 )
 
-                temp["group_size"] = temp.groupby([byvar, "fractile_double", "date"])[
-                    self.sigvar
-                ].transform("count")
+                grp_fd = temp.groupby(
+                    [byvar, "fractile_double", "date"], sort=False
+                )[self.sigvar]
+                group_size = grp_fd.transform("count")
+                rank = grp_fd.rank(method="max" if self.frac_stretch else "average")
+                percentile = np.ceil(rank * 100 / group_size)
                 if self.frac_stretch:
-                    temp["rank"] = temp.groupby([byvar, "fractile_double", "date"])[
-                        self.sigvar
-                    ].transform(lambda x: x.rank(method="max"))
-                    temp["percentile"] = np.ceil(
-                        temp.pop("rank") * 100 / temp.pop("group_size")
+                    pct_group = percentile.groupby(
+                        [temp[byvar], temp["fractile_double"], temp["date"]],
+                        sort=False,
                     )
-                    temp["percentile"] = temp.groupby(
-                        [byvar, "fractile_double", "date"]
-                    )["percentile"].transform(
-                        lambda x: (x - x.min() + 1) * 100 / (x.max() - x.min() + 1)
+                    min_pct = pct_group.transform("min")
+                    max_pct = pct_group.transform("max")
+                    percentile = (percentile - min_pct + 1) * 100 / (
+                        max_pct - min_pct + 1
                     )
-                else:
-                    temp["rank"] = temp.groupby([byvar, "fractile_double", "date"])[
-                        self.sigvar
-                    ].transform(lambda x: x.rank(method="average"))
-                    temp["percentile"] = np.ceil(
-                        temp.pop("rank") * 100 / temp.pop("group_size")
-                    )
+                temp["percentile"] = percentile
 
                 temp["position"] = np.select(
                     [
@@ -829,28 +788,20 @@ class BacktestFast:
 
             # single sorting
             elif self.sort_method == "single":
-                temp["group_size"] = temp.groupby([byvar, "date"])[
-                    self.sigvar
-                ].transform("count")
+                grp_bd = temp.groupby([byvar, "date"], sort=False)[self.sigvar]
+                group_size = grp_bd.transform("count")
+                rank = grp_bd.rank(method="max" if self.frac_stretch else "average")
+                percentile = np.ceil(rank * 100 / group_size)
                 if self.frac_stretch:
-                    temp["rank"] = temp.groupby([byvar, "date"])[self.sigvar].transform(
-                        lambda x: x.rank(method="max")
+                    pct_group = percentile.groupby(
+                        [temp[byvar], temp["date"]], sort=False
                     )
-                    temp["percentile"] = np.ceil(
-                        temp.pop("rank") * 100 / temp.pop("group_size")
+                    min_pct = pct_group.transform("min")
+                    max_pct = pct_group.transform("max")
+                    percentile = (percentile - min_pct + 1) * 100 / (
+                        max_pct - min_pct + 1
                     )
-                    temp["percentile"] = temp.groupby([byvar, "date"])[
-                        "percentile"
-                    ].transform(
-                        lambda x: (x - x.min() + 1) * 100 / (x.max() - x.min() + 1)
-                    )
-                else:
-                    temp["rank"] = temp.groupby([byvar, "date"])[self.sigvar].transform(
-                        lambda x: x.rank(method="average")
-                    )
-                    temp["percentile"] = np.ceil(
-                        temp.pop("rank") * 100 / temp.pop("group_size")
-                    )
+                temp["percentile"] = percentile
 
                 temp["position"] = np.select(
                     [
@@ -890,60 +841,54 @@ class BacktestFast:
         if self.input_type != "weight":
             # generate weight
             if self.weight == "equal":
-                port["weight"] = (
-                    port.groupby([byvar, "date", "position"])["security_id"].transform(
-                        lambda x: 1 / x.count()
-                    )
-                    * port["position"]
-                )
+                group_size = port.groupby(
+                    [byvar, "date", "position"], sort=False
+                )["security_id"].transform("count")
+                port["weight"] = (1 / group_size) * port["position"]
             elif self.weight == "value":
-                port["mcap_h"] = port.groupby([byvar, "date", "position"])[
-                    "mcap"
-                ].transform(lambda x: x.quantile(q=self.upper_pct / 100))
-                port["mcap_l"] = port.groupby([byvar, "date", "position"])[
-                    "mcap"
-                ].transform(lambda x: x.quantile(q=1 - self.upper_pct / 100))
+                mcap_grp = port.groupby([byvar, "date", "position"], sort=False)["mcap"]
+                port["mcap_h"] = mcap_grp.transform(
+                    "quantile", q=self.upper_pct / 100
+                )
+                port["mcap_l"] = mcap_grp.transform(
+                    "quantile", q=1 - self.upper_pct / 100
+                )
                 port["mcap"] = np.select(
                     [port["mcap"] > port["mcap_h"], port["mcap"] < port["mcap_l"]],
                     [port["mcap_h"], port["mcap_l"]],
                     default=port["mcap"],
                 )
-                port["weight"] = (
-                    port.groupby([byvar, "date", "position"])["mcap"].transform(
-                        lambda x: x / x.sum() * 1
-                    )
-                    * port["position"]
-                )
+                mcap_sum = port.groupby([byvar, "date", "position"], sort=False)[
+                    "mcap"
+                ].transform("sum")
+                port["weight"] = (port["mcap"] / mcap_sum) * port["position"]
             elif self.weight == "volume":
-                port["adv_h"] = port.groupby([byvar, "date", "position"])[
-                    "adv"
-                ].transform(lambda x: x.quantile(q=self.upper_pct / 100))
-                port["adv_l"] = port.groupby([byvar, "date", "position"])[
-                    "adv"
-                ].transform(lambda x: x.quantile(q=1 - self.upper_pct / 100))
+                adv_grp = port.groupby([byvar, "date", "position"], sort=False)["adv"]
+                port["adv_h"] = adv_grp.transform(
+                    "quantile", q=self.upper_pct / 100
+                )
+                port["adv_l"] = adv_grp.transform(
+                    "quantile", q=1 - self.upper_pct / 100
+                )
                 port["adv"] = np.select(
                     [port["adv"] > port["adv_h"], port["adv"] < port["adv_l"]],
                     [port["adv_h"], port["adv_l"]],
                     default=port["adv"],
                 )
-                port["weight"] = (
-                    port.groupby([byvar, "date", "position"])["adv"].transform(
-                        lambda x: x / x.sum() * 1
-                    )
-                    * port["position"]
-                )
+                adv_sum = port.groupby([byvar, "date", "position"], sort=False)[
+                    "adv"
+                ].transform("sum")
+                port["weight"] = (port["adv"] / adv_sum) * port["position"]
 
         elif self.input_type == "weight":
             port["weight"] = port[self.sigvar]
             if "position" not in port.columns.to_list():
                 port["position"] = np.where(port["weight"] > 0, 1, -1)
             if self.weight_adj == True:
-                port["weight"] = (
-                    port.groupby([byvar, "date", "position"])["weight"].transform(
-                        lambda x: x / x.sum()
-                    )
-                    * port["position"]
-                )
+                weight_sum = port.groupby([byvar, "date", "position"], sort=False)[
+                    "weight"
+                ].transform("sum")
+                port["weight"] = (port["weight"] / weight_sum) * port["position"]
             port["weight"]
         port2 = port[
             ["security_id", "date", byvar, "ret", "resret", "position", "weight"]
@@ -977,12 +922,12 @@ class BacktestFast:
         # number of stocks with non-zero position
         turnover["numcos_l"] = np.where(turnover["weight"] > 0, 1, 0)
         turnover["numcos_s"] = np.where(turnover["weight"] < 0, 1, 0)
-        turnover["numcos_l"] = turnover.groupby([byvar, "date"])["numcos_l"].transform(
-            "sum"
-        )
-        turnover["numcos_s"] = turnover.groupby([byvar, "date"])["numcos_s"].transform(
-            "sum"
-        )
+        turnover["numcos_l"] = turnover.groupby(
+            [byvar, "date"], sort=False
+        )["numcos_l"].transform("sum")
+        turnover["numcos_s"] = turnover.groupby(
+            [byvar, "date"], sort=False
+        )["numcos_s"].transform("sum")
         turnover["numcos"] = turnover[["numcos_l", "numcos_s"]].min(axis=1)
         if self.method == "long_short":
             turnover = turnover[turnover["numcos"] >= self.mincos]
@@ -990,21 +935,33 @@ class BacktestFast:
             turnover = turnover[turnover["numcos_l"] >= self.mincos]
 
         # calculate turnover from previous trading day
-        turnover2 = turnover.copy()
-        turnover2["n"] = turnover2["n"] + 1
-        # variable 'date' is dropped, and merged back later on, because of the outer join
+        prev = turnover[["security_id", byvar, "n", "weight"]].copy()
+        prev["n"] = prev["n"] + 1
+        # variable 'date' is dropped, and merged back later on
         turnover = turnover.drop(columns=["date"]).merge(
-            turnover2[["security_id", byvar, "n", "weight"]],
-            how="outer",
+            prev,
+            how="left",
             on=["security_id", byvar, "n"],
+            suffixes=("", "_prev"),
         )
-        turnover["weight_x"] = turnover["weight_x"].fillna(0)
-        turnover["weight_y"] = turnover["weight_y"].fillna(0)
-        turnover["weight_diff"] = np.absolute(
-            turnover["weight_x"] - turnover["weight_y"]
+        turnover["weight_prev"] = turnover["weight_prev"].fillna(0)
+        turnover["weight_diff"] = (turnover["weight"] - turnover["weight_prev"]).abs()
+
+        current_keys = turnover[["security_id", byvar, "n"]].drop_duplicates()
+        exits = prev.merge(
+            current_keys, on=["security_id", byvar, "n"], how="left", indicator=True
         )
+        exits = exits[exits["_merge"] == "left_only"].drop(columns=["_merge"])
+        exits = exits.rename(columns={"weight": "weight_prev"})
+        exits["weight"] = 0.0
+        exits["weight_diff"] = exits["weight_prev"].abs()
+        exits["numcos_l"] = np.nan
+        exits["numcos_s"] = np.nan
+        exits["numcos"] = np.nan
+
+        turnover = pd.concat([turnover, exits], ignore_index=True, sort=False)
         turnover = turnover.merge(self.datefile[["date", "n"]], on="n")
-        turnover["n_min"] = turnover.groupby(byvar)["n"].transform("min")
+        turnover["n_min"] = turnover.groupby(byvar, sort=False)["n"].transform("min")
         turnover["weight_diff"] = np.where(
             turnover["n"] == turnover["n_min"], 0, turnover["weight_diff"]
         )
@@ -1038,11 +995,11 @@ class BacktestFast:
             ) / (turnover["close_adj"])
 
         turnover["tc"] = turnover["tc"] * turnover["weight_diff"]
-        tc = turnover.groupby([byvar, "date"])["tc"].sum().reset_index()
+        tc = turnover.groupby([byvar, "date"], sort=False)["tc"].sum().reset_index()
         # calculate turnover and transaction cost for each day
-        turnover["turnover"] = turnover.groupby([byvar, "n"])["weight_diff"].transform(
-            "sum"
-        )
+        turnover["turnover"] = turnover.groupby([byvar, "n"], sort=False)[
+            "weight_diff"
+        ].transform("sum")
         turnover = (
             turnover[["date", byvar, "numcos_l", "numcos_s", "turnover", "numcos"]]
             .drop_duplicates()
@@ -1051,14 +1008,14 @@ class BacktestFast:
         if self.method == "long_short":
             date_minmax = (
                 turnover[turnover["numcos"] >= self.mincos]
-                .groupby(byvar)["date"]
+                .groupby(byvar, sort=False)["date"]
                 .agg(["min", "max"])
                 .reset_index()
             )
         elif self.method == "long_only":
             date_minmax = (
                 turnover[turnover["numcos_l"] >= self.mincos]
-                .groupby(byvar)["date"]
+                .groupby(byvar, sort=False)["date"]
                 .agg(["min", "max"])
                 .reset_index()
             )
@@ -1085,7 +1042,7 @@ class BacktestFast:
             turnover = turnover[turnover["insample2"] == 1]
 
         turnover = (
-            turnover.groupby(byvar)
+            turnover.groupby(byvar, sort=False)
             .mean()
             .reset_index()
             .rename(columns={byvar: "group"})
@@ -1100,8 +1057,12 @@ class BacktestFast:
         port = weight_file[["security_id", byvar, "date", "ret", "resret", "weight"]]
         port["numcos_l"] = np.where(port["weight"] > 0, 1, 0)
         port["numcos_s"] = np.where(port["weight"] < 0, 1, 0)
-        port["numcos_l"] = port.groupby([byvar, "date"])["numcos_l"].transform("sum")
-        port["numcos_s"] = port.groupby([byvar, "date"])["numcos_s"].transform("sum")
+        port["numcos_l"] = port.groupby([byvar, "date"], sort=False)[
+            "numcos_l"
+        ].transform("sum")
+        port["numcos_s"] = port.groupby([byvar, "date"], sort=False)[
+            "numcos_s"
+        ].transform("sum")
         port["numcos"] = port[["numcos_l", "numcos_s"]].min(axis=1)
 
         port = port.merge(
@@ -1145,7 +1106,11 @@ class BacktestFast:
         for stat in var_list:
             port[stat] = port[stat] * port["weight"]
 
-        port2 = port.groupby([byvar, "date"])[var_list].sum().reset_index()
+        port2 = (
+            port.groupby([byvar, "date"], sort=False)[var_list]
+            .sum()
+            .reset_index()
+        )
         port2 = port2.merge(tc, how="left", on=[byvar, "date"])
         port2["tc"] = port2["tc"].fillna(0)
         port2["ret_net"] = port2["ret"] - port2["tc"]
@@ -1160,11 +1125,13 @@ class BacktestFast:
             port2 = port2.merge(self.datefile[["date", "insample2"]], on="date")
             port2 = port2[port2["insample2"] == 1]
 
-        port2["cumret"] = port2.groupby(byvar)["ret"].transform("cumsum")
-        port2["cumretnet"] = port2.groupby(byvar)["ret_net"].transform("cumsum")
-        port2["drawdown"] = port2["cumret"] - port2.groupby(byvar)["cumret"].transform(
-            "cummax"
+        port2["cumret"] = port2.groupby(byvar, sort=False)["ret"].transform("cumsum")
+        port2["cumretnet"] = port2.groupby(byvar, sort=False)["ret_net"].transform(
+            "cumsum"
         )
+        port2["drawdown"] = port2["cumret"] - port2.groupby(
+            byvar, sort=False
+        )["cumret"].transform("cummax")
 
         if self.method == "long_only":
             if self.long_index == "sp500":
@@ -1235,7 +1202,7 @@ class BacktestFast:
         # calculate factor exposure
         exposure = (
             port2[[byvar] + factor_list]
-            .groupby(byvar)
+            .groupby(byvar, sort=False)
             .mean()
             .reset_index()
             .rename(columns={byvar: "group"})
@@ -1265,38 +1232,37 @@ class BacktestFast:
         if "year" in byvar or "yr" in byvar:
 
             port2["trade"] = np.where(port2["ret"] == 0, 0, 1)
-            port2["num_date"] = port2.groupby(byvar)["trade"].transform("sum")
-            port2["ret_ann"] = port2.groupby(byvar)["ret"].transform(
-                lambda x: x.mean() * x.count()
-            )
-            port2["ret_std"] = port2.groupby(byvar)["ret"].transform(
-                lambda x: x.std() * math.sqrt(x.count())
-            )
+            group = port2.groupby(byvar, sort=False)
+            port2["num_date"] = group["trade"].transform("sum")
+            ret_count = group["ret"].transform("count")
+            ret_mean = group["ret"].transform("mean")
+            ret_std = group["ret"].transform("std")
+            port2["ret_ann"] = ret_mean * ret_count
+            port2["ret_std"] = ret_std * np.sqrt(ret_count)
             port2["sharpe_ret"] = port2["ret_ann"] / port2["ret_std"]
-            port2["resret_ann"] = port2.groupby(byvar)["resret"].transform(
-                lambda x: x.mean() * x.count()
-            )
-            port2["resret_std"] = port2.groupby(byvar)["resret"].transform(
-                lambda x: x.std() * math.sqrt(x.count())
-            )
+            resret_mean = group["resret"].transform("mean")
+            resret_std = group["resret"].transform("std")
+            port2["resret_ann"] = resret_mean * ret_count
+            port2["resret_std"] = resret_std * np.sqrt(ret_count)
             port2["sharpe_resret"] = port2["resret_ann"] / port2["resret_std"]
-            port2["ret_net_ann"] = port2.groupby(byvar)["ret_net"].transform(
-                lambda x: x.mean() * x.count()
-            )
-            port2["ret_net_std"] = port2.groupby(byvar)["ret_net"].transform(
-                lambda x: x.std() * math.sqrt(x.count())
-            )
+            ret_net_mean = group["ret_net"].transform("mean")
+            ret_net_std = group["ret_net"].transform("std")
+            port2["ret_net_ann"] = ret_net_mean * ret_count
+            port2["ret_net_std"] = ret_net_std * np.sqrt(ret_count)
             port2["sharpe_retnet"] = port2["ret_net_ann"] / port2["ret_net_std"]
-            port2["maxdraw"] = port2.groupby(byvar)["drawdown"].transform("min")
-            port2["retPctPos"] = port2.groupby(byvar)["ret"].transform(
-                lambda x: np.mean(np.sign(x) + 1) / 2
+            port2["maxdraw"] = group["drawdown"].transform("min")
+            ret_pct = (np.sign(port2["ret"]) + 1) / 2
+            resret_pct = (np.sign(port2["resret"]) + 1) / 2
+            retnet_pct = (np.sign(port2["ret_net"]) + 1) / 2
+            port2["retPctPos"] = ret_pct.groupby(port2[byvar], sort=False).transform(
+                "mean"
             )
-            port2["resretPctPos"] = port2.groupby(byvar)["resret"].transform(
-                lambda x: np.mean(np.sign(x) + 1) / 2
-            )
-            port2["retnetPctPos"] = port2.groupby(byvar)["ret_net"].transform(
-                lambda x: np.mean(np.sign(x) + 1) / 2
-            )
+            port2["resretPctPos"] = resret_pct.groupby(
+                port2[byvar], sort=False
+            ).transform("mean")
+            port2["retnetPctPos"] = retnet_pct.groupby(
+                port2[byvar], sort=False
+            ).transform("mean")
             stats_list_f = [
                 "ret_ann",
                 "ret_std",
@@ -1324,12 +1290,11 @@ class BacktestFast:
 
             if self.method == "long_only":
 
-                port2[f"{self.long_index}_ann"] = port2.groupby(byvar)[
-                    self.long_index
-                ].transform(lambda x: x.mean() * x.count())
-                port2[f"{self.long_index}_std"] = port2.groupby(byvar)[
-                    self.long_index
-                ].transform(lambda x: x.std() * math.sqrt(x.count()))
+                long_count = group[self.long_index].transform("count")
+                long_mean = group[self.long_index].transform("mean")
+                long_std = group[self.long_index].transform("std")
+                port2[f"{self.long_index}_ann"] = long_mean * long_count
+                port2[f"{self.long_index}_std"] = long_std * np.sqrt(long_count)
                 port2[f"sharpe_{self.long_index}"] = (
                     port2[f"{self.long_index}_ann"] / port2[f"{self.long_index}_std"]
                 )
@@ -1347,39 +1312,37 @@ class BacktestFast:
         else:
 
             port2["trade"] = np.where(port2["ret"] == 0, 0, 1)
-            port2["num_date"] = port2.groupby(byvar)["trade"].transform("sum")
+            group = port2.groupby(byvar, sort=False)
+            port2["num_date"] = group["trade"].transform("sum")
             # port2 = port2[port2['trade']==1]
-            port2["ret_ann"] = port2.groupby(byvar)["ret"].transform(
-                lambda x: x.mean() * 252
-            )
-            port2["ret_std"] = port2.groupby(byvar)["ret"].transform(
-                lambda x: x.std() * math.sqrt(252)
-            )
+            ret_mean = group["ret"].transform("mean")
+            ret_std = group["ret"].transform("std")
+            port2["ret_ann"] = ret_mean * 252
+            port2["ret_std"] = ret_std * math.sqrt(252)
             port2["sharpe_ret"] = port2["ret_ann"] / port2["ret_std"]
-            port2["resret_ann"] = port2.groupby(byvar)["resret"].transform(
-                lambda x: x.mean() * 252
-            )
-            port2["resret_std"] = port2.groupby(byvar)["resret"].transform(
-                lambda x: x.std() * math.sqrt(252)
-            )
+            resret_mean = group["resret"].transform("mean")
+            resret_std = group["resret"].transform("std")
+            port2["resret_ann"] = resret_mean * 252
+            port2["resret_std"] = resret_std * math.sqrt(252)
             port2["sharpe_resret"] = port2["resret_ann"] / port2["resret_std"]
-            port2["ret_net_ann"] = port2.groupby(byvar)["ret_net"].transform(
-                lambda x: x.mean() * 252
-            )
-            port2["ret_net_std"] = port2.groupby(byvar)["ret_net"].transform(
-                lambda x: x.std() * math.sqrt(252)
-            )
+            ret_net_mean = group["ret_net"].transform("mean")
+            ret_net_std = group["ret_net"].transform("std")
+            port2["ret_net_ann"] = ret_net_mean * 252
+            port2["ret_net_std"] = ret_net_std * math.sqrt(252)
             port2["sharpe_retnet"] = port2["ret_net_ann"] / port2["ret_net_std"]
-            port2["maxdraw"] = port2.groupby(byvar)["drawdown"].transform("min")
-            port2["retPctPos"] = port2.groupby(byvar)["ret"].transform(
-                lambda x: np.mean(np.sign(x) + 1) / 2
+            port2["maxdraw"] = group["drawdown"].transform("min")
+            ret_pct = (np.sign(port2["ret"]) + 1) / 2
+            resret_pct = (np.sign(port2["resret"]) + 1) / 2
+            retnet_pct = (np.sign(port2["ret_net"]) + 1) / 2
+            port2["retPctPos"] = ret_pct.groupby(port2[byvar], sort=False).transform(
+                "mean"
             )
-            port2["resretPctPos"] = port2.groupby(byvar)["resret"].transform(
-                lambda x: np.mean(np.sign(x) + 1) / 2
-            )
-            port2["retnetPctPos"] = port2.groupby(byvar)["ret_net"].transform(
-                lambda x: np.mean(np.sign(x) + 1) / 2
-            )
+            port2["resretPctPos"] = resret_pct.groupby(
+                port2[byvar], sort=False
+            ).transform("mean")
+            port2["retnetPctPos"] = retnet_pct.groupby(
+                port2[byvar], sort=False
+            ).transform("mean")
             stats_list_f = [
                 "ret_ann",
                 "ret_std",
@@ -1407,12 +1370,10 @@ class BacktestFast:
 
             if self.method == "long_only":
 
-                port2[f"{self.long_index}_ann"] = port2.groupby(byvar)[
-                    self.long_index
-                ].transform(lambda x: x.mean() * 252)
-                port2[f"{self.long_index}_std"] = port2.groupby(byvar)[
-                    self.long_index
-                ].transform(lambda x: x.std() * math.sqrt(252))
+                long_mean = group[self.long_index].transform("mean")
+                long_std = group[self.long_index].transform("std")
+                port2[f"{self.long_index}_ann"] = long_mean * 252
+                port2[f"{self.long_index}_std"] = long_std * math.sqrt(252)
                 port2[f"sharpe_{self.long_index}"] = (
                     port2[f"{self.long_index}_ann"] / port2[f"{self.long_index}_std"]
                 )
