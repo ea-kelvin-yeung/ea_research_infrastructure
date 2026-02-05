@@ -310,12 +310,12 @@ def main():
                 runs_df['label'] = runs_df['run_id'].str[:12] + '...'
             
             # Select a run
-            selected_label = st.selectbox("Select a run to view", runs_df['label'].tolist())
+            selected_label = st.selectbox("Select an experiment to view", runs_df['label'].tolist())
             selected_run = runs_df[runs_df['label'] == selected_label].iloc[0]
             run_id = selected_run['run_id']
             
-            # Show run details
-            st.subheader("Run Details")
+            # Show experiment details
+            st.subheader("Experiment Details")
             col1, col2, col3 = st.columns(3)
             with col1:
                 st.metric("Signal", selected_run.get('tags.signal_name', 'N/A'))

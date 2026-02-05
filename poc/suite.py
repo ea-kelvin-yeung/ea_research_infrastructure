@@ -21,6 +21,10 @@ DEFAULT_GRID = {
 }
 
 
+# Risk factors available in the risk file
+RISK_FACTORS = ['size', 'value', 'growth', 'leverage', 'volatility', 'momentum']
+
+
 @dataclass
 class SuiteResult:
     """Result from running a full suite."""
@@ -28,6 +32,8 @@ class SuiteResult:
     baselines: Dict[str, BacktestResult]     # Baseline name -> result
     summary: pd.DataFrame                     # One row per config
     correlations: pd.DataFrame                # Signal/PnL correlations to baselines
+    factor_exposures: Optional[pd.DataFrame] = None  # Signal correlations to risk factors
+    coverage: Optional[Dict] = None           # Signal coverage metrics
 
 
 def _run_single_config(signal_df, catalog, lag, residualize):
@@ -117,11 +123,21 @@ def run_suite(
     # Compute correlations
     correlations = _compute_correlations(signal_df, catalog, results, baselines, baseline_start_date, baseline_end_date)
     
+    # Compute factor exposures
+    print("Computing factor exposures...")
+    factor_exposures = _compute_factor_exposures(signal_df, catalog)
+    
+    # Compute coverage metrics
+    print("Computing coverage metrics...")
+    coverage = _compute_coverage(signal_df, catalog)
+    
     return SuiteResult(
         results=results,
         baselines=baselines,
         summary=summary,
         correlations=correlations,
+        factor_exposures=factor_exposures,
+        coverage=coverage,
     )
 
 
@@ -204,3 +220,89 @@ def get_best_config(suite_result: SuiteResult, metric: str = 'sharpe') -> str:
     if len(valid_rows) == 0:
         return signal_rows['config'].iloc[0] if len(signal_rows) > 0 else None
     return valid_rows.loc[valid_rows[metric].idxmax(), 'config']
+
+
+def _compute_factor_exposures(signal_df: pd.DataFrame, catalog: dict) -> pd.DataFrame:
+    """
+    Compute correlations between signal and risk factors.
+    
+    Returns DataFrame with columns: factor, correlation, abs_correlation
+    """
+    risk_df = catalog.get('risk')
+    if risk_df is None:
+        return pd.DataFrame()
+    
+    # Merge signal with risk factors
+    # Signal has date_sig, risk has date - use date_sig as the reference
+    signal_cols = ['security_id', 'date_sig', 'signal']
+    if not all(c in signal_df.columns for c in signal_cols):
+        return pd.DataFrame()
+    
+    signal_subset = signal_df[signal_cols].copy()
+    
+    # Get available risk factors
+    available_factors = [f for f in RISK_FACTORS if f in risk_df.columns]
+    if not available_factors:
+        return pd.DataFrame()
+    
+    # Prepare risk data with renamed date column
+    risk_cols = ['security_id', 'date'] + available_factors
+    risk_subset = risk_df[risk_cols].rename(columns={'date': 'date_sig'})
+    
+    # Merge signal with risk factors
+    merged = signal_subset.merge(risk_subset, on=['security_id', 'date_sig'], how='inner')
+    
+    if len(merged) < 100:
+        return pd.DataFrame()
+    
+    # Compute correlations
+    rows = []
+    for factor in available_factors:
+        if factor in merged.columns:
+            corr = merged['signal'].corr(merged[factor])
+            rows.append({
+                'factor': factor,
+                'correlation': corr,
+                'abs_correlation': abs(corr) if not np.isnan(corr) else np.nan,
+            })
+    
+    result = pd.DataFrame(rows)
+    if len(result) > 0:
+        result = result.sort_values('abs_correlation', ascending=False)
+    
+    return result
+
+
+def _compute_coverage(signal_df: pd.DataFrame, catalog: dict) -> Dict:
+    """
+    Compute signal coverage metrics.
+    
+    Returns dict with:
+        - avg_securities_per_day: Average number of securities with signal per day
+        - coverage_pct: Percentage of universe covered
+        - total_days: Number of days with signal
+    """
+    if 'date_sig' not in signal_df.columns or 'security_id' not in signal_df.columns:
+        return {}
+    
+    # Securities per day
+    securities_per_day = signal_df.groupby('date_sig')['security_id'].nunique()
+    avg_securities = securities_per_day.mean()
+    
+    # Total unique securities in signal
+    unique_signal_securities = signal_df['security_id'].nunique()
+    
+    # Try to get universe size from risk file
+    risk_df = catalog.get('risk')
+    if risk_df is not None and 'security_id' in risk_df.columns:
+        unique_universe_securities = risk_df['security_id'].nunique()
+        coverage_pct = 100 * unique_signal_securities / unique_universe_securities if unique_universe_securities > 0 else np.nan
+    else:
+        coverage_pct = np.nan
+    
+    return {
+        'avg_securities_per_day': avg_securities,
+        'coverage_pct': coverage_pct,
+        'total_days': securities_per_day.count(),
+        'unique_securities': unique_signal_securities,
+    }

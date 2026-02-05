@@ -243,6 +243,8 @@ class SuiteResult:
     baselines: Dict[str, BacktestResult]  # baseline_name -> result
     summary: pd.DataFrame                  # All configs summarized
     correlations: pd.DataFrame             # Signal/PnL correlations
+    factor_exposures: pd.DataFrame         # Signal correlation to risk factors
+    coverage: Dict                         # avg_securities_per_day, coverage_pct, etc.
 
     @property best_sharpe -> float
     @property best_config -> str
@@ -253,6 +255,15 @@ class SuiteResult:
 run_suite(signal_df, catalog, grid=None, include_baselines=True, n_jobs=1) -> SuiteResult
 get_best_config(suite_result, metric='sharpe') -> str
 ```
+
+**Risk Factor Exposures:**
+Correlates signal values to common risk factors (size, value, growth, leverage, volatility, momentum) to identify factor overlap.
+
+**Coverage Metrics:**
+- `avg_securities_per_day`: Average number of securities with signal per day
+- `coverage_pct`: Percentage of universe securities covered by signal
+- `unique_securities`: Total unique securities in signal
+- `total_days`: Number of trading days with signal
 
 ---
 
@@ -276,25 +287,42 @@ get_run_history(experiment_name, max_results=100) -> List[dict]
 
 ### 7. `poc/tearsheet.py` - Tear Sheet Generator
 
-Creates HTML report with traffic-light verdict.
+Creates HTML report with traffic-light verdict and composite quality score.
 
 **Sections:**
 1. **Header** - Signal name, date range, snapshot
-2. **Summary Table** - All configs with key metrics
-3. **Cumulative Return Chart** - Interactive Plotly chart
-4. **Baseline Comparison** - Correlations table
-5. **Verdict Panel** - Green/Yellow/Red with reasons
+2. **Verdict Panel** - Green/Yellow/Red with reasons + letter grade (A-F)
+3. **Quality Score Breakdown** - Weighted component scores
+4. **Headline Metrics** - Sharpe, return, drawdown, turnover, coverage
+5. **Suite Results** - All configs with key metrics
+6. **Robustness Analysis** - Cap-tier and year-by-year breakdown
+7. **Baseline Comparison** - Correlations table
+8. **Signal Uniqueness** - Baseline correlations
+9. **Risk Factor Exposures** - Correlation to size, value, momentum, volatility, etc.
+10. **Signal Coverage** - Avg securities/day, unique securities, universe coverage %
 
 **Verdict logic:**
 | Color | Criteria |
 |-------|----------|
-| 🟢 Green | Sharpe > 0.5, turnover < 50%, passes lag/resid tests |
-| 🟡 Yellow | Sharpe > 0, some concerns (high decay, turnover, correlation) |
-| 🔴 Red | Sharpe ≤ 0 or fails critical tests |
+| 🟢 Green | Sharpe ≥ 1.0, passes lag/resid tests, low baseline/factor correlation, consistent across cap/year |
+| 🟡 Yellow | Sharpe ≥ 0.5, some concerns (high decay, turnover, correlation, inconsistency) |
+| 🔴 Red | Sharpe < 0.5 or fails critical tests |
+
+**Composite Quality Score (0-100):**
+| Component | Weight | Description |
+|-----------|--------|-------------|
+| Sharpe | 25% | Scaled from 0-2.0 |
+| Lag Stability | 15% | Sharpe retention from lag0 to lag2 |
+| Resid Stability | 15% | Sharpe retention after industry neutralization |
+| Baseline Uniqueness | 15% | Low correlation to reversal/value baselines |
+| Cap Consistency | 10% | Similar performance across large/mid/small cap |
+| Year Consistency | 10% | Positive Sharpe across years |
+| Factor Uniqueness | 10% | Low correlation to risk factors |
 
 **Key functions:**
 ```python
 compute_verdict(suite_result) -> {'color': str, 'reasons': List[str]}
+compute_composite_score(suite_result) -> {'total_score': float, 'breakdown': Dict, 'grade': str}
 generate_tearsheet(suite_result, signal_name, catalog, output_path) -> path
 ```
 
