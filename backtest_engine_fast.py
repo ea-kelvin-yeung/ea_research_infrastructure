@@ -29,6 +29,58 @@ def _fast_residualize(group, y_col, x_cols):
     else:
         resid = y - y.mean()
     return pd.Series(resid, index=group.index)
+
+
+def _fast_residualize_industry(group, y_col, industry_col):
+    y = group[y_col].to_numpy(dtype="float64", copy=False)
+    codes, _ = pd.factorize(group[industry_col], sort=False)
+    if (codes < 0).any():
+        mask = codes >= 0
+        resid = np.full(len(y), np.nan, dtype="float64")
+        codes = codes[mask]
+        y_mask = y[mask]
+        counts = np.bincount(codes)
+        y_mean = np.bincount(codes, weights=y_mask) / counts
+        resid[mask] = y_mask - y_mean[codes]
+    else:
+        counts = np.bincount(codes)
+        y_mean = np.bincount(codes, weights=y) / counts
+        resid = y - y_mean[codes]
+    return pd.Series(resid, index=group.index)
+
+
+def _fast_residualize_factors_within_industry(group, y_col, x_cols, industry_col):
+    y = group[y_col].to_numpy(dtype="float64", copy=False)
+    codes, _ = pd.factorize(group[industry_col], sort=False)
+    if (codes < 0).any():
+        mask = codes >= 0
+        resid = np.full(len(y), np.nan, dtype="float64")
+        group = group.loc[mask]
+        y = y[mask]
+        codes = codes[mask]
+    else:
+        resid = None
+
+    counts = np.bincount(codes)
+    y_mean = np.bincount(codes, weights=y) / counts
+    y_demean = y - y_mean[codes]
+
+    if not x_cols:
+        out = y_demean
+    else:
+        x_mat = group[x_cols].to_numpy(dtype="float64", copy=False)
+        x_demean = np.empty_like(x_mat, dtype="float64")
+        for j in range(x_mat.shape[1]):
+            x_sum = np.bincount(codes, weights=x_mat[:, j])
+            x_mean = x_sum / counts
+            x_demean[:, j] = x_mat[:, j] - x_mean[codes]
+        coef, _, _, _ = np.linalg.lstsq(x_demean, y_demean, rcond=None)
+        out = y_demean - x_demean @ coef
+
+    if resid is None:
+        return pd.Series(out, index=group.index)
+    resid[mask] = out
+    return pd.Series(resid, index=group.index)
 """
 
 ##############################################################################
@@ -419,6 +471,27 @@ class BacktestFast:
         self.benchmark = benchmark
         self.ff_result = ff_result
         self.ff_model = ff_model
+        self._otherfile_sorted = None
+        self._double_file_sorted = None
+
+    def _get_otherfile_sorted(self):
+        if self._otherfile_sorted is None:
+            self._otherfile_sorted = self.otherfile.sort_values("date")
+        return self._otherfile_sorted
+
+    def _get_otherfile_cols(self, cols):
+        return self._get_otherfile_sorted()[cols]
+
+    def _get_doublefile_sorted(self):
+        if self._double_file_sorted is None:
+            if self.double_file is None:
+                if self.double_var is None:
+                    raise RuntimeError("double_var must be set for double sorting")
+                df = self.otherfile[["security_id", "date", self.double_var]]
+            else:
+                df = self.double_file
+            self._double_file_sorted = df.sort_values("date")
+        return self._double_file_sorted
 
     def pre_process(self):
         # merge with return data
@@ -463,7 +536,7 @@ class BacktestFast:
                 )
             temp = pd.merge_asof(
                 temp.sort_values(by=["date_sig"]),
-                self.otherfile[
+                self._get_otherfile_cols(
                     [
                         "security_id",
                         "date",
@@ -477,9 +550,7 @@ class BacktestFast:
                         "momentum",
                         "yield",
                     ]
-                ]
-                .rename(columns={"date": "date_sig", "yield": "yields"})
-                .sort_values(by="date_sig"),
+                ).rename(columns={"date": "date_sig", "yield": "yields"}),
                 by="security_id",
                 on="date_sig",
                 allow_exact_matches=True,
@@ -488,25 +559,23 @@ class BacktestFast:
             ).dropna()
             temp = temp.sort_values(by=["date", "security_id"]).reset_index(drop=True)
 
-            resid_factor_cols = []
-            if self.resid_style in ["all", "factor"]:
-                resid_factor_cols = list(self.resid_varlist)
-
-            ind_cols = []
-            if self.resid_style in ["all", "industry"]:
-                temp["industry_id"] = temp["industry_id"].astype("category")
-                ind_dummies = pd.get_dummies(
-                    temp["industry_id"], prefix="ind", drop_first=True
+            if self.resid_style == "industry":
+                resid = temp.groupby("date", sort=False).apply(
+                    _fast_residualize_industry, self.sigvar, "industry_id"
                 )
-                ind_cols = ind_dummies.columns.tolist()
-                temp = pd.concat([temp, ind_dummies], axis=1)
-
-            x_cols = resid_factor_cols + ind_cols
-
-            def resid_group(df):
-                return _fast_residualize(df, self.sigvar, x_cols)
-
-            resid = temp.groupby("date", sort=False).apply(resid_group)
+            elif self.resid_style == "factor":
+                resid = temp.groupby("date", sort=False).apply(
+                    _fast_residualize, self.sigvar, list(self.resid_varlist)
+                )
+            elif self.resid_style == "all":
+                resid = temp.groupby("date", sort=False).apply(
+                    _fast_residualize_factors_within_industry,
+                    self.sigvar,
+                    list(self.resid_varlist),
+                    "industry_id",
+                )
+            else:
+                raise RuntimeError(f"Unknown resid_style: {self.resid_style}")
             resid = resid.reset_index(level=0, drop=True)
             temp[self.sigvar] = resid
             temp = temp[
@@ -520,7 +589,7 @@ class BacktestFast:
     def cal_corr(self, infile, byvar):
 
         cor_file = infile.merge(
-            self.otherfile[["security_id", "date"] + self.factor_list],
+            self._get_otherfile_cols(["security_id", "date"] + self.factor_list),
             on=["security_id", "date"],
         )
 
@@ -580,9 +649,9 @@ class BacktestFast:
                     ]
                 port = pd.merge_asof(
                     port.sort_values(by=["date_sig"]),
-                    self.double_file.rename(
+                    self._get_doublefile_sorted().rename(
                         columns={"date": "date_doublevar"}
-                    ).sort_values(by="date_doublevar"),
+                    ),
                     by="security_id",
                     left_on="date_sig",
                     right_on="date_doublevar",
@@ -637,7 +706,9 @@ class BacktestFast:
 
         port = port[["security_id", "date", "fractile", "ret", "resret"]]
         port = port.merge(
-            self.otherfile[["security_id", "date", "adv", "mcap"] + self.factor_list],
+            self._get_otherfile_cols(
+                ["security_id", "date", "adv", "mcap"] + self.factor_list
+            ),
             on=["security_id", "date"],
         )
 
@@ -694,7 +765,8 @@ class BacktestFast:
         port2 = port2.merge(numcos, on="date")
         port2 = port2[port2["numcos"] >= self.mincos]
 
-        for var in [
+        weight = port2["weight"].to_numpy(dtype="float64", copy=False)
+        scale_cols = [
             "ret",
             "resret",
             "size",
@@ -704,9 +776,8 @@ class BacktestFast:
             "volatility",
             "momentum",
             "yield",
-        ]:
-
-            port2[var] = port2[var] * port2["weight"]
+        ]
+        port2[scale_cols] = port2[scale_cols].to_numpy(copy=False) * weight[:, None]
 
         check = port2.groupby(["date", "fractile"], sort=False).sum().reset_index()
         check2 = (
@@ -739,9 +810,9 @@ class BacktestFast:
                     ]
                 temp = pd.merge_asof(
                     temp.sort_values(by=["date_sig"]),
-                    self.double_file.rename(
+                    self._get_doublefile_sorted().rename(
                         columns={"date": "date_doublevar"}
-                    ).sort_values(by="date_doublevar"),
+                    ),
                     by="security_id",
                     left_on="date_sig",
                     right_on="date_doublevar",
@@ -830,7 +901,7 @@ class BacktestFast:
 
         temp = temp[temp["position"].isin([-1, 1])]
         temp = temp.merge(
-            self.otherfile[["security_id", "date", "adv", "mcap"]],
+            self._get_otherfile_cols(["security_id", "date", "adv", "mcap"]),
             on=["security_id", "date"],
         )
 
@@ -968,7 +1039,7 @@ class BacktestFast:
 
         if "cap" not in turnover.columns:
             turnover = turnover.merge(
-                self.otherfile[["security_id", "date", "cap"]],
+                self._get_otherfile_cols(["security_id", "date", "cap"]),
                 on=["security_id", "date"],
             )
 
@@ -1066,7 +1137,7 @@ class BacktestFast:
         port["numcos"] = port[["numcos_l", "numcos_s"]].min(axis=1)
 
         port = port.merge(
-            self.otherfile[
+            self._get_otherfile_cols(
                 [
                     "security_id",
                     "date",
@@ -1078,7 +1149,7 @@ class BacktestFast:
                     "momentum",
                     "yield",
                 ]
-            ],
+            ),
             how="inner",
             on=["security_id", "date"],
         )
@@ -1103,8 +1174,8 @@ class BacktestFast:
             for stat in var_list:
                 port.loc[port["numcos_l"] < self.mincos, stat] = 0
 
-        for stat in var_list:
-            port[stat] = port[stat] * port["weight"]
+        weight = port["weight"].to_numpy(dtype="float64", copy=False)
+        port[var_list] = port[var_list].to_numpy(copy=False) * weight[:, None]
 
         port2 = (
             port.groupby([byvar, "date"], sort=False)[var_list]
@@ -1453,52 +1524,58 @@ class BacktestFast:
 
     def gen_result(self):
         result = []
-        temp = self.pre_process()
+        temp_base = self.pre_process()
         if self.input_type in ["value", "fractile"]:
-            fractile = self.gen_fractile(temp, np.ceil(100 / self.fractile[0]))
+            fractile = self.gen_fractile(temp_base, np.ceil(100 / self.fractile[0]))
         else:
             fractile = None
+
+        byvar_cols = []
+        for byvar in self.byvar_list:
+            if byvar not in ["overall", "year", "capyr"]:
+                byvar_cols.append(byvar)
+        if "capyr" in self.byvar_list and "cap" not in byvar_cols:
+            byvar_cols.append("cap")
+        byvar_cols = list(dict.fromkeys(byvar_cols))
+
+        if byvar_cols:
+            temp_with_byvars = pd.merge_asof(
+                temp_base.sort_values(by=["date_sig"]),
+                self._get_otherfile_cols(["security_id", "date"] + byvar_cols).rename(
+                    columns={"date": "date_sig"}
+                ),
+                by="security_id",
+                on="date_sig",
+                allow_exact_matches=True,
+                direction="backward",
+                tolerance=pd.Timedelta("20d"),
+            )
+        else:
+            temp_with_byvars = temp_base
+
+        if "capyr" in self.byvar_list and "cap" in temp_with_byvars.columns:
+            cap = temp_with_byvars["cap"]
+            cap_label = np.select(
+                [cap == 1, cap == 2], ["LargeCap", "MediumCap"], default="SmallCap"
+            )
+            temp_with_byvars["capyr"] = np.where(
+                cap.notna(), cap_label + "_" + temp_with_byvars["year"].astype("str"), np.nan
+            )
+
         daily_stats, daily_stats2, turnover = (
             pd.DataFrame(),
             pd.DataFrame(),
             pd.DataFrame(),
         )
+        temp_iter = temp_with_byvars
         for byvar in self.byvar_list:
 
             if self.verbose:
                 print(f"Processing byvar: {byvar}")
 
-            if byvar not in ["overall", "year", "capyr"]:
-                temp = pd.merge_asof(
-                    temp.sort_values(by=["date_sig"]),
-                    self.otherfile[["security_id", "date", byvar]]
-                    .rename(columns={"date": "date_sig"})
-                    .sort_values(by="date_sig"),
-                    by="security_id",
-                    on="date_sig",
-                    allow_exact_matches=True,
-                    direction="backward",
-                    tolerance=pd.Timedelta("20d"),
-                ).dropna()
-            elif byvar == "capyr":
-                temp = pd.merge_asof(
-                    temp.sort_values(by=["date_sig"]),
-                    self.otherfile[["security_id", "date", "cap"]]
-                    .rename(columns={"date": "date_sig"})
-                    .sort_values(by="date_sig"),
-                    by="security_id",
-                    on="date_sig",
-                    allow_exact_matches=True,
-                    direction="backward",
-                    tolerance=pd.Timedelta("20d"),
-                ).dropna()
-
-                temp["cap"] = np.select(
-                    [temp["cap"] == 1, temp["cap"] == 2],
-                    ["LargeCap", "MediumCap"],
-                    "SmallCap",
-                )
-                temp["capyr"] = temp["cap"] + "_" + temp["year"].astype("str")
+            if byvar not in ["overall", "year"]:
+                temp_iter = temp_iter[temp_iter[byvar].notna()]
+            temp = temp_iter
 
             if byvar == "overall":
                 combo, daily_stats, turnover = self.backtest(temp, byvar)
@@ -1510,7 +1587,7 @@ class BacktestFast:
             result.append(combo)
 
         if self.earnings_window:
-            temp2 = temp.merge(self.window_file, on=["security_id", "date"])
+            temp2 = temp_iter.merge(self.window_file, on=["security_id", "date"])
             combo = self.backtest(temp2, "earning_window")
             result.append(combo)
 
@@ -1531,7 +1608,7 @@ class BacktestFast:
                     f"vix > {vix_median}",
                     f"vix <= {vix_median}",
                 )
-                temp2 = temp.merge(vix, on=["date"])
+                temp2 = temp_iter.merge(vix, on=["date"])
                 combo = self.backtest(temp2, "vix")
                 result.append(combo)
             except:
