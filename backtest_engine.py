@@ -1045,14 +1045,14 @@ class Backtest:
             date_minmax = (
                 turnover[turnover["numcos"] >= self.mincos]
                 .groupby(byvar)["date"]
-                .agg([np.min, np.max])
+                .agg(["min", "max"])
                 .reset_index()
             )
         elif self.method == "long_only":
             date_minmax = (
                 turnover[turnover["numcos_l"] >= self.mincos]
                 .groupby(byvar)["date"]
-                .agg([np.min, np.max])
+                .agg(["min", "max"])
                 .reset_index()
             )
 

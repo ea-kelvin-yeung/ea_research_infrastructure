@@ -5,11 +5,27 @@ Baseline Library: Standard comparison signals.
 
 import pandas as pd
 import numpy as np
+import hashlib
+from pathlib import Path
 from typing import Callable, Dict, Optional
+from joblib import Memory
 
 # Default date range for baselines
 DEFAULT_START_DATE = '2017-01-01'
 DEFAULT_END_DATE = '2018-12-31'
+
+# Cache for baseline signals (persists to disk)
+CACHE_DIR = Path('.cache/baselines')
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+memory = Memory(CACHE_DIR, verbose=0)
+
+
+def _get_catalog_hash(catalog: dict) -> str:
+    """Get a hash to identify the catalog data for caching."""
+    # Use shape + first/last dates as quick identifier
+    ret_info = f"ret_{len(catalog['ret'])}_{catalog['ret']['date'].min()}_{catalog['ret']['date'].max()}"
+    risk_info = f"risk_{len(catalog['risk'])}_{catalog['risk']['date'].min()}_{catalog['risk']['date'].max()}"
+    return hashlib.md5(f"{ret_info}_{risk_info}".encode()).hexdigest()[:12]
 
 
 def _filter_dates(df: pd.DataFrame, date_col: str, start_date: Optional[str], end_date: Optional[str]) -> pd.DataFrame:
@@ -19,6 +35,26 @@ def _filter_dates(df: pd.DataFrame, date_col: str, start_date: Optional[str], en
     if end_date:
         df = df[df[date_col] <= end_date]
     return df
+
+
+@memory.cache
+def _compute_reversal(ret_df: pd.DataFrame, lookback: int, start_date: str, end_date: str, catalog_hash: str) -> pd.DataFrame:
+    """Cached reversal computation."""
+    ret = ret_df[['security_id', 'date', 'ret']].copy()
+    ret = _filter_dates(ret, 'date', start_date, end_date)
+    ret = ret.sort_values(['security_id', 'date'])
+    
+    ret['cum_ret'] = ret.groupby('security_id')['ret'].transform(
+        lambda x: (1 + x).rolling(lookback, min_periods=lookback).apply(
+            lambda y: y.prod() - 1, raw=True
+        )
+    )
+    ret['signal'] = -ret['cum_ret']
+    
+    result = ret[['security_id', 'date', 'signal']].copy()
+    result = result.rename(columns={'date': 'date_sig'})
+    result['date_avail'] = result['date_sig'] + pd.Timedelta(days=1)
+    return result.dropna()
 
 
 def generate_reversal_signal(
@@ -32,25 +68,27 @@ def generate_reversal_signal(
     
     Idea: stocks that went down recently will bounce back.
     """
-    ret = catalog['ret'][['security_id', 'date', 'ret']].copy()
-    ret = _filter_dates(ret, 'date', start_date, end_date)
+    catalog_hash = _get_catalog_hash(catalog)
+    return _compute_reversal(catalog['ret'], lookback, start_date, end_date, catalog_hash)
+
+
+@memory.cache
+def _compute_momentum(ret_df: pd.DataFrame, lookback: int, skip: int, start_date: str, end_date: str, catalog_hash: str) -> pd.DataFrame:
+    """Cached momentum computation."""
+    ret = ret_df[['security_id', 'date', 'ret']].copy()
     ret = ret.sort_values(['security_id', 'date'])
     
-    # Calculate rolling return
-    ret['cum_ret'] = ret.groupby('security_id')['ret'].transform(
-        lambda x: (1 + x).rolling(lookback, min_periods=lookback).apply(
-            lambda y: y.prod() - 1, raw=True
-        )
-    )
+    def rolling_ret(x, n):
+        return (1 + x).rolling(n, min_periods=n).apply(lambda y: y.prod() - 1, raw=True)
     
-    # Reversal = negative of past return
-    ret['signal'] = -ret['cum_ret']
+    ret['ret_full'] = ret.groupby('security_id')['ret'].transform(rolling_ret, lookback)
+    ret['ret_skip'] = ret.groupby('security_id')['ret'].transform(rolling_ret, skip)
+    ret['signal'] = ret['ret_full'] - ret['ret_skip']
+    ret = _filter_dates(ret, 'date', start_date, end_date)
     
-    # Format for signal contract
     result = ret[['security_id', 'date', 'signal']].copy()
     result = result.rename(columns={'date': 'date_sig'})
     result['date_avail'] = result['date_sig'] + pd.Timedelta(days=1)
-    
     return result.dropna()
 
 
@@ -66,27 +104,18 @@ def generate_momentum_signal(
     
     Idea: stocks with strong past performance (excluding very recent) continue to perform.
     """
-    ret = catalog['ret'][['security_id', 'date', 'ret']].copy()
-    ret = ret.sort_values(['security_id', 'date'])
+    catalog_hash = _get_catalog_hash(catalog)
+    return _compute_momentum(catalog['ret'], lookback, skip, start_date, end_date, catalog_hash)
+
+
+@memory.cache
+def _compute_value(risk_df: pd.DataFrame, start_date: str, end_date: str, catalog_hash: str) -> pd.DataFrame:
+    """Cached value signal computation."""
+    risk = risk_df[['security_id', 'date', 'value']].copy()
+    risk = _filter_dates(risk, 'date', start_date, end_date)
     
-    # Calculate rolling returns on FULL data first (need lookback history)
-    def rolling_ret(x, n):
-        return (1 + x).rolling(n, min_periods=n).apply(lambda y: y.prod() - 1, raw=True)
-    
-    ret['ret_full'] = ret.groupby('security_id')['ret'].transform(rolling_ret, lookback)
-    ret['ret_skip'] = ret.groupby('security_id')['ret'].transform(rolling_ret, skip)
-    
-    # Momentum = full period minus recent period
-    ret['signal'] = ret['ret_full'] - ret['ret_skip']
-    
-    # Filter to date range AFTER calculating rolling (need history for lookback)
-    ret = _filter_dates(ret, 'date', start_date, end_date)
-    
-    # Format for signal contract
-    result = ret[['security_id', 'date', 'signal']].copy()
-    result = result.rename(columns={'date': 'date_sig'})
+    result = risk.rename(columns={'date': 'date_sig', 'value': 'signal'})
     result['date_avail'] = result['date_sig'] + pd.Timedelta(days=1)
-    
     return result.dropna()
 
 
@@ -100,14 +129,8 @@ def generate_value_signal(
     
     Idea: cheap stocks (high book-to-market, etc.) outperform.
     """
-    risk = catalog['risk'][['security_id', 'date', 'value']].copy()
-    risk = _filter_dates(risk, 'date', start_date, end_date)
-    
-    # Format for signal contract
-    result = risk.rename(columns={'date': 'date_sig', 'value': 'signal'})
-    result['date_avail'] = result['date_sig'] + pd.Timedelta(days=1)
-    
-    return result.dropna()
+    catalog_hash = _get_catalog_hash(catalog)
+    return _compute_value(catalog['risk'], start_date, end_date, catalog_hash)
 
 
 # Registry of all baseline signals
@@ -163,6 +186,6 @@ def compute_signal_correlation(signal_df: pd.DataFrame, baseline_df: pd.DataFram
             return np.nan
         return df['signal'].corr(df['signal_baseline'], method='spearman')
     
-    daily_corrs = merged.groupby('date_sig').apply(daily_corr)
+    daily_corrs = merged.groupby('date_sig').apply(daily_corr, include_groups=False)
     
     return daily_corrs.mean()

@@ -33,3 +33,4 @@ env/
 snapshots/
 artifacts/
 mlruns/
+.cache/

@@ -100,6 +100,10 @@ def run_suite(
         print(f"Running baseline signals ({baseline_start_date} to {baseline_end_date})...")
         baseline_signals = generate_all_baselines(catalog, start_date=baseline_start_date, end_date=baseline_end_date)
         for name, baseline_df in baseline_signals.items():
+            # Skip if baseline has too few rows (e.g., momentum needs 252 days lookback)
+            if len(baseline_df) < 100:
+                print(f"  {name}: Skipped (only {len(baseline_df)} rows, need more data)")
+                continue
             try:
                 config = BacktestConfig(lag=0, residualize='off')
                 baselines[name] = run_backtest(baseline_df, catalog, config, validate=False)
