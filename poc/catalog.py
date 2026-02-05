@@ -1,6 +1,7 @@
 """
 Data Catalog: Load data from snapshots with manifest tracking.
-~80 lines - keep it simple.
+
+Includes master_data: pre-merged ret+risk DataFrame for fast backtest joins.
 """
 
 import pandas as pd
@@ -10,15 +11,66 @@ from datetime import datetime
 from typing import Optional
 
 
-def load_catalog(snapshot_path: str = "snapshots/default") -> dict:
+def _create_master_data(ret_df: pd.DataFrame, risk_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Pre-merge ret and risk DataFrames into a single master DataFrame.
+    
+    This eliminates repeated merges during backtest (13+ seconds -> ~1 second).
+    The master data is indexed on (security_id, date) for fast joins.
+    
+    Columns included:
+    - From ret: ret, resret, openret, resopenret, vol, adv, close_adj
+    - From risk: mcap, cap, industry_id, sector_id, size, value, growth, 
+                 leverage, volatility, momentum, yield
+    """
+    # Select columns from ret
+    ret_cols = ['security_id', 'date', 'ret', 'resret']
+    optional_ret_cols = ['openret', 'resopenret', 'vol', 'adv', 'close_adj']
+    for col in optional_ret_cols:
+        if col in ret_df.columns:
+            ret_cols.append(col)
+    
+    # Select columns from risk
+    risk_cols = ['security_id', 'date']
+    optional_risk_cols = ['mcap', 'cap', 'industry_id', 'sector_id', 
+                          'size', 'value', 'growth', 'leverage', 
+                          'volatility', 'momentum', 'yield']
+    for col in optional_risk_cols:
+        if col in risk_df.columns:
+            risk_cols.append(col)
+    
+    # Handle adv column naming conflict (may exist in both)
+    ret_subset = ret_df[ret_cols].copy()
+    risk_subset = risk_df[risk_cols].copy()
+    
+    if 'adv' in ret_subset.columns and 'adv' in risk_subset.columns:
+        # Keep ret's adv, drop risk's
+        risk_subset = risk_subset.drop(columns=['adv'])
+    
+    # Merge
+    master = ret_subset.merge(
+        risk_subset,
+        on=['security_id', 'date'],
+        how='inner'
+    )
+    
+    # Set index for fast joins
+    master = master.set_index(['security_id', 'date']).sort_index()
+    
+    return master
+
+
+def load_catalog(snapshot_path: str = "snapshots/default", use_master: bool = True) -> dict:
     """
     Load data catalog from a snapshot directory.
     
     Args:
         snapshot_path: Path to snapshot directory containing parquet files
+        use_master: If True, load/create master_data for fast backtest joins
         
     Returns:
         dict with keys: 'ret', 'risk', 'dates', 'snapshot_id', 'manifest'
+        If use_master=True, also includes 'master' (indexed DataFrame)
     """
     path = Path(snapshot_path)
     
@@ -39,6 +91,22 @@ def load_catalog(snapshot_path: str = "snapshots/default") -> dict:
             catalog['manifest'] = json.load(f)
     else:
         catalog['manifest'] = {'snapshot_id': path.name, 'created_at': 'unknown'}
+    
+    # Load or create master data for fast joins
+    if use_master:
+        master_path = path / 'master.parquet'
+        if master_path.exists():
+            # Load cached master data
+            catalog['master'] = pd.read_parquet(master_path)
+            # Restore index
+            if 'security_id' in catalog['master'].columns:
+                catalog['master'] = catalog['master'].set_index(['security_id', 'date']).sort_index()
+        else:
+            # Create and cache master data
+            catalog['master'] = _create_master_data(catalog['ret'], catalog['risk'])
+            # Save to disk (reset index for parquet)
+            catalog['master'].reset_index().to_parquet(master_path, index=False)
+            print(f"Created master.parquet cache: {len(catalog['master'])} rows")
     
     return catalog
 
@@ -79,6 +147,10 @@ def create_snapshot(
     ret_df.to_parquet(snapshot_path / 'ret.parquet', index=False)
     risk_df.to_parquet(snapshot_path / 'risk.parquet', index=False)
     datefile.to_parquet(snapshot_path / 'trading_date.parquet', index=False)
+    
+    # Create master data (pre-merged for fast backtest)
+    master_df = _create_master_data(ret_df, risk_df)
+    master_df.reset_index().to_parquet(snapshot_path / 'master.parquet', index=False)
     
     # Create manifest
     manifest = {

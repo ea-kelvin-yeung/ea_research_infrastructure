@@ -1,6 +1,6 @@
 """
-Backtest Wrapper: Thin wrapper around existing Backtest class.
-~150 lines - stable API with clean result dataclass.
+Backtest Wrapper: Thin wrapper around Backtest/BacktestFast classes.
+~170 lines - stable API with clean result dataclass.
 """
 
 import pandas as pd
@@ -10,9 +10,10 @@ from typing import Optional, Dict, Any
 import sys
 from pathlib import Path
 
-# Add parent directory to path to import backtest_engine
+# Add parent directory to path to import backtest engines
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from backtest_engine import Backtest
+from backtest_engine_fast import BacktestFast
 
 from .contract import prepare_signal
 
@@ -119,26 +120,35 @@ def run_backtest(
     resid = config.residualize != 'off'
     resid_style = config.residualize if resid else 'all'
     
+    # Use BacktestFast if master data is available (3-4x faster)
+    use_fast = 'master' in catalog and catalog['master'] is not None
+    BacktestClass = BacktestFast if use_fast else Backtest
+    
     # Instantiate and run backtest
-    bt = Backtest(
-        infile=aligned_signal,
-        retfile=catalog['ret'],
-        otherfile=catalog['risk'],
-        datefile=catalog['dates'],
-        sigvar='signal',
-        method='long_short',
-        byvar_list=config.byvar_list,
-        from_open=config.from_open,
-        input_type='value',
-        mincos=config.mincos,
-        fractile=list(config.fractile),
-        weight=config.weight,
-        tc_model=config.tc_model,
-        resid=resid,
-        resid_style=resid_style,
-        output='simple',
-        verbose=False,
-    )
+    bt_kwargs = {
+        'infile': aligned_signal,
+        'retfile': catalog['ret'],
+        'otherfile': catalog['risk'],
+        'datefile': catalog['dates'],
+        'sigvar': 'signal',
+        'method': 'long_short',
+        'byvar_list': config.byvar_list,
+        'from_open': config.from_open,
+        'input_type': 'value',
+        'mincos': config.mincos,
+        'fractile': list(config.fractile),
+        'weight': config.weight,
+        'tc_model': config.tc_model,
+        'resid': resid,
+        'resid_style': resid_style,
+        'output': 'simple',
+        'verbose': False,
+    }
+    
+    if use_fast:
+        bt_kwargs['master_data'] = catalog['master']
+    
+    bt = BacktestClass(**bt_kwargs)
     
     # Run and extract results
     result = bt.gen_result()

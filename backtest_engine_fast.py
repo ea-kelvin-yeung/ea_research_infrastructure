@@ -426,6 +426,7 @@ class BacktestFast:
         ff_result=False,
         ff_model="ff3",
         verbose=False,
+        master_data=None,
     ):
 
         self.verbose = verbose
@@ -433,6 +434,7 @@ class BacktestFast:
         self.retfile = retfile
         self.otherfile = otherfile
         self.datefile = datefile
+        self.master_data = master_data  # Pre-merged indexed DataFrame for fast joins
         self.sigvar = sigvar
         # byvar_list should not include mcap, adv and factor
         self.byvar_list = byvar_list
@@ -471,16 +473,55 @@ class BacktestFast:
         self.benchmark = benchmark
         self.ff_result = ff_result
         self.ff_model = ff_model
-        self._otherfile_sorted = None
         self._double_file_sorted = None
 
-    def _get_otherfile_sorted(self):
-        if self._otherfile_sorted is None:
-            self._otherfile_sorted = self.otherfile.sort_values("date")
-        return self._otherfile_sorted
+    def _fast_join_master(self, df, cols, how='inner'):
+        """
+        Fast join using pre-indexed master_data.
+        
+        Uses index-based join instead of merge, which avoids the expensive
+        _factorize_keys operation that dominates merge time.
+        
+        Args:
+            df: DataFrame with security_id and date columns
+            cols: List of columns to retrieve from master_data
+            how: Join type ('inner' or 'left')
+            
+        Returns:
+            DataFrame with requested columns joined
+        """
+        if self.master_data is None:
+            # Fall back to traditional merge
+            return df.merge(
+                self.retfile[['security_id', 'date'] + [c for c in cols if c in self.retfile.columns]],
+                on=['security_id', 'date'],
+                how=how
+            )
+        
+        # Filter columns that exist in master
+        available_cols = [c for c in cols if c in self.master_data.columns]
+        if not available_cols:
+            return df
+        
+        # Set index on df for fast join (use left join, then filter for inner)
+        df_indexed = df.set_index(['security_id', 'date'])
+        
+        # Join with master (index-based, much faster than merge)
+        # Always use left join to preserve df order, then filter if inner requested
+        result = df_indexed.join(self.master_data[available_cols], how='left')
+        
+        # For inner join, drop rows where joined columns are NaN
+        if how == 'inner':
+            result = result.dropna(subset=available_cols)
+        
+        # Reset index
+        result = result.reset_index()
+        
+        return result
 
     def _get_otherfile_cols(self, cols):
-        return self._get_otherfile_sorted()[cols]
+        """Direct column access without sorting (faster than sorting)."""
+        return self.otherfile[cols]
 
     def _get_doublefile_sorted(self):
         if self._double_file_sorted is None:
@@ -507,6 +548,8 @@ class BacktestFast:
                 .dropna()
             )
 
+            # Always use retfile for initial join (not master, which is ret ∩ risk)
+            # Master filtering happens later in gen_fractile/portfolio_ls
             temp = temp.merge(
                 self.retfile[["security_id", "date", "openret", "resopenret"]].rename(
                     columns={"openret": "ret", "resopenret": "resret"}
@@ -523,6 +566,7 @@ class BacktestFast:
                 .dropna()
             )
 
+            # Always use retfile for initial join (not master, which is ret ∩ risk)
             temp = temp.merge(
                 self.retfile[["security_id", "date", "ret", "resret"]],
                 how="inner",
@@ -550,7 +594,7 @@ class BacktestFast:
                         "momentum",
                         "yield",
                     ]
-                ).rename(columns={"date": "date_sig", "yield": "yields"}),
+                ).rename(columns={"date": "date_sig", "yield": "yields"}).sort_values(by="date_sig"),
                 by="security_id",
                 on="date_sig",
                 allow_exact_matches=True,
@@ -705,12 +749,16 @@ class BacktestFast:
             port["fractile"] = port[self.sigvar]
 
         port = port[["security_id", "date", "fractile", "ret", "resret"]]
-        port = port.merge(
-            self._get_otherfile_cols(
-                ["security_id", "date", "adv", "mcap"] + self.factor_list
-            ),
-            on=["security_id", "date"],
-        )
+        
+        # Use fast join if master_data available
+        needed_cols = ["adv", "mcap"] + self.factor_list
+        if self.master_data is not None:
+            port = self._fast_join_master(port, needed_cols, how='inner')
+        else:
+            port = port.merge(
+                self._get_otherfile_cols(["security_id", "date"] + needed_cols),
+                on=["security_id", "date"],
+            )
 
         if self.weight == "equal":
             group_size = port.groupby(["date", "fractile"], sort=False)[
@@ -900,10 +948,15 @@ class BacktestFast:
             temp["position"] = temp[self.sigvar]
 
         temp = temp[temp["position"].isin([-1, 1])]
-        temp = temp.merge(
-            self._get_otherfile_cols(["security_id", "date", "adv", "mcap"]),
-            on=["security_id", "date"],
-        )
+        
+        # Use fast join if master_data available
+        if self.master_data is not None:
+            temp = self._fast_join_master(temp, ["adv", "mcap"], how='inner')
+        else:
+            temp = temp.merge(
+                self._get_otherfile_cols(["security_id", "date", "adv", "mcap"]),
+                on=["security_id", "date"],
+            )
 
         return temp
 
@@ -1038,10 +1091,14 @@ class BacktestFast:
         )
 
         if "cap" not in turnover.columns:
-            turnover = turnover.merge(
-                self._get_otherfile_cols(["security_id", "date", "cap"]),
-                on=["security_id", "date"],
-            )
+            # Use fast join if master_data available
+            if self.master_data is not None:
+                turnover = self._fast_join_master(turnover, ["cap"], how='inner')
+            else:
+                turnover = turnover.merge(
+                    self._get_otherfile_cols(["security_id", "date", "cap"]),
+                    on=["security_id", "date"],
+                )
 
         if self.tc_model == "naive":
             turnover["tc"] = np.select(
@@ -1050,10 +1107,14 @@ class BacktestFast:
                 default=self.tc_level["small"] / 10000,
             )
         elif self.tc_model == "power_law":
-            turnover = turnover.merge(
-                self.retfile[["security_id", "date", "vol", "adv", "close_adj"]],
-                on=["security_id", "date"],
-            )
+            # Use fast join if master_data available
+            if self.master_data is not None:
+                turnover = self._fast_join_master(turnover, ["vol", "adv", "close_adj"], how='inner')
+            else:
+                turnover = turnover.merge(
+                    self.retfile[["security_id", "date", "vol", "adv", "close_adj"]],
+                    on=["security_id", "date"],
+                )
 
             tc_beta, tc_alpha = self.tc_value
             turnover["tc"] = (
@@ -1136,23 +1197,16 @@ class BacktestFast:
         ].transform("sum")
         port["numcos"] = port[["numcos_l", "numcos_s"]].min(axis=1)
 
-        port = port.merge(
-            self._get_otherfile_cols(
-                [
-                    "security_id",
-                    "date",
-                    "size",
-                    "value",
-                    "growth",
-                    "leverage",
-                    "volatility",
-                    "momentum",
-                    "yield",
-                ]
-            ),
-            how="inner",
-            on=["security_id", "date"],
-        )
+        # Use fast join if master_data available
+        factor_cols = ["size", "value", "growth", "leverage", "volatility", "momentum", "yield"]
+        if self.master_data is not None:
+            port = self._fast_join_master(port, factor_cols, how='inner')
+        else:
+            port = port.merge(
+                self._get_otherfile_cols(["security_id", "date"] + factor_cols),
+                how="inner",
+                on=["security_id", "date"],
+            )
 
         # the minimum number of stock on each side should be greater than the minimum threshold
 
@@ -1543,7 +1597,7 @@ class BacktestFast:
                 temp_base.sort_values(by=["date_sig"]),
                 self._get_otherfile_cols(["security_id", "date"] + byvar_cols).rename(
                     columns={"date": "date_sig"}
-                ),
+                ).sort_values(by="date_sig"),
                 by="security_id",
                 on="date_sig",
                 allow_exact_matches=True,

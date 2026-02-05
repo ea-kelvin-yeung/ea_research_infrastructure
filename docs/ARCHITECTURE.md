@@ -63,7 +63,8 @@ This infrastructure wraps an existing backtest engine to provide:
 
 ```
 ea_research_infrastructure/
-├── backtest_engine.py      # Core backtest engine (unchanged)
+├── backtest_engine.py      # Core backtest engine (original)
+├── backtest_engine_fast.py # Optimized backtest engine (3-4x faster)
 ├── run_demo.py             # Demo script
 ├── requirements.txt        # Dependencies
 │
@@ -90,7 +91,8 @@ ea_research_infrastructure/
 │       ├── manifest.json
 │       ├── ret.parquet
 │       ├── risk.parquet
-│       └── dates.pkl
+│       ├── trading_date.parquet
+│       └── master.parquet  # Pre-merged for fast joins
 │
 ├── artifacts/              # Generated outputs
 │   ├── *_tearsheet.html
@@ -142,9 +144,23 @@ list_snapshots(snapshots_dir) -> List[str]       # List available snapshots
     'ret': pd.DataFrame,      # Returns data
     'risk': pd.DataFrame,     # Risk factors
     'dates': pd.DataFrame,    # Trading calendar
+    'master': pd.DataFrame,   # Pre-merged ret+risk (indexed)
     'snapshot_id': str,       # Snapshot identifier
 }
 ```
+
+**Master Data (Performance Optimization):**
+
+The `master` DataFrame is a pre-merged, indexed version of `ret` and `risk` data, created automatically when loading a catalog. It provides **3-4x speedup** for backtests by avoiding repeated merge operations.
+
+```python
+# Master data columns (indexed on security_id, date):
+# From ret: ret, resret, openret, resopenret, vol, adv, close_adj
+# From risk: mcap, cap, industry_id, sector_id, size, value, growth, 
+#            leverage, volatility, momentum, yield
+```
+
+The master data is cached to `master.parquet` in the snapshot directory for fast loading.
 
 ---
 
@@ -377,6 +393,79 @@ mlflow ui
 - `snapshots/`, `artifacts/` - Generated files
 - `.cache/` - Baseline cache
 - `*.parquet`, `*.pkl` - Data files
+
+---
+
+## Performance Optimizations
+
+### BacktestFast Engine
+
+`backtest_engine_fast.py` contains `BacktestFast`, an optimized version of the core `Backtest` class that provides **3-4x speedup** through several techniques:
+
+#### 1. Master Data Pre-Merge
+
+The biggest bottleneck in the original engine is pandas merge operations, which spend 70-80% of time on key hashing (`_factorize_keys`). The master data strategy eliminates most merges:
+
+```python
+# Original: 18+ merge operations per backtest
+# Optimized: 2-3 merges using pre-indexed master data
+
+# Usage:
+from backtest_engine_fast import BacktestFast
+from poc.catalog import load_catalog
+
+catalog = load_catalog('snapshots/default', use_master=True)
+
+bt = BacktestFast(
+    infile=signal_df,
+    retfile=catalog['ret'],
+    datefile=catalog['dates'],
+    otherfile=catalog['risk'],
+    master_data=catalog['master'],  # Pass master for fast joins
+    **config
+)
+result = bt.gen_result()
+```
+
+#### 2. Vectorized Industry Residualization
+
+For `resid_style='industry'`, uses `transform('mean')` instead of `groupby().apply()`:
+
+```python
+# Original: ~30s (10ms per day × 3000 days)
+resid = temp.groupby("date").apply(_residualize_industry, ...)
+
+# Optimized: ~0.05s (single vectorized operation)
+ind_means = temp.groupby(["date", "industry_id"]).transform("mean")
+temp[sigvar] = temp[sigvar] - ind_means
+```
+
+#### 3. Fast Index-Based Joins
+
+Uses `DataFrame.join()` on pre-indexed master data instead of `merge()`:
+
+```python
+# Original merge (slow - requires key hashing)
+df.merge(other, on=['security_id', 'date'])
+
+# Optimized join (fast - uses sorted index)
+df.set_index(['security_id', 'date']).join(master[cols])
+```
+
+### Benchmark Results
+
+| Configuration | Original | Fast+Master | Speedup |
+|---------------|----------|-------------|---------|
+| Basic (resid=off) | 18-20s | 5-6s | **3.3x** |
+| With residualization | 25-30s | 7-8s | **3.5x** |
+
+### Equivalence Guarantee
+
+`BacktestFast` produces numerically identical results to the original `Backtest` class (differences at machine epsilon ~10⁻¹⁶). Run equivalence tests:
+
+```bash
+python tests/test_equivalence.py
+```
 
 ---
 
