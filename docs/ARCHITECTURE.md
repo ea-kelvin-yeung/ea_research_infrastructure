@@ -476,44 +476,38 @@ df['n'] = datefile_by_date.reindex(df['date'])['n'].values
 
 ### Benchmark Results (3-Year Data, 377K signal rows)
 
-| Configuration | Original | Fast+Master | Time Saved | Speedup |
-|---------------|----------|-------------|------------|---------|
-| resid=off | 18.5s | 5.0s | 13.5s | **3.7x** |
-| resid=industry | 23.2s | 8.1s | 15.1s | **2.9x** |
-| resid=all | 26.0s | 10.1s | 15.9s | **2.6x** |
+| Configuration | Original | Optimized | Speedup |
+|---------------|----------|-----------|---------|
+| resid=off, overall | 19.3s | 4.9s | **3.9x** |
+| resid=off, overall+cap | 29.4s | 4.7s | **6.2x** |
+| resid=all, overall | 27.2s | 10.0s | **2.7x** |
+| resid=all, overall+cap | 42.2s | 9.9s | **4.3x** |
 
-**Why does speedup ratio decrease with residualization?**
+**Key observations:**
+- `overall+cap` cases show biggest gains because cached sorted asof tables avoid repeated 30M-row sorts
+- `merge_asof` (fuzzy time-based join) cannot use pre-merged master data, which limits speedup for resid cases
 
-Absolute time saved *increases* with residualization, but the speedup *ratio* decreases because `merge_asof` (fuzzy time-based join) **cannot be optimized** by master data:
+### Optimization Techniques
 
-```python
-# This merge_asof finds closest date within 5 days - cannot use pre-merged master
-pd.merge_asof(..., tolerance=pd.Timedelta("5d"), direction="backward")
-```
-
-Master data only optimizes exact `(security_id, date)` joins.
-
-### Speedup Breakdown (resid=all)
-
-| Component | Time Saved | Contribution |
-|-----------|------------|--------------|
-| Master data joins | 10.6s | **67%** |
-| Residualization (statsmodels → numpy) | 5.3s | **33%** |
+1. **Master Data Pre-Merge**: Pre-indexed `(security_id, date)` lookups using `get_indexer` + `numpy.take`
+2. **Cached Sorted Asof Tables**: Avoid repeated 30M-row sorts for `merge_asof` calls
+3. **Fast Multi-Key Lookup**: Replace turnover prev merge with numpy indexer+take
+4. **Vectorized Residualization**: Pure NumPy instead of statsmodels (97x faster for the math)
 
 **Residualization math comparison:**
 - Statsmodels OLS (groupby.apply): 4.85s
 - Pure NumPy: 0.05s (~97x faster)
 
-However, the **bulk of the overall speedup comes from eliminating merge operations** (`_factorize_keys` calls), not from faster residualization. The merge operations dominate runtime in `pre_process`.
+The **bulk of the overall speedup comes from eliminating merge/sort operations** (`_factorize_keys`, sorting), not from faster residualization math.
 
-### Profile Breakdown (5.9s total)
+### Profile Breakdown (resid=off, 6.2s total)
 
 | Operation | Time | Notes |
 |-----------|------|-------|
-| `_fast_join_master` | 2.2s | Numpy get_indexer + take |
-| `_factorize_keys` | 2.6s | Remaining 13 merges (datefile, small DFs) |
+| `_factorize_keys` | 2.7s | Remaining merges (datefile, small DFs) |
+| `is_unique` | 2.2s | Pandas internal uniqueness checks |
+| `_take_nd_ndarray` | 0.5s | Array copying |
 | groupby/transform | 0.5s | Weight calculations |
-| backtest() | 0.6s | Portfolio return aggregation |
 
 ### Equivalence Guarantee
 

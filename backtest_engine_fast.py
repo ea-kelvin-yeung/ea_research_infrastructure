@@ -594,6 +594,10 @@ class BacktestFast:
         # Pre-index datefile for fast lookups
         self._datefile_by_date = None
         self._datefile_by_n = None
+        
+        # Cached sorted asof tables (optimization #1)
+        self._other_asof_resid = None  # For residualization merge_asof
+        self._other_asof_byvars = {}   # For byvar merge_asof (keyed by column tuple)
 
     def _get_datefile_by_date(self):
         """Get datefile indexed by date for fast lookups."""
@@ -640,6 +644,90 @@ class BacktestFast:
                 df[new_col] = lookup_result[col].values
         
         return df
+
+    # =========================================================================
+    # Cached sorted asof tables (optimization #1)
+    # Sorting 30M rows takes ~2s. Caching avoids repeated sorts.
+    # =========================================================================
+    
+    def _get_other_asof_resid(self):
+        """
+        Get pre-sorted otherfile for residualization merge_asof.
+        
+        Sorted by date_sig for merge_asof (which requires global sort on 'on' key).
+        Cached on first call.
+        """
+        if self._other_asof_resid is None:
+            cols = [
+                "security_id", "date", "industry_id", "sector_id",
+                "size", "value", "growth", "leverage", "volatility", "momentum", "yield"
+            ]
+            rhs = self.otherfile[cols].rename(columns={"date": "date_sig", "yield": "yields"})
+            # Sort by on-key (date_sig) for merge_asof - must be globally sorted
+            self._other_asof_resid = rhs.sort_values("date_sig")
+        return self._other_asof_resid
+    
+    def _get_other_asof_byvars(self, byvar_cols):
+        """
+        Get pre-sorted otherfile for byvar merge_asof.
+        
+        Sorted by date_sig (globally) for merge_asof.
+        Cached per unique set of byvar columns.
+        """
+        key = tuple(sorted(byvar_cols))
+        if key not in self._other_asof_byvars:
+            cols = ["security_id", "date"] + list(byvar_cols)
+            rhs = self.otherfile[cols].rename(columns={"date": "date_sig"})
+            # Sort by on-key (date_sig) for merge_asof - must be globally sorted
+            self._other_asof_byvars[key] = rhs.sort_values("date_sig")
+        return self._other_asof_byvars[key]
+
+    # =========================================================================
+    # Fast multi-key lookup (optimization #3)
+    # Replaces hash-based merge with numpy indexer+take for turnover prev merge.
+    # =========================================================================
+    
+    def _fast_lookup_multi(self, left_df, right_df, keys, value_cols, suffix="_prev"):
+        """
+        Fast lookup using numpy get_indexer + take instead of merge.
+        
+        Right_df must have unique keys. Much faster than pandas merge
+        because it bypasses hash-based key matching and is_unique checks.
+        
+        Args:
+            left_df: DataFrame to add columns to
+            right_df: DataFrame to lookup from (must have unique keys)
+            keys: List of key columns
+            value_cols: List of value columns to lookup
+            suffix: Suffix to add to value column names
+            
+        Returns:
+            DataFrame with looked-up columns added
+        """
+        # Build MultiIndex for right side (unique keys)
+        right_idx = pd.MultiIndex.from_frame(right_df[keys])
+        
+        # Build MultiIndex for left side (lookup keys)
+        left_idx = pd.MultiIndex.from_frame(left_df[keys])
+        
+        # Get positions (-1 for missing)
+        positions = right_idx.get_indexer(left_idx)
+        
+        out = left_df.copy()
+        for col in value_cols:
+            arr = right_df[col].to_numpy()
+            # Take values (clip to avoid out-of-bounds, then set missing to NaN)
+            taken = np.take(arr, np.clip(positions, 0, len(arr) - 1))
+            # Handle numeric types that support NaN
+            if np.issubdtype(taken.dtype, np.floating):
+                taken = taken.copy()
+                taken[positions == -1] = np.nan
+            else:
+                # Convert to float64 for NaN support
+                taken = taken.astype("float64", copy=True)
+                taken[positions == -1] = np.nan
+            out[col + suffix] = taken
+        return out
 
     def _fast_join_master(self, df, cols, how='inner'):
         """
@@ -753,23 +841,11 @@ class BacktestFast:
                 raise RuntimeError(
                     "signal residualization only applies to numerical signal"
                 )
+            # Use cached pre-sorted table (optimization #1)
+            # Sort by date_sig (globally) - merge_asof requires this
             temp = pd.merge_asof(
                 temp.sort_values(by=["date_sig"]),
-                self._get_otherfile_cols(
-                    [
-                        "security_id",
-                        "date",
-                        "industry_id",
-                        "sector_id",
-                        "size",
-                        "value",
-                        "growth",
-                        "leverage",
-                        "volatility",
-                        "momentum",
-                        "yield",
-                    ]
-                ).rename(columns={"date": "date_sig", "yield": "yields"}).sort_values(by="date_sig"),
+                self._get_other_asof_resid(),  # Pre-sorted, cached
                 by="security_id",
                 on="date_sig",
                 allow_exact_matches=True,
@@ -1239,15 +1315,16 @@ class BacktestFast:
             turnover = turnover[turnover["numcos_l"] >= self.mincos]
 
         # calculate turnover from previous trading day
+        # Optimization #3: Use fast numpy lookup instead of merge
         prev = turnover[["security_id", byvar, "n", "weight"]].copy()
         prev["n"] = prev["n"] + 1
-        # variable 'date' is dropped, and merged back later on
-        turnover = turnover.drop(columns=["date"]).merge(
-            prev,
-            how="left",
-            on=["security_id", byvar, "n"],
-            suffixes=("", "_prev"),
-        )
+        # Ensure unique keys for fast lookup (keep last if duplicates)
+        prev = prev.drop_duplicates(subset=["security_id", byvar, "n"], keep="last")
+        
+        # Use fast numpy lookup instead of merge (bypasses hash-based key matching)
+        turnover = turnover.drop(columns=["date"])
+        keys = ["security_id", byvar, "n"]
+        turnover = self._fast_lookup_multi(turnover, prev, keys, ["weight"], suffix="_prev")
         turnover["weight_prev"] = turnover["weight_prev"].fillna(0)
         turnover["weight_diff"] = (turnover["weight"] - turnover["weight_prev"]).abs()
 
@@ -1774,11 +1851,11 @@ class BacktestFast:
         byvar_cols = list(dict.fromkeys(byvar_cols))
 
         if byvar_cols:
+            # Use cached pre-sorted table (optimization #1)
+            # Sort by date_sig (globally) - merge_asof requires this
             temp_with_byvars = pd.merge_asof(
                 temp_base.sort_values(by=["date_sig"]),
-                self._get_otherfile_cols(["security_id", "date"] + byvar_cols).rename(
-                    columns={"date": "date_sig"}
-                ).sort_values(by="date_sig"),
+                self._get_other_asof_byvars(byvar_cols),  # Pre-sorted, cached
                 by="security_id",
                 on="date_sig",
                 allow_exact_matches=True,
