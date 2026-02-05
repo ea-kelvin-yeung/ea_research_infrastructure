@@ -92,7 +92,8 @@ ea_research_infrastructure/
 │       ├── ret.parquet
 │       ├── risk.parquet
 │       ├── trading_date.parquet
-│       └── master.parquet  # Pre-merged for fast joins
+│       ├── master.parquet  # Pre-merged for fast backtest joins
+│       └── factors.parquet # Pre-indexed for fast factor correlation
 │
 ├── artifacts/              # Generated outputs
 │   ├── *_tearsheet.html
@@ -161,6 +162,16 @@ The `master` DataFrame is a pre-merged, indexed version of `ret` and `risk` data
 ```
 
 The master data is cached to `master.parquet` in the snapshot directory for fast loading.
+
+**Pre-indexed Factor Data:**
+
+A separate `factors.parquet` is created for fast factor correlation computation:
+```python
+# Indexed by (security_id, date) for O(1) lookups
+# Columns: size, value, growth, leverage, volatility, momentum
+```
+
+Both pre-computed files are created at snapshot creation time and loaded lazily if missing.
 
 ---
 
@@ -309,15 +320,18 @@ Creates HTML report with traffic-light verdict and composite quality score.
 | 🔴 Red | Sharpe < 0.5 or fails critical tests |
 
 **Composite Quality Score (0-100):**
-| Component | Weight | Description |
-|-----------|--------|-------------|
-| Sharpe | 25% | Scaled from 0-2.0 |
-| Lag Stability | 15% | Sharpe retention from lag0 to lag2 |
-| Resid Stability | 15% | Sharpe retention after industry neutralization |
-| Baseline Uniqueness | 15% | Low correlation to reversal/value baselines |
-| Cap Consistency | 10% | Similar performance across large/mid/small cap |
-| Year Consistency | 10% | Positive Sharpe across years |
-| Factor Uniqueness | 10% | Low correlation to risk factors |
+
+| Component | Weight | Formula | Scale |
+|-----------|--------|---------|-------|
+| Sharpe | 25% | `min(100, sharpe / 2.0 * 100)` | Sharpe 2.0 = 100 |
+| Lag Stability | 15% | `(sharpe_lag2 / sharpe_lag0) * 100` | 100% = no decay |
+| Resid Stability | 15% | `(sharpe_resid_ind / sharpe_resid_off) * 100` | 100% = survives |
+| Baseline Uniqueness | 15% | `100 - (max_baseline_corr / 0.5 * 100)` | 0% corr = 100 |
+| Cap Consistency | 10% | `(large_cap_sharpe / small_cap_sharpe) * 100` | 100% = balanced |
+| Year Consistency | 10% | `(positive_years / total_years) * 100` | 100% = all positive |
+| Factor Uniqueness | 10% | `100 - (max_factor_corr / 0.3 * 100)` | 0% corr = 100 |
+
+**Grade thresholds:** A ≥ 80, B ≥ 65, C ≥ 50, D ≥ 35, F < 35
 
 **Key functions:**
 ```python

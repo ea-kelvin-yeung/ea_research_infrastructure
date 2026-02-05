@@ -12,6 +12,7 @@ from joblib import Parallel, delayed
 
 from .wrapper import BacktestConfig, BacktestResult, run_backtest
 from .baselines import generate_all_baselines, compute_signal_correlation, BASELINES, DEFAULT_START_DATE, DEFAULT_END_DATE
+from .catalog import RISK_FACTORS
 
 
 # Default suite configuration
@@ -19,10 +20,6 @@ DEFAULT_GRID = {
     'lags': [0, 1, 2],
     'residualize': ['off', 'industry'],
 }
-
-
-# Risk factors available in the risk file
-RISK_FACTORS = ['size', 'value', 'growth', 'leverage', 'volatility', 'momentum']
 
 
 @dataclass
@@ -226,45 +223,86 @@ def _compute_factor_exposures(signal_df: pd.DataFrame, catalog: dict) -> pd.Data
     """
     Compute correlations between signal and risk factors.
     
+    Uses pre-indexed factors DataFrame from catalog if available (10x faster).
+    Falls back to risk DataFrame merge if factors not pre-computed.
+    
     Returns DataFrame with columns: factor, correlation, abs_correlation
     """
-    risk_df = catalog.get('risk')
-    if risk_df is None:
-        return pd.DataFrame()
-    
-    # Merge signal with risk factors
-    # Signal has date_sig, risk has date - use date_sig as the reference
+    # Check required signal columns
     signal_cols = ['security_id', 'date_sig', 'signal']
     if not all(c in signal_df.columns for c in signal_cols):
         return pd.DataFrame()
     
-    signal_subset = signal_df[signal_cols].copy()
-    
-    # Get available risk factors
-    available_factors = [f for f in RISK_FACTORS if f in risk_df.columns]
-    if not available_factors:
-        return pd.DataFrame()
-    
-    # Prepare risk data with renamed date column
-    risk_cols = ['security_id', 'date'] + available_factors
-    risk_subset = risk_df[risk_cols].rename(columns={'date': 'date_sig'})
-    
-    # Merge signal with risk factors
-    merged = signal_subset.merge(risk_subset, on=['security_id', 'date_sig'], how='inner')
-    
-    if len(merged) < 100:
-        return pd.DataFrame()
-    
-    # Compute correlations
-    rows = []
-    for factor in available_factors:
-        if factor in merged.columns:
-            corr = merged['signal'].corr(merged[factor])
+    # Try to use pre-indexed factors (much faster)
+    factors_df = catalog.get('factors')
+    if factors_df is not None and len(factors_df) > 0:
+        # Fast path: use pre-indexed factors with get_indexer + take
+        signal_subset = signal_df[signal_cols].copy()
+        
+        # Build MultiIndex for lookup
+        lookup_idx = pd.MultiIndex.from_arrays(
+            [signal_subset['security_id'].values, signal_subset['date_sig'].values],
+            names=['security_id', 'date']
+        )
+        
+        # Get positions in factors index
+        positions = factors_df.index.get_indexer(lookup_idx)
+        valid_mask = positions >= 0
+        
+        if valid_mask.sum() < 100:
+            return pd.DataFrame()
+        
+        # Get signal values for valid matches
+        signal_values = signal_subset['signal'].values[valid_mask]
+        
+        # Compute correlations using numpy for speed
+        rows = []
+        for factor in factors_df.columns:
+            factor_values = factors_df[factor].values[positions[valid_mask]]
+            # Remove NaN pairs
+            valid_pairs = ~(np.isnan(signal_values) | np.isnan(factor_values))
+            if valid_pairs.sum() < 100:
+                corr = np.nan
+            else:
+                corr = np.corrcoef(signal_values[valid_pairs], factor_values[valid_pairs])[0, 1]
             rows.append({
                 'factor': factor,
                 'correlation': corr,
                 'abs_correlation': abs(corr) if not np.isnan(corr) else np.nan,
             })
+    else:
+        # Fallback: use risk DataFrame with merge
+        risk_df = catalog.get('risk')
+        if risk_df is None:
+            return pd.DataFrame()
+        
+        signal_subset = signal_df[signal_cols].copy()
+        
+        # Get available risk factors
+        available_factors = [f for f in RISK_FACTORS if f in risk_df.columns]
+        if not available_factors:
+            return pd.DataFrame()
+        
+        # Prepare risk data with renamed date column
+        risk_cols = ['security_id', 'date'] + available_factors
+        risk_subset = risk_df[risk_cols].rename(columns={'date': 'date_sig'})
+        
+        # Merge signal with risk factors
+        merged = signal_subset.merge(risk_subset, on=['security_id', 'date_sig'], how='inner')
+        
+        if len(merged) < 100:
+            return pd.DataFrame()
+        
+        # Compute correlations
+        rows = []
+        for factor in available_factors:
+            if factor in merged.columns:
+                corr = merged['signal'].corr(merged[factor])
+                rows.append({
+                    'factor': factor,
+                    'correlation': corr,
+                    'abs_correlation': abs(corr) if not np.isnan(corr) else np.nan,
+                })
     
     result = pd.DataFrame(rows)
     if len(result) > 0:

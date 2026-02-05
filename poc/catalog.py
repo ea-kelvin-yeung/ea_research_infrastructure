@@ -1,7 +1,9 @@
 """
 Data Catalog: Load data from snapshots with manifest tracking.
 
-Includes master_data: pre-merged ret+risk DataFrame for fast backtest joins.
+Includes:
+- master_data: pre-merged ret+risk DataFrame for fast backtest joins
+- factors: pre-indexed risk factor DataFrame for fast factor correlation
 """
 
 import pandas as pd
@@ -9,6 +11,10 @@ import json
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
+
+
+# Standard risk factors used for signal quality assessment
+RISK_FACTORS = ['size', 'value', 'growth', 'leverage', 'volatility', 'momentum']
 
 
 def _create_master_data(ret_df: pd.DataFrame, risk_df: pd.DataFrame) -> pd.DataFrame:
@@ -60,6 +66,35 @@ def _create_master_data(ret_df: pd.DataFrame, risk_df: pd.DataFrame) -> pd.DataF
     return master
 
 
+def _create_factor_data(risk_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Create a pre-indexed factor DataFrame for fast factor correlation.
+    
+    This speeds up factor exposure computation in suite.py by:
+    1. Selecting only the factor columns needed
+    2. Pre-indexing by (security_id, date) for fast joins
+    
+    Columns included:
+    - security_id, date (as index)
+    - size, value, growth, leverage, volatility, momentum
+    """
+    # Select available factor columns
+    cols = ['security_id', 'date']
+    for factor in RISK_FACTORS:
+        if factor in risk_df.columns:
+            cols.append(factor)
+    
+    if len(cols) <= 2:
+        # No factor columns available
+        return pd.DataFrame()
+    
+    # Create subset and index
+    factors = risk_df[cols].copy()
+    factors = factors.set_index(['security_id', 'date']).sort_index()
+    
+    return factors
+
+
 def load_catalog(snapshot_path: str = "snapshots/default", use_master: bool = True) -> dict:
     """
     Load data catalog from a snapshot directory.
@@ -108,6 +143,22 @@ def load_catalog(snapshot_path: str = "snapshots/default", use_master: bool = Tr
             catalog['master'].reset_index().to_parquet(master_path, index=False)
             print(f"Created master.parquet cache: {len(catalog['master'])} rows")
     
+    # Load or create pre-indexed factor data for fast factor correlation
+    factors_path = path / 'factors.parquet'
+    if factors_path.exists():
+        # Load cached factor data
+        catalog['factors'] = pd.read_parquet(factors_path)
+        # Restore index
+        if 'security_id' in catalog['factors'].columns:
+            catalog['factors'] = catalog['factors'].set_index(['security_id', 'date']).sort_index()
+    else:
+        # Create and cache factor data
+        catalog['factors'] = _create_factor_data(catalog['risk'])
+        if len(catalog['factors']) > 0:
+            # Save to disk (reset index for parquet)
+            catalog['factors'].reset_index().to_parquet(factors_path, index=False)
+            print(f"Created factors.parquet cache: {len(catalog['factors'])} rows")
+    
     return catalog
 
 
@@ -152,6 +203,11 @@ def create_snapshot(
     master_df = _create_master_data(ret_df, risk_df)
     master_df.reset_index().to_parquet(snapshot_path / 'master.parquet', index=False)
     
+    # Create factor data (pre-indexed for fast factor correlation)
+    factor_df = _create_factor_data(risk_df)
+    if len(factor_df) > 0:
+        factor_df.reset_index().to_parquet(snapshot_path / 'factors.parquet', index=False)
+    
     # Create manifest
     manifest = {
         'snapshot_id': snapshot_id,
@@ -168,6 +224,10 @@ def create_snapshot(
             },
             'trading_date': {
                 'rows': len(datefile),
+            },
+            'factors': {
+                'rows': len(factor_df),
+                'columns': list(factor_df.columns) if len(factor_df) > 0 else [],
             },
         },
     }
