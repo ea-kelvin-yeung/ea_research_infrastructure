@@ -4,28 +4,28 @@ overview: Implement a standardized backtesting PoC with signal contract validati
 todos:
   - id: signal-contract
     content: "Implement signal contract: schema validation + date alignment (poc/contract/)"
-    status: pending
+    status: completed
   - id: data-catalog
     content: Implement DataCatalog with snapshot management and manifest (poc/data/)
-    status: pending
+    status: completed
   - id: backtest-wrapper
     content: Create canonical backtest wrapper API with BacktestResult dataclass (poc/engine/)
-    status: pending
+    status: completed
   - id: baseline-library
     content: "Implement baseline signal generators: reversal, momentum, value (poc/baselines/)"
-    status: pending
+    status: completed
   - id: suite-runner
     content: Build suite runner with config matrix and parallel execution (poc/suite/)
-    status: pending
+    status: completed
   - id: mlflow-tracking
     content: Add MLflow logging for tags, params, metrics, artifacts (poc/tracking/)
-    status: pending
+    status: completed
   - id: tearsheet-gen
     content: Create tear sheet HTML generator with verdict panel (poc/reporting/)
-    status: pending
+    status: completed
   - id: streamlit-ui
     content: "Build Streamlit UI: Run, Results, History pages (poc/ui/)"
-    status: pending
+    status: completed
   - id: perf-optimize
     content: Apply performance optimizations if needed for responsiveness
     status: pending
