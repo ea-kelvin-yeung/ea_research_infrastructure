@@ -139,12 +139,14 @@ TEARSHEET_TEMPLATE = """
                 {% if cap_table %}
                 <div class="subsection">
                     <h3>Performance by Market Cap</h3>
+                    <p style="font-size: 11px; color: #666; margin-bottom: 8px;">All metrics use 252-day annualization for consistency across slices.</p>
                     {{ cap_table | safe }}
                 </div>
                 {% endif %}
                 {% if year_table %}
                 <div class="subsection">
                     <h3>Performance by Year</h3>
+                    <p style="font-size: 11px; color: #666; margin-bottom: 8px;">All metrics use 252-day annualization for consistency across slices.</p>
                     {{ year_table | safe }}
                 </div>
                 {% endif %}

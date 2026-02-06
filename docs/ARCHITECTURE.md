@@ -207,6 +207,8 @@ class BacktestResult:
     @property turnover -> float
 ```
 
+**Annualization note:** All slices (overall, year, cap) use 252-day annualization for Sharpe ratio and annual return calculations. This ensures metrics are comparable across different time periods and market cap groups.
+
 ---
 
 ### 4. `poc/baselines.py` - Baseline Library
@@ -306,7 +308,7 @@ Creates HTML report with traffic-light verdict and composite quality score.
 3. **Quality Score Breakdown** - Weighted component scores
 4. **Headline Metrics** - Sharpe, return, drawdown, turnover, coverage
 5. **Suite Results** - All configs with key metrics
-6. **Robustness Analysis** - Cap-tier and year-by-year breakdown
+6. **Robustness Analysis** - Cap-tier and year-by-year breakdown (all metrics use 252-day annualization for consistency)
 7. **Baseline Comparison** - Correlations table
 8. **Signal Uniqueness** - Baseline correlations
 9. **Risk Factor Exposures** - Correlation to size, value, momentum, volatility, etc.

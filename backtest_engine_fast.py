@@ -1612,25 +1612,26 @@ class BacktestFast:
             port2 = port2[[byvar, "ret", "resret", "ret_net", "resret_net", "drawdown"]]
 
         if "year" in byvar or "yr" in byvar:
+            # Use 252-day annualization for consistency with other slices
+            # (previously used actual day count, which made partial years look worse)
 
             port2["trade"] = np.where(port2["ret"] == 0, 0, 1)
             group = port2.groupby(byvar, sort=False)
             port2["num_date"] = group["trade"].transform("sum")
-            ret_count = group["ret"].transform("count")
             ret_mean = group["ret"].transform("mean")
             ret_std = group["ret"].transform("std")
-            port2["ret_ann"] = ret_mean * ret_count
-            port2["ret_std"] = ret_std * np.sqrt(ret_count)
+            port2["ret_ann"] = ret_mean * 252
+            port2["ret_std"] = ret_std * np.sqrt(252)
             port2["sharpe_ret"] = port2["ret_ann"] / port2["ret_std"]
             resret_mean = group["resret"].transform("mean")
             resret_std = group["resret"].transform("std")
-            port2["resret_ann"] = resret_mean * ret_count
-            port2["resret_std"] = resret_std * np.sqrt(ret_count)
+            port2["resret_ann"] = resret_mean * 252
+            port2["resret_std"] = resret_std * np.sqrt(252)
             port2["sharpe_resret"] = port2["resret_ann"] / port2["resret_std"]
             ret_net_mean = group["ret_net"].transform("mean")
             ret_net_std = group["ret_net"].transform("std")
-            port2["ret_net_ann"] = ret_net_mean * ret_count
-            port2["ret_net_std"] = ret_net_std * np.sqrt(ret_count)
+            port2["ret_net_ann"] = ret_net_mean * 252
+            port2["ret_net_std"] = ret_net_std * np.sqrt(252)
             port2["sharpe_retnet"] = port2["ret_net_ann"] / port2["ret_net_std"]
             port2["maxdraw"] = group["drawdown"].transform("min")
             ret_pct = (np.sign(port2["ret"]) + 1) / 2

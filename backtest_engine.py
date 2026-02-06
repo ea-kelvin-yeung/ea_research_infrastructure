@@ -1261,28 +1261,30 @@ class Backtest:
             port2 = port2[[byvar, "ret", "resret", "ret_net", "resret_net", "drawdown"]]
 
         if "year" in byvar or "yr" in byvar:
+            # Use 252-day annualization for consistency with other slices
+            # (previously used actual day count, which made partial years look worse)
 
             port2["trade"] = np.where(port2["ret"] == 0, 0, 1)
             port2["num_date"] = port2.groupby(byvar)["trade"].transform("sum")
             port2["ret_ann"] = port2.groupby(byvar)["ret"].transform(
-                lambda x: x.mean() * x.count()
+                lambda x: x.mean() * 252
             )
             port2["ret_std"] = port2.groupby(byvar)["ret"].transform(
-                lambda x: x.std() * math.sqrt(x.count())
+                lambda x: x.std() * math.sqrt(252)
             )
             port2["sharpe_ret"] = port2["ret_ann"] / port2["ret_std"]
             port2["resret_ann"] = port2.groupby(byvar)["resret"].transform(
-                lambda x: x.mean() * x.count()
+                lambda x: x.mean() * 252
             )
             port2["resret_std"] = port2.groupby(byvar)["resret"].transform(
-                lambda x: x.std() * math.sqrt(x.count())
+                lambda x: x.std() * math.sqrt(252)
             )
             port2["sharpe_resret"] = port2["resret_ann"] / port2["resret_std"]
             port2["ret_net_ann"] = port2.groupby(byvar)["ret_net"].transform(
-                lambda x: x.mean() * x.count()
+                lambda x: x.mean() * 252
             )
             port2["ret_net_std"] = port2.groupby(byvar)["ret_net"].transform(
-                lambda x: x.std() * math.sqrt(x.count())
+                lambda x: x.std() * math.sqrt(252)
             )
             port2["sharpe_retnet"] = port2["ret_net_ann"] / port2["ret_net_std"]
             port2["maxdraw"] = port2.groupby(byvar)["drawdown"].transform("min")
