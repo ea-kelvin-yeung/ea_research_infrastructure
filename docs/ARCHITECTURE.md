@@ -542,6 +542,33 @@ df['n'] = datefile_by_date.reindex(df['date'])['n'].values
 - Statsmodels OLS (groupby.apply): 4.85s
 - Pure NumPy: 0.05s (~97x faster)
 
+### Streamlit Data Caching
+
+The app uses `@st.cache_resource` to keep catalog data in memory across reruns:
+
+```python
+@st.cache_resource(show_spinner="Loading data snapshot...")
+def get_cached_catalog(snapshot_path: str):
+    """Load catalog once and cache in memory across reruns."""
+    return load_catalog(snapshot_path, use_master=True)
+```
+
+**How it works:**
+- First run: Loads full catalog from disk (a few seconds for large snapshots)
+- Subsequent runs: Uses cached data instantly
+- Changing snapshot: Loads that snapshot once, then caches it
+- Cache persists until "Clear Cache" button is clicked or app restarts
+
+**Memory usage:**
+| Snapshot | Rows | Approx RAM |
+|----------|------|------------|
+| 2018 only | ~600K | ~500 MB |
+| 2018-2023 | ~4M | ~1.5 GB |
+| Full history (2001-2025) | ~30M | ~3 GB |
+
+**Controls:**
+- Sidebar → "Data Cache" expander → "Clear Cache" button to force reload from disk
+
 The **bulk of the overall speedup comes from eliminating merge/sort operations** (`_factorize_keys`, sorting), not from faster residualization math.
 
 ### Profile Breakdown (resid=off, 6.2s total)

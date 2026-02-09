@@ -18,6 +18,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from poc.catalog import load_catalog, list_snapshots, create_snapshot
 from poc.suite import run_suite, DEFAULT_GRID
 from poc.tearsheet import generate_tearsheet
+
+
+@st.cache_resource(show_spinner="Loading data snapshot...")
+def get_cached_catalog(snapshot_path: str):
+    """Load catalog once and cache in memory across reruns."""
+    return load_catalog(snapshot_path, use_master=True)
 from poc.tracking import log_run, get_run_history, get_git_sha, compute_signal_hash
 from poc.charts import (
     plot_lag_sensitivity, plot_decile_returns, plot_factor_exposure_bars, 
@@ -76,6 +82,14 @@ def main():
             return
         
         selected_snapshot = st.selectbox("Data Snapshot", snapshots, help="Pre-built market data (returns, risk factors, dates)")
+        
+        # Cache controls
+        with st.expander("Data Cache", expanded=False):
+            st.caption("Data is cached in memory after first load for faster reruns.")
+            if st.button("Clear Cache", help="Clear cached data to reload from disk"):
+                get_cached_catalog.clear()
+                st.success("Cache cleared!")
+                st.rerun()
         
         # Suite configuration
         st.subheader("Suite Options")
@@ -142,8 +156,8 @@ def main():
                         (signal_df['date_sig'] <= end_str)
                     ]
                     
-                    # Load and filter catalog
-                    catalog = load_catalog(f"snapshots/{selected_snapshot}")
+                    # Load catalog (cached in memory after first load)
+                    catalog = get_cached_catalog(f"snapshots/{selected_snapshot}")
                     catalog = filter_catalog(catalog, start_str, end_str)
                     
                     # Apply universe filter if requested
