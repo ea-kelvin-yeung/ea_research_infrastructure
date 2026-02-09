@@ -567,7 +567,51 @@ def get_cached_catalog(snapshot_path: str):
 | Full history (2001-2025) | ~30M | ~3 GB |
 
 **Controls:**
-- Sidebar → "Data Cache" expander → "Clear Cache" button to force reload from disk
+- Sidebar → "Data Cache" expander → "Clear Data Cache" button to force reload from disk
+
+### Compare Tab Caching
+
+The Compare tab loads MLflow run data and artifacts. Several caching layers ensure fast performance:
+
+**1. Run History Caching:**
+```python
+@st.cache_data(ttl=60, show_spinner=False)
+def get_cached_run_history():
+    """Get run history with 60-second cache to avoid repeated MLflow queries."""
+    return get_run_history()
+```
+- Caches the list of past runs for 60 seconds
+- Avoids repeated MLflow queries on tab switches
+
+**2. MLflow Artifact Caching:**
+```python
+# In compare.py
+_run_data_cache: Dict[str, Tuple[Dict, Optional[pd.DataFrame]]] = {}
+
+def load_run_data(run_id: str, use_cache: bool = True):
+    if use_cache and run_id in _run_data_cache:
+        return _run_data_cache[run_id]
+    # ... load from MLflow ...
+    _run_data_cache[run_id] = result
+    return result
+```
+- Caches downloaded artifacts (daily parquet files) in memory
+- First comparison downloads from MLflow; repeat comparisons are instant
+
+**3. Parallel Run Loading:**
+```python
+def compare_runs(run_a_id: str, run_b_id: str) -> CompareResult:
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_a = executor.submit(load_run_data, run_a_id)
+        future_b = executor.submit(load_run_data, run_b_id)
+        run_a, daily_a = future_a.result()
+        run_b, daily_b = future_b.result()
+```
+- Loads both runs simultaneously, cutting uncached load time ~50%
+
+**Controls:**
+- Sidebar → "Data Cache" expander → "Clear Compare Cache" to clear MLflow artifact cache and run history
+- History tab → "Refresh" button clears run history cache
 
 The **bulk of the overall speedup comes from eliminating merge/sort operations** (`_factorize_keys`, sorting), not from faster residualization math.
 

@@ -1,0 +1,10 @@
+[server]
+# Max size of messages sent between browser and server (in MB)
+maxMessageSize = 500
+
+# Max upload size for file uploader (in MB)
+maxUploadSize = 500
+
+[browser]
+# Disable usage statistics
+gatherUsageStats = false

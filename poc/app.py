@@ -24,12 +24,18 @@ from poc.tearsheet import generate_tearsheet
 def get_cached_catalog(snapshot_path: str):
     """Load catalog once and cache in memory across reruns."""
     return load_catalog(snapshot_path, use_master=True)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_cached_run_history():
+    """Get run history with 60-second cache to avoid repeated MLflow queries."""
+    return get_run_history()
 from poc.tracking import log_run, get_run_history, get_git_sha, compute_signal_hash
 from poc.charts import (
     plot_lag_sensitivity, plot_decile_returns, plot_factor_exposure_bars, 
     plot_coverage_over_time, plot_ic_over_time
 )
-from poc.compare import compare_runs, get_overlay_data, compute_cumret_diff
+from poc.compare import compare_runs, get_overlay_data, compute_cumret_diff, clear_run_cache
 
 
 st.set_page_config(page_title="Backtest Suite Runner", page_icon="📊", layout="wide")
@@ -85,10 +91,15 @@ def main():
         
         # Cache controls
         with st.expander("Data Cache", expanded=False):
-            st.caption("Data is cached in memory after first load for faster reruns.")
-            if st.button("Clear Cache", help="Clear cached data to reload from disk"):
+            st.caption("Data is cached in memory for faster reruns.")
+            if st.button("Clear Data Cache", help="Clear cached snapshot data to reload from disk"):
                 get_cached_catalog.clear()
-                st.success("Cache cleared!")
+                st.success("Data cache cleared!")
+                st.rerun()
+            if st.button("Clear Compare Cache", help="Clear cached MLflow run data"):
+                clear_run_cache()
+                get_cached_run_history.clear()
+                st.success("Compare cache cleared!")
                 st.rerun()
         
         # Suite configuration
@@ -315,14 +326,14 @@ def main():
                              title='Cumulative Return: Signal vs Baselines',
                              line_dash='type')
                 fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02))
-                st.plotly_chart(fig, use_container_width=True, key="results_cumret")
+                st.plotly_chart(fig, width='stretch', key="results_cumret")
             else:
                 st.info("Select at least one config to display")
             
             # Lag Sensitivity Chart
             st.subheader("Lag Sensitivity")
             lag_fig = plot_lag_sensitivity(result)
-            st.plotly_chart(lag_fig, use_container_width=True, key="results_lag_sensitivity")
+            st.plotly_chart(lag_fig, width='stretch', key="results_lag_sensitivity")
             
             # Signal Quality Charts section
             st.subheader("Signal Quality Charts")
@@ -333,14 +344,14 @@ def main():
                 signal_df = st.session_state.get('signal_df')
                 if signal_df is not None:
                     coverage_fig = plot_coverage_over_time(signal_df)
-                    st.plotly_chart(coverage_fig, use_container_width=True, key="results_coverage")
+                    st.plotly_chart(coverage_fig, width='stretch', key="results_coverage")
                 else:
                     st.info("Signal data not available for coverage chart")
                 
                 # Factor Exposure bars
                 if result.factor_exposures is not None and len(result.factor_exposures) > 0:
                     factor_fig = plot_factor_exposure_bars(result.factor_exposures)
-                    st.plotly_chart(factor_fig, use_container_width=True, key="results_factor_exposure")
+                    st.plotly_chart(factor_fig, width='stretch', key="results_factor_exposure")
             
             with chart_col2:
                 # Decile Returns - use best config's fractile data
@@ -348,7 +359,7 @@ def main():
                 if best_key and result.results[best_key].fractile is not None:
                     fractile_df = result.results[best_key].fractile
                     decile_fig = plot_decile_returns(fractile_df)
-                    st.plotly_chart(decile_fig, use_container_width=True, key="results_decile")
+                    st.plotly_chart(decile_fig, width='stretch', key="results_decile")
                 else:
                     st.info("No fractile data available")
             
@@ -368,7 +379,7 @@ def main():
                 # IC over time chart
                 if result.ic_series is not None and len(result.ic_series) > 0:
                     ic_fig = plot_ic_over_time(result.ic_series)
-                    st.plotly_chart(ic_fig, use_container_width=True, key="results_ic")
+                    st.plotly_chart(ic_fig, width='stretch', key="results_ic")
             else:
                 st.info("IC not available (requires signal and return data)")
             
@@ -392,7 +403,7 @@ def main():
     with tab3:
         st.header("Compare Runs")
         
-        runs = get_run_history()
+        runs = get_cached_run_history()
         
         if not runs or len(runs) < 2:
             st.info("Need at least 2 runs in MLflow to compare. Run some backtests first.")
@@ -471,7 +482,7 @@ def main():
                             'Diff': '{:+.4f}',
                             'Diff %': '{:+.1f}%',
                         }, na_rep='N/A')
-                        st.dataframe(styled, use_container_width=True)
+                        st.dataframe(styled, width='stretch')
                     else:
                         st.info("No comparable metrics found.")
                     
@@ -490,7 +501,7 @@ def main():
                                 title='Cumulative Return: Run A vs Run B'
                             )
                             fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02))
-                            st.plotly_chart(fig, use_container_width=True, key="compare_cumret")
+                            st.plotly_chart(fig, width='stretch', key="compare_cumret")
                             
                             # Difference plot
                             diff_data = compute_cumret_diff(result.daily_a, result.daily_b)
@@ -510,7 +521,7 @@ def main():
                                     xaxis_title="Date",
                                     showlegend=False,
                                 )
-                                st.plotly_chart(fig_diff, use_container_width=True, key="compare_diff")
+                                st.plotly_chart(fig_diff, width='stretch', key="compare_diff")
                         else:
                             st.info("No daily data available for overlay plot.")
                     else:
@@ -523,9 +534,11 @@ def main():
         col1, col2 = st.columns([1, 4])
         with col1:
             if st.button("Refresh"):
+                # Clear the run history cache and reload
+                get_cached_run_history.clear()
                 st.rerun()
         
-        runs = get_run_history()
+        runs = get_cached_run_history()
         
         if not runs:
             st.info("No runs found in MLflow. Run a suite first.")
@@ -609,7 +622,7 @@ def main():
                             'max_dd': '{:.2%}',
                             'turnover': '{:.2%}',
                         }, na_rep='N/A'),
-                        use_container_width=True
+                        width='stretch'
                     )
                 
                 # Cumulative Returns
@@ -654,7 +667,7 @@ def main():
                         fig = px.line(daily_df, x='date', y='cumret', title='Cumulative Return')
                     
                     fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02))
-                    st.plotly_chart(fig, use_container_width=True, key="history_cumret")
+                    st.plotly_chart(fig, width='stretch', key="history_cumret")
                 else:
                     st.info("No daily returns data found for this run.")
                 
@@ -666,7 +679,7 @@ def main():
                     # Factor Exposure bars
                     if factor_exposures is not None and len(factor_exposures) > 0:
                         factor_fig = plot_factor_exposure_bars(factor_exposures)
-                        st.plotly_chart(factor_fig, use_container_width=True, key="history_factor_exposure")
+                        st.plotly_chart(factor_fig, width='stretch', key="history_factor_exposure")
                     else:
                         st.info("No factor exposure data")
                 
@@ -698,7 +711,7 @@ def main():
                     
                     if ic_series is not None and len(ic_series) > 0:
                         ic_fig = plot_ic_over_time(ic_series)
-                        st.plotly_chart(ic_fig, use_container_width=True, key="history_ic")
+                        st.plotly_chart(ic_fig, width='stretch', key="history_ic")
                 else:
                     st.info("No IC data available for this run.")
                 
@@ -708,7 +721,7 @@ def main():
                     st.dataframe(correlations.style.format({
                         'signal_corr': '{:.3f}',
                         'pnl_corr': '{:.3f}',
-                    }, na_rep='N/A'), use_container_width=True)
+                    }, na_rep='N/A'), width='stretch')
                 else:
                     st.info("No baseline correlations available.")
                 

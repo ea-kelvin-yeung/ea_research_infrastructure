@@ -8,6 +8,8 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
+from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
 
 import mlflow
 
@@ -22,16 +24,30 @@ class CompareResult:
     daily_b: Optional[pd.DataFrame] = None  # Run B daily series
 
 
-def load_run_data(run_id: str) -> Tuple[Dict, Optional[pd.DataFrame]]:
+# Cache for loaded run data (avoids re-downloading artifacts)
+_run_data_cache: Dict[str, Tuple[Dict, Optional[pd.DataFrame]]] = {}
+
+
+def clear_run_cache():
+    """Clear the run data cache."""
+    _run_data_cache.clear()
+
+
+def load_run_data(run_id: str, use_cache: bool = True) -> Tuple[Dict, Optional[pd.DataFrame]]:
     """
     Load run metadata and daily returns from MLflow.
     
     Args:
         run_id: MLflow run ID
+        use_cache: Whether to use cached data (default True)
         
     Returns:
         Tuple of (run_info dict, daily DataFrame or None)
     """
+    # Check cache first
+    if use_cache and run_id in _run_data_cache:
+        return _run_data_cache[run_id]
+    
     client = mlflow.tracking.MlflowClient()
     
     # Get run info
@@ -61,7 +77,11 @@ def load_run_data(run_id: str) -> Tuple[Dict, Optional[pd.DataFrame]]:
     except Exception as e:
         print(f"Could not load daily data for {run_id}: {e}")
     
-    return run_info, daily_df
+    # Cache the result
+    result = (run_info, daily_df)
+    _run_data_cache[run_id] = result
+    
+    return result
 
 
 def compare_runs(run_a_id: str, run_b_id: str) -> CompareResult:
@@ -75,9 +95,12 @@ def compare_runs(run_a_id: str, run_b_id: str) -> CompareResult:
     Returns:
         CompareResult with metrics diff and overlay data
     """
-    # Load both runs
-    run_a, daily_a = load_run_data(run_a_id)
-    run_b, daily_b = load_run_data(run_b_id)
+    # Load both runs in parallel for faster loading
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_a = executor.submit(load_run_data, run_a_id)
+        future_b = executor.submit(load_run_data, run_b_id)
+        run_a, daily_a = future_a.result()
+        run_b, daily_b = future_b.result()
     
     # Build metrics comparison table
     metrics_diff = _build_metrics_diff(run_a, run_b)
