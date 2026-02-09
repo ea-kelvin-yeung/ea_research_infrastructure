@@ -132,48 +132,71 @@ prepare_signal(df, datefile, lag=0) -> df # Validate + align
 
 ### 2. `poc/catalog.py` - Data Catalog
 
-Manages versioned data snapshots for reproducibility.
+Manages versioned data snapshots for reproducibility. **All heavy computation is done at snapshot creation time.**
 
 **Key functions:**
 ```python
-create_snapshot(source_dir, output_dir) -> Path  # Create new snapshot
-load_catalog(snapshot_path) -> dict              # Load snapshot data
+create_snapshot(source_dir, output_dir) -> Path  # Create snapshot + ALL precomputation
+load_catalog(snapshot_path) -> dict              # Fast load (just reads files)
 list_snapshots(snapshots_dir) -> List[str]       # List available snapshots
 ```
 
 **Catalog dict structure:**
 ```python
 {
-    'ret': pd.DataFrame,      # Returns data
-    'risk': pd.DataFrame,     # Risk factors
-    'dates': pd.DataFrame,    # Trading calendar
-    'master': pd.DataFrame,   # Pre-merged ret+risk (indexed)
-    'snapshot_id': str,       # Snapshot identifier
+    'ret': pd.DataFrame,           # Normalized returns (deduplicated, int32 keys)
+    'risk': pd.DataFrame,          # Normalized risk factors (category cols)
+    'dates': pd.DataFrame,         # Trading calendar
+    'master': pd.DataFrame,        # Pre-merged ret+risk (MultiIndex)
+    'factors': pd.DataFrame,       # Pre-indexed factors (MultiIndex)
+    'dates_indexed': dict,         # {'by_date': df, 'by_n': df}
+    'asof_tables': dict,           # {'resid': df, 'byvars_cap': df}
+    'snapshot_id': str,
+    'manifest': dict,              # Includes version: 2 for optimized snapshots
 }
 ```
 
-**Master Data (Performance Optimization):**
+**V2 Snapshot Format:**
 
-The `master` DataFrame is a pre-merged, indexed version of `ret` and `risk` data, created automatically when loading a catalog. It provides **3-4x speedup** for backtests by avoiding repeated merge operations.
+V2 snapshots (version >= 2 in manifest) have all precomputation done at creation time:
 
+| File | Created At | Contents |
+|------|------------|----------|
+| `ret.parquet` | Snapshot creation | Normalized, deduplicated, security_id=int32 |
+| `risk.parquet` | Snapshot creation | Normalized, group cols=category |
+| `master.parquet` | Snapshot creation | Pre-merged ret+risk, ready for MultiIndex |
+| `asof_resid.parquet` | Snapshot creation | Pre-sorted for residualization merge_asof |
+| `asof_cap.parquet` | Snapshot creation | Pre-sorted for cap lookup merge_asof |
+| `factors.parquet` | Snapshot creation | Pre-indexed for factor correlation |
+
+**Loading Flow:**
 ```python
-# Master data columns (indexed on security_id, date):
-# From ret: ret, resret, openret, resopenret, vol, adv, close_adj
-# From risk: mcap, cap, industry_id, sector_id, size, value, growth, 
-#            leverage, volatility, momentum, yield
+# V2 snapshots: Just read files, restore indexes
+load_catalog('snapshots/v2-snapshot')  # ~2-5 seconds
+
+# V1 snapshots (backwards compat): Normalize on load
+load_catalog('snapshots/v1-snapshot')  # Slower, normalizes each time
 ```
 
-The master data is cached to `master.parquet` in the snapshot directory for fast loading.
+**Master Data:**
 
-**Pre-indexed Factor Data:**
-
-A separate `factors.parquet` is created for fast factor correlation computation:
+Pre-merged, indexed version of `ret` and `risk` data:
 ```python
-# Indexed by (security_id, date) for O(1) lookups
-# Columns: size, value, growth, leverage, volatility, momentum
+# Indexed on (security_id, date) for O(1) lookups via get_indexer
+# Columns from ret: ret, resret, openret, resopenret, vol, adv, close_adj
+# Columns from risk: mcap, cap, industry_id, sector_id, size, value, growth, 
+#                    leverage, volatility, momentum, yield
 ```
 
-Both pre-computed files are created at snapshot creation time and loaded lazily if missing.
+**Pre-sorted Asof Tables:**
+
+For `merge_asof` operations (which require sorted keys):
+```python
+asof_tables = {
+    'resid': risk_df with date→date_sig, sorted by date_sig,
+    'byvars_cap': cap table with date→date_sig, sorted by date_sig,
+}
+```
 
 ---
 
@@ -460,6 +483,84 @@ mlflow ui
 
 ## Performance Optimizations
 
+The system uses a **multi-layer optimization strategy** where heavy computation is pushed as early as possible:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    create_snapshot() - ONE TIME (~60s)                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  • Normalize data (dedup on security_id+date, convert to int32)     │    │
+│  │  • Create master.parquet (pre-merged ret+risk, indexed)             │    │
+│  │  • Create asof_resid.parquet, asof_cap.parquet (pre-sorted)         │    │
+│  │  • Create factors.parquet (pre-indexed)                             │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    load_catalog() - FAST (~2-5s)                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  • Read pre-normalized parquet files (no dedup/conversion)          │    │
+│  │  • Restore MultiIndex on master_data (cheap)                        │    │
+│  │  • Create dates_indexed dict (tiny data)                            │    │
+│  │  • Load pre-sorted asof tables                                      │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    run_backtest() - FAST (seconds)                           │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  • _fast_join_master() uses get_indexer + np.take (no merge)        │    │
+│  │  • merge_asof uses pre-sorted asof tables (no sort)                 │    │
+│  │  • No is_unique checks, no _factorize_keys overhead                 │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Snapshot Precomputation
+
+All heavy data preparation is done **once** at snapshot creation time:
+
+```bash
+# Create optimized snapshot (takes ~60s for large data, but only done once)
+python -c "from poc.catalog import create_snapshot; create_snapshot('data', 'snapshots', 'my-snapshot')"
+```
+
+**Files created in snapshot:**
+
+| File | Contents | Purpose |
+|------|----------|---------|
+| `ret.parquet` | Normalized returns | Deduplicated, security_id=int32 |
+| `risk.parquet` | Normalized risk factors | Deduplicated, group cols=category |
+| `trading_date.parquet` | Normalized dates | n=int32, date=datetime64 |
+| `master.parquet` | Pre-merged ret+risk | Indexed by (security_id, date) |
+| `factors.parquet` | Pre-indexed factors | For fast factor correlation |
+| `asof_resid.parquet` | Pre-sorted for residualization | date→date_sig, sorted |
+| `asof_cap.parquet` | Pre-sorted for cap lookup | date→date_sig, sorted |
+
+**V2 manifest marker:**
+```json
+{
+  "version": 2,
+  "files": {
+    "ret": {"normalized": true, ...},
+    "risk": {"normalized": true, ...}
+  }
+}
+```
+
+### Data Normalization
+
+Normalization eliminates expensive operations during backtest:
+
+| Optimization | Before | After | Benefit |
+|--------------|--------|-------|---------|
+| Deduplicate on keys | Every merge checks uniqueness | Done once at snapshot | Eliminates `is_unique` checks |
+| `security_id` → `int32` | `int64` (8 bytes) | `int32` (4 bytes) | 2x faster hashing in `_factorize_keys` |
+| Group cols → `category` | String/int comparisons | Integer codes | Faster groupby/factorize |
+| Dates → `datetime64[ns]` | Mixed types | Consistent | No type coercion |
+
 ### BacktestFast Engine
 
 `backtest_engine_fast.py` contains `BacktestFast`, an optimized version of the core `Backtest` class that provides **3-4x speedup** through several techniques:
@@ -633,6 +734,60 @@ def compare_runs(run_a_id: str, run_b_id: str) -> CompareResult:
 
 The **bulk of the overall speedup comes from eliminating merge/sort operations** (`_factorize_keys`, sorting), not from faster residualization math.
 
+### Post-Backtest Optimizations
+
+After backtests complete, `run_suite()` computes additional analytics. These have been optimized:
+
+#### 1. Baseline Signal Reuse
+
+**Problem:** `_compute_correlations()` was calling `generate_all_baselines()` again, duplicating work.
+
+**Fix:** Pass already-generated `baseline_signals` dict to avoid regeneration.
+
+```python
+# Before (slow - generates baselines twice)
+baseline_signals = generate_all_baselines(...)  # First time
+baselines = {name: run_backtest(df, ...) for name, df in baseline_signals.items()}
+correlations = _compute_correlations(...)  # Called generate_all_baselines again!
+
+# After (fast - reuse baseline_signals)
+baseline_signals = generate_all_baselines(...)  # Only once
+baselines = {...}
+correlations = _compute_correlations(..., baseline_signals=baseline_signals)
+```
+
+#### 2. Fast IC Computation
+
+**Problem:** `_compute_ic()` used slow `merge()` and `groupby().apply()` with scipy.
+
+**Fix:** Use pre-indexed `master_data` with `get_indexer` + numpy, vectorized Spearman correlation.
+
+```python
+# Before (slow - merge + groupby.apply + scipy)
+merged = signal.merge(ret, on=['security_id', 'date_sig'])
+ic_by_date = merged.groupby('date_sig').apply(lambda g: spearmanr(g['signal'], g['ret'])[0])
+
+# After (fast - get_indexer + numpy)
+positions = master_data.index.get_indexer(lookup_idx)
+merged['fwd_ret'] = np.take(master_data['ret'].values, positions[valid_mask])
+
+# Vectorized Spearman (rank correlation via numpy)
+sig_ranks = sig_day.argsort().argsort()
+ret_ranks = ret_day.argsort().argsort()
+corr = cov(sig_ranks, ret_ranks) / (std(sig_ranks) * std(ret_ranks))
+```
+
+#### 3. Fast Factor Exposures
+
+Uses pre-indexed `factors` DataFrame from catalog:
+
+```python
+# Fast path with pre-indexed factors
+positions = factors_df.index.get_indexer(lookup_idx)
+factor_values = factors_df[factor].values[positions[valid_mask]]
+corr = np.corrcoef(signal_values, factor_values)[0, 1]
+```
+
 ### Profile Breakdown (resid=off, 6.2s total)
 
 | Operation | Time | Notes |
@@ -649,6 +804,53 @@ The **bulk of the overall speedup comes from eliminating merge/sort operations**
 ```bash
 python tests/test_equivalence.py
 ```
+
+### Profiling Tool
+
+Use `profile_backtest.py` to identify bottlenecks:
+
+```bash
+# Basic profiling
+python profile_backtest.py --top 40
+
+# With residualization (slower path)
+python profile_backtest.py --top 40 --resid
+
+# Sort by cumulative time
+python profile_backtest.py --top 40 --cumulative
+```
+
+**Key metrics to watch:**
+
+| Function | Description | Target |
+|----------|-------------|--------|
+| `is_unique` | Pandas uniqueness checks during merge | < 1s (should be near 0 with precomputed) |
+| `_factorize_keys` | Hash-based key creation for merges | < 1s (minimized by using master_data) |
+| `get_join_indexers_non_unique` | Non-unique join path | Should not appear (keys should be unique) |
+
+**Profiler output example:**
+```
+Top 10 functions by total time:
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+       36    0.52    0.014    0.55    0.015 merge.py:2399(_factorize_keys)
+      145    0.08    0.001    0.08    0.001 base.py:2236(is_monotonic_increasing)
+      ...
+```
+
+### Creating Optimized Snapshots
+
+To get full benefit of optimizations, recreate snapshots with v2 format:
+
+```bash
+# Delete old snapshot
+rm -rf snapshots/full-history
+
+# Create new v2 snapshot with all precomputation
+python -c "from poc.catalog import create_snapshot; create_snapshot('data', 'snapshots', 'full-history')"
+```
+
+This runs the heavy normalization and pre-indexing once, making all subsequent `load_catalog()` calls fast.
 
 ---
 
