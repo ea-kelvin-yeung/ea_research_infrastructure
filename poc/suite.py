@@ -101,6 +101,7 @@ def run_suite(
     
     # Run baselines
     baselines = {}
+    baseline_signals = {}  # Store generated signals to avoid recomputing
     if include_baselines:
         print(f"Running baseline signals ({baseline_start_date} to {baseline_end_date})...")
         snapshot_path = catalog.get('snapshot_path')
@@ -125,8 +126,8 @@ def run_suite(
     # Build summary table
     summary = _build_summary(results, baselines)
     
-    # Compute correlations
-    correlations = _compute_correlations(signal_df, catalog, results, baselines, baseline_start_date, baseline_end_date)
+    # Compute correlations (reuse baseline_signals to avoid regenerating)
+    correlations = _compute_correlations(signal_df, catalog, results, baselines, baseline_signals)
     
     # Compute factor exposures
     print("Computing factor exposures...")
@@ -188,16 +189,14 @@ def _compute_correlations(
     catalog: dict,
     results: Dict[str, BacktestResult],
     baselines: Dict[str, BacktestResult],
-    start_date: str = DEFAULT_START_DATE,
-    end_date: str = DEFAULT_END_DATE,
+    baseline_signals: Dict[str, pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """Compute signal and PnL correlations to baselines."""
     rows = []
     
-    snapshot_path = catalog.get('snapshot_path')
-    baseline_signals = generate_all_baselines(
-        catalog, start_date=start_date, end_date=end_date, snapshot_path=snapshot_path
-    )
+    # Use provided baseline_signals to avoid regenerating
+    if baseline_signals is None:
+        baseline_signals = {}
     
     for baseline_name, baseline_df in baseline_signals.items():
         # Signal correlation
@@ -384,53 +383,105 @@ def _compute_ic(signal_df: pd.DataFrame, catalog: dict) -> tuple:
         - date: Trading date
         - ic: Daily IC value
     """
-    from scipy.stats import spearmanr
-    
     if 'date_sig' not in signal_df.columns or 'security_id' not in signal_df.columns:
         return None, None
     
     if 'signal' not in signal_df.columns:
         return None, None
     
-    # Get returns data
-    ret_df = catalog.get('ret')
-    if ret_df is None or 'ret' not in ret_df.columns:
-        return None, None
-    
-    # Merge signal with forward returns
-    # Signal date_sig is the signal observation date
-    # We want to correlate with the next day's return
-    signal = signal_df[['security_id', 'date_sig', 'signal']].copy()
-    signal['date_sig'] = pd.to_datetime(signal['date_sig'])
-    
-    ret = ret_df[['security_id', 'date', 'ret']].copy()
-    ret['date'] = pd.to_datetime(ret['date'])
-    
-    # Shift returns back by 1 day to align signal with next-day return
-    # i.e., signal on date T predicts return on date T+1
-    merged = signal.merge(
-        ret.rename(columns={'date': 'date_sig', 'ret': 'fwd_ret'}),
-        on=['security_id', 'date_sig'],
-        how='inner'
-    )
+    # Get returns data - prefer master_data (pre-indexed)
+    master_data = catalog.get('master')
+    if master_data is not None:
+        # Fast path: use pre-indexed master_data
+        signal = signal_df[['security_id', 'date_sig', 'signal']].copy()
+        signal['security_id'] = signal['security_id'].astype(np.int32)
+        signal['date_sig'] = pd.to_datetime(signal['date_sig'])
+        
+        # Build lookup index
+        lookup_idx = pd.MultiIndex.from_arrays(
+            [signal['security_id'].values, signal['date_sig'].values],
+            names=['security_id', 'date']
+        )
+        
+        # Get positions
+        positions = master_data.index.get_indexer(lookup_idx)
+        valid_mask = positions >= 0
+        
+        if valid_mask.sum() == 0:
+            return None, None
+        
+        # Build merged DataFrame using numpy take
+        merged = signal.loc[valid_mask].copy()
+        merged['fwd_ret'] = np.take(master_data['ret'].values, positions[valid_mask])
+    else:
+        # Fallback to merge
+        ret_df = catalog.get('ret')
+        if ret_df is None or 'ret' not in ret_df.columns:
+            return None, None
+        
+        signal = signal_df[['security_id', 'date_sig', 'signal']].copy()
+        signal['date_sig'] = pd.to_datetime(signal['date_sig'])
+        
+        ret = ret_df[['security_id', 'date', 'ret']].copy()
+        ret['date'] = pd.to_datetime(ret['date'])
+        
+        merged = signal.merge(
+            ret.rename(columns={'date': 'date_sig', 'ret': 'fwd_ret'}),
+            on=['security_id', 'date_sig'],
+            how='inner'
+        )
     
     if len(merged) == 0:
         return None, None
     
-    # Compute daily IC
-    def compute_daily_ic(group):
-        if len(group) < 10:  # Need minimum securities for meaningful correlation
-            return np.nan
-        sig = group['signal'].values
-        ret = group['fwd_ret'].values
-        # Remove any NaNs
-        mask = ~(np.isnan(sig) | np.isnan(ret))
-        if mask.sum() < 10:
-            return np.nan
-        corr, _ = spearmanr(sig[mask], ret[mask])
-        return corr
+    # Compute daily IC using vectorized numpy (faster than groupby.apply)
+    # Sort by date for efficient groupby
+    merged = merged.sort_values('date_sig')
     
-    ic_by_date = merged.groupby('date_sig').apply(compute_daily_ic)
+    dates = merged['date_sig'].values
+    signals = merged['signal'].values.astype(np.float64)
+    returns = merged['fwd_ret'].values.astype(np.float64)
+    
+    # Find unique dates and their boundaries
+    unique_dates, start_indices = np.unique(dates, return_index=True)
+    end_indices = np.append(start_indices[1:], len(dates))
+    
+    # Compute IC for each date using numpy
+    ic_values = []
+    ic_dates = []
+    for date, start, end in zip(unique_dates, start_indices, end_indices):
+        sig_day = signals[start:end]
+        ret_day = returns[start:end]
+        
+        # Remove NaNs
+        valid = ~(np.isnan(sig_day) | np.isnan(ret_day))
+        if valid.sum() < 10:
+            continue
+        
+        sig_valid = sig_day[valid]
+        ret_valid = ret_day[valid]
+        
+        # Spearman correlation = Pearson on ranks
+        sig_ranks = sig_valid.argsort().argsort()
+        ret_ranks = ret_valid.argsort().argsort()
+        
+        n = len(sig_ranks)
+        sig_mean = sig_ranks.mean()
+        ret_mean = ret_ranks.mean()
+        
+        cov = np.sum((sig_ranks - sig_mean) * (ret_ranks - ret_mean))
+        sig_std = np.sqrt(np.sum((sig_ranks - sig_mean) ** 2))
+        ret_std = np.sqrt(np.sum((ret_ranks - ret_mean) ** 2))
+        
+        if sig_std > 0 and ret_std > 0:
+            corr = cov / (sig_std * ret_std)
+            ic_values.append(corr)
+            ic_dates.append(date)
+    
+    if len(ic_values) == 0:
+        return None, None
+    
+    ic_by_date = pd.Series(ic_values, index=ic_dates)
     ic_series = pd.DataFrame({
         'date': ic_by_date.index,
         'ic': ic_by_date.values

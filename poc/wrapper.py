@@ -116,6 +116,12 @@ def run_backtest(
         validate=validate,
     )
     
+    # Normalize signal security_id to int32 to match catalog data
+    # (catalog data was normalized at snapshot creation time)
+    if aligned_signal['security_id'].dtype != np.int32:
+        aligned_signal = aligned_signal.copy()
+        aligned_signal['security_id'] = aligned_signal['security_id'].astype(np.int32)
+    
     # Map residualize setting to Backtest parameters
     resid = config.residualize != 'off'
     resid_style = config.residualize if resid else 'all'
@@ -149,6 +155,13 @@ def run_backtest(
         bt_kwargs['master_data'] = catalog['master']
     
     bt = BacktestClass(**bt_kwargs)
+    
+    # Inject pre-computed indexes if available (avoids repeated indexing)
+    if use_fast and hasattr(bt, 'set_precomputed_indexes'):
+        bt.set_precomputed_indexes(
+            dates_indexed=catalog.get('dates_indexed'),
+            asof_tables=catalog.get('asof_tables'),
+        )
     
     # Run and extract results
     result = bt.gen_result()

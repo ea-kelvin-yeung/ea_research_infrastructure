@@ -599,6 +599,37 @@ class BacktestFast:
         self._other_asof_resid = None  # For residualization merge_asof
         self._other_asof_byvars = {}   # For byvar merge_asof (keyed by column tuple)
 
+    def set_precomputed_indexes(
+        self,
+        risk_indexed=None,
+        ret_indexed=None,
+        dates_indexed=None,
+        asof_tables=None,
+    ):
+        """
+        Set pre-computed indexes from catalog for faster joins.
+        
+        This allows the catalog to precompute these indexes once at load time,
+        avoiding repeated indexing during each backtest run.
+        
+        Args:
+            risk_indexed: DataFrame indexed by (security_id, date)
+            ret_indexed: DataFrame indexed by (security_id, date)
+            dates_indexed: Dict with 'by_date' and 'by_n' indexed DataFrames
+            asof_tables: Dict with 'resid' and 'byvars_cap' pre-sorted DataFrames
+        """
+        # Note: We don't use risk_indexed/ret_indexed directly anymore
+        # because _fast_join_master uses master_data which is already indexed
+        
+        if dates_indexed is not None:
+            self._datefile_by_date = dates_indexed.get('by_date')
+            self._datefile_by_n = dates_indexed.get('by_n')
+        
+        if asof_tables is not None:
+            self._other_asof_resid = asof_tables.get('resid')
+            if 'byvars_cap' in asof_tables:
+                self._other_asof_byvars[('cap',)] = asof_tables['byvars_cap']
+
     def _get_datefile_by_date(self):
         """Get datefile indexed by date for fast lookups."""
         if self._datefile_by_date is None:
@@ -811,15 +842,10 @@ class BacktestFast:
                 .dropna()
             )
 
-            # Always use retfile for initial join (not master, which is ret ∩ risk)
-            # Master filtering happens later in gen_fractile/portfolio_ls
-            temp = temp.merge(
-                self.retfile[["security_id", "date", "openret", "resopenret"]].rename(
-                    columns={"openret": "ret", "resopenret": "resret"}
-                ),
-                how="inner",
-                on=["security_id", "date"],
-            )
+            # Use fast index-based join via master_data (bypasses is_unique checks)
+            # Master contains openret/resopenret from retfile
+            temp = self._fast_join_master(temp, ["openret", "resopenret"], how='inner')
+            temp = temp.rename(columns={"openret": "ret", "resopenret": "resret"})
             temp = temp[temp["ret"] > -0.95]
         else:
             temp = (
@@ -829,12 +855,8 @@ class BacktestFast:
                 .dropna()
             )
 
-            # Always use retfile for initial join (not master, which is ret ∩ risk)
-            temp = temp.merge(
-                self.retfile[["security_id", "date", "ret", "resret"]],
-                how="inner",
-                on=["security_id", "date"],
-            )
+            # Use fast index-based join via master_data (bypasses is_unique checks)
+            temp = self._fast_join_master(temp, ["ret", "resret"], how='inner')
 
         if self.resid:
             if self.input_type != "value":
