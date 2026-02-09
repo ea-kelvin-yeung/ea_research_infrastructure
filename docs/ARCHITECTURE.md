@@ -92,8 +92,10 @@ ea_research_infrastructure/
 │       ├── ret.parquet
 │       ├── risk.parquet
 │       ├── trading_date.parquet
-│       ├── master.parquet  # Pre-merged for fast backtest joins
-│       └── factors.parquet # Pre-indexed for fast factor correlation
+│       ├── master.parquet              # Pre-merged for fast backtest joins
+│       ├── factors.parquet             # Pre-indexed for fast factor correlation
+│       ├── baseline_reversal_5d.parquet  # Pre-computed reversal baseline
+│       └── baseline_value.parquet        # Pre-computed value baseline
 │
 ├── artifacts/              # Generated outputs
 │   ├── *_tearsheet.html
@@ -222,14 +224,30 @@ Standard signals for comparison.
 | `momentum_12_1` | 12-month return minus last month | 252 days |
 | `value` | Value factor from risk file | N/A |
 
-**Caching:** Results cached to `.cache/baselines/` using joblib.
+**Pre-computed Baselines:**
+
+Baselines can be pre-computed and stored in the snapshot folder for instant loading:
+
+```python
+from poc.catalog import load_catalog
+from poc.baselines import precompute_baselines_to_snapshot
+
+catalog = load_catalog('snapshots/my-snapshot', use_master=False)
+precompute_baselines_to_snapshot(catalog, 'snapshots/my-snapshot')
+# Creates: baseline_reversal_5d.parquet, baseline_value.parquet
+```
+
+When `generate_all_baselines()` is called with a `snapshot_path`, it loads from these files and filters to the requested date range (instant vs. ~60s to compute).
+
+**Fallback caching:** If pre-computed files don't exist, results are cached to `.cache/baselines/` using joblib.
 
 **Key functions:**
 ```python
 generate_reversal_signal(catalog, lookback=5, start_date, end_date) -> df
-generate_momentum_signal(catalog, lookback=252, skip=21, ...) -> df
 generate_value_signal(catalog, start_date, end_date) -> df
-generate_all_baselines(catalog, start_date, end_date) -> Dict[str, df]
+generate_all_baselines(catalog, start_date, end_date, snapshot_path=None) -> Dict[str, df]
+precompute_baselines_to_snapshot(catalog, snapshot_path) -> Dict[str, Path]
+load_precomputed_baselines(snapshot_path) -> Optional[Dict[str, df]]
 compute_signal_correlation(signal_df, baseline_df) -> float
 clear_baseline_cache()  # Clear disk cache
 ```

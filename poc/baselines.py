@@ -144,18 +144,35 @@ def generate_all_baselines(
     catalog: dict,
     start_date: str = DEFAULT_START_DATE,
     end_date: str = DEFAULT_END_DATE,
+    snapshot_path: Optional[str] = None,
 ) -> Dict[str, pd.DataFrame]:
     """
     Generate all baseline signals.
+    
+    If snapshot_path is provided and pre-computed baselines exist, loads from disk
+    and filters to date range (much faster than recomputing).
     
     Args:
         catalog: Data catalog
         start_date: Start date for signals (default: 2017-01-01)
         end_date: End date for signals (default: 2018-12-31)
+        snapshot_path: Optional path to snapshot dir with pre-computed baselines
     
     Returns:
         Dict mapping baseline name to signal DataFrame
     """
+    # Try to load pre-computed baselines
+    if snapshot_path:
+        precomputed = load_precomputed_baselines(snapshot_path)
+        if precomputed:
+            # Filter to requested date range
+            result = {}
+            for name, df in precomputed.items():
+                filtered = _filter_dates(df, 'date_sig', start_date, end_date)
+                result[name] = filtered
+            return result
+    
+    # Fall back to computing from scratch
     return {
         'reversal_5d': generate_reversal_signal(catalog, lookback=5, start_date=start_date, end_date=end_date),
         'value': generate_value_signal(catalog, start_date=start_date, end_date=end_date),
@@ -166,6 +183,75 @@ def clear_baseline_cache():
     """Clear the baseline signal cache."""
     memory.clear(warn=False)
     print(f"Cleared baseline cache at {CACHE_DIR}")
+
+
+def precompute_baselines_to_snapshot(catalog: dict, snapshot_path: str) -> Dict[str, Path]:
+    """
+    Pre-compute baseline signals and save to snapshot folder for fast loading.
+    
+    Args:
+        catalog: Data catalog (must have 'ret' and 'risk')
+        snapshot_path: Path to snapshot directory
+        
+    Returns:
+        Dict mapping baseline name to saved file path
+    """
+    snapshot_dir = Path(snapshot_path)
+    
+    # Use full date range from the data
+    start_date = catalog['ret']['date'].min().strftime('%Y-%m-%d')
+    end_date = catalog['ret']['date'].max().strftime('%Y-%m-%d')
+    
+    print(f"Pre-computing baselines for {start_date} to {end_date}...")
+    
+    saved_files = {}
+    
+    # Reversal 5-day
+    print("  Computing reversal_5d...")
+    reversal = generate_reversal_signal(catalog, lookback=5, start_date=start_date, end_date=end_date)
+    reversal_path = snapshot_dir / 'baseline_reversal_5d.parquet'
+    reversal.to_parquet(reversal_path, index=False)
+    saved_files['reversal_5d'] = reversal_path
+    print(f"    Saved {len(reversal):,} rows to {reversal_path.name}")
+    
+    # Value
+    print("  Computing value...")
+    value = generate_value_signal(catalog, start_date=start_date, end_date=end_date)
+    value_path = snapshot_dir / 'baseline_value.parquet'
+    value.to_parquet(value_path, index=False)
+    saved_files['value'] = value_path
+    print(f"    Saved {len(value):,} rows to {value_path.name}")
+    
+    print(f"Done! Saved {len(saved_files)} baseline files to {snapshot_dir}")
+    return saved_files
+
+
+def load_precomputed_baselines(snapshot_path: str) -> Optional[Dict[str, pd.DataFrame]]:
+    """
+    Load pre-computed baseline signals from snapshot folder.
+    
+    Args:
+        snapshot_path: Path to snapshot directory
+        
+    Returns:
+        Dict mapping baseline name to DataFrame, or None if files don't exist
+    """
+    snapshot_dir = Path(snapshot_path)
+    
+    baselines = {}
+    
+    reversal_path = snapshot_dir / 'baseline_reversal_5d.parquet'
+    value_path = snapshot_dir / 'baseline_value.parquet'
+    
+    if reversal_path.exists():
+        baselines['reversal_5d'] = pd.read_parquet(reversal_path)
+    
+    if value_path.exists():
+        baselines['value'] = pd.read_parquet(value_path)
+    
+    if baselines:
+        return baselines
+    return None
 
 
 def compute_signal_correlation(signal_df: pd.DataFrame, baseline_df: pd.DataFrame) -> float:

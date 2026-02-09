@@ -117,6 +117,7 @@ def load_catalog(snapshot_path: str = "snapshots/default", use_master: bool = Tr
         'risk': pd.read_parquet(path / 'risk.parquet'),
         'dates': pd.read_parquet(path / 'trading_date.parquet'),
         'snapshot_id': path.name,
+        'snapshot_path': str(path.resolve()),  # Full path for loading pre-computed files
     }
     
     # Load manifest if exists

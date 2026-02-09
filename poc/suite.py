@@ -103,7 +103,13 @@ def run_suite(
     baselines = {}
     if include_baselines:
         print(f"Running baseline signals ({baseline_start_date} to {baseline_end_date})...")
-        baseline_signals = generate_all_baselines(catalog, start_date=baseline_start_date, end_date=baseline_end_date)
+        snapshot_path = catalog.get('snapshot_path')
+        baseline_signals = generate_all_baselines(
+            catalog, 
+            start_date=baseline_start_date, 
+            end_date=baseline_end_date,
+            snapshot_path=snapshot_path,
+        )
         for name, baseline_df in baseline_signals.items():
             # Skip if baseline has too few rows (e.g., momentum needs 252 days lookback)
             if len(baseline_df) < 100:
@@ -188,7 +194,10 @@ def _compute_correlations(
     """Compute signal and PnL correlations to baselines."""
     rows = []
     
-    baseline_signals = generate_all_baselines(catalog, start_date=start_date, end_date=end_date)
+    snapshot_path = catalog.get('snapshot_path')
+    baseline_signals = generate_all_baselines(
+        catalog, start_date=start_date, end_date=end_date, snapshot_path=snapshot_path
+    )
     
     for baseline_name, baseline_df in baseline_signals.items():
         # Signal correlation
