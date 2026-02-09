@@ -31,6 +31,8 @@ class SuiteResult:
     correlations: pd.DataFrame                # Signal/PnL correlations to baselines
     factor_exposures: Optional[pd.DataFrame] = None  # Signal correlations to risk factors
     coverage: Optional[Dict] = None           # Signal coverage metrics
+    ic_stats: Optional[Dict] = None           # IC summary stats (mean, t-stat, hit_rate)
+    ic_series: Optional[pd.DataFrame] = None  # Daily IC time series
 
 
 def _run_single_config(signal_df, catalog, lag, residualize):
@@ -128,6 +130,12 @@ def run_suite(
     print("Computing coverage metrics...")
     coverage = _compute_coverage(signal_df, catalog)
     
+    # Compute Information Coefficient (IC)
+    print("Computing IC...")
+    ic_stats, ic_series = _compute_ic(signal_df, catalog)
+    if ic_stats:
+        print(f"  IC mean: {ic_stats['mean']:.4f}, t-stat: {ic_stats['t_stat']:.2f}, hit rate: {ic_stats['hit_rate']:.1f}%")
+    
     return SuiteResult(
         results=results,
         baselines=baselines,
@@ -135,6 +143,8 @@ def run_suite(
         correlations=correlations,
         factor_exposures=factor_exposures,
         coverage=coverage,
+        ic_stats=ic_stats,
+        ic_series=ic_series,
     )
 
 
@@ -344,3 +354,98 @@ def _compute_coverage(signal_df: pd.DataFrame, catalog: dict) -> Dict:
         'total_days': securities_per_day.count(),
         'unique_securities': unique_signal_securities,
     }
+
+
+def _compute_ic(signal_df: pd.DataFrame, catalog: dict) -> tuple:
+    """
+    Compute Information Coefficient (IC) - daily cross-sectional Spearman correlation
+    between signal and forward returns.
+    
+    Returns:
+        Tuple of (ic_stats dict, ic_series DataFrame)
+        
+        ic_stats contains:
+        - mean: Mean daily IC
+        - std: Std dev of daily IC
+        - t_stat: t-statistic (mean / (std / sqrt(n)))
+        - hit_rate: % of days with positive IC
+        - ir: Information Ratio (mean / std)
+        
+        ic_series contains:
+        - date: Trading date
+        - ic: Daily IC value
+    """
+    from scipy.stats import spearmanr
+    
+    if 'date_sig' not in signal_df.columns or 'security_id' not in signal_df.columns:
+        return None, None
+    
+    if 'signal' not in signal_df.columns:
+        return None, None
+    
+    # Get returns data
+    ret_df = catalog.get('ret')
+    if ret_df is None or 'ret' not in ret_df.columns:
+        return None, None
+    
+    # Merge signal with forward returns
+    # Signal date_sig is the signal observation date
+    # We want to correlate with the next day's return
+    signal = signal_df[['security_id', 'date_sig', 'signal']].copy()
+    signal['date_sig'] = pd.to_datetime(signal['date_sig'])
+    
+    ret = ret_df[['security_id', 'date', 'ret']].copy()
+    ret['date'] = pd.to_datetime(ret['date'])
+    
+    # Shift returns back by 1 day to align signal with next-day return
+    # i.e., signal on date T predicts return on date T+1
+    merged = signal.merge(
+        ret.rename(columns={'date': 'date_sig', 'ret': 'fwd_ret'}),
+        on=['security_id', 'date_sig'],
+        how='inner'
+    )
+    
+    if len(merged) == 0:
+        return None, None
+    
+    # Compute daily IC
+    def compute_daily_ic(group):
+        if len(group) < 10:  # Need minimum securities for meaningful correlation
+            return np.nan
+        sig = group['signal'].values
+        ret = group['fwd_ret'].values
+        # Remove any NaNs
+        mask = ~(np.isnan(sig) | np.isnan(ret))
+        if mask.sum() < 10:
+            return np.nan
+        corr, _ = spearmanr(sig[mask], ret[mask])
+        return corr
+    
+    ic_by_date = merged.groupby('date_sig').apply(compute_daily_ic)
+    ic_series = pd.DataFrame({
+        'date': ic_by_date.index,
+        'ic': ic_by_date.values
+    }).dropna()
+    
+    if len(ic_series) == 0:
+        return None, None
+    
+    # Compute summary stats
+    ic_values = ic_series['ic'].values
+    n = len(ic_values)
+    ic_mean = np.mean(ic_values)
+    ic_std = np.std(ic_values)
+    ic_t_stat = ic_mean / (ic_std / np.sqrt(n)) if ic_std > 0 else 0
+    ic_hit_rate = np.mean(ic_values > 0) * 100  # % of positive IC days
+    ic_ir = ic_mean / ic_std if ic_std > 0 else 0  # Information Ratio
+    
+    ic_stats = {
+        'mean': ic_mean,
+        'std': ic_std,
+        't_stat': ic_t_stat,
+        'hit_rate': ic_hit_rate,
+        'ir': ic_ir,
+        'n_days': n,
+    }
+    
+    return ic_stats, ic_series

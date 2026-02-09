@@ -1,6 +1,6 @@
 """
 MLflow Tracking: Log suite runs for reproducibility.
-~80 lines - simple logging, let MLflow handle the rest.
+~100 lines - simple logging, let MLflow handle the rest.
 """
 
 import logging
@@ -15,10 +15,13 @@ for _logger_name in ['alembic', 'alembic.runtime', 'alembic.runtime.plugins',
     _logger.propagate = False
 
 import subprocess
+import hashlib
+import json
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
 
+import pandas as pd
 from .suite import SuiteResult
 
 
@@ -34,6 +37,15 @@ def get_git_sha() -> str:
         return 'unknown'
 
 
+def compute_signal_hash(signal_df: pd.DataFrame) -> str:
+    """Compute MD5 hash of signal DataFrame for reproducibility."""
+    # Hash based on sorted values to be order-independent
+    sorted_df = signal_df.sort_values(['security_id', 'date_sig']).reset_index(drop=True)
+    # Use a stable representation
+    content = sorted_df.to_csv(index=False).encode('utf-8')
+    return hashlib.md5(content).hexdigest()[:12]
+
+
 def log_run(
     suite_result: SuiteResult,
     signal_name: str,
@@ -41,6 +53,7 @@ def log_run(
     tearsheet_path: Optional[str] = None,
     experiment_name: str = 'backtest-poc',
     author: Optional[str] = None,
+    signal_df: Optional[pd.DataFrame] = None,
 ) -> str:
     """
     Log a suite run to MLflow.
@@ -52,19 +65,24 @@ def log_run(
         tearsheet_path: Path to tearsheet HTML (optional)
         experiment_name: MLflow experiment name
         author: Author name (optional)
+        signal_df: Original signal DataFrame (for computing hash)
         
     Returns:
         MLflow run ID
     """
     mlflow.set_experiment(experiment_name)
     
+    # Compute signal hash for reproducibility
+    signal_hash = compute_signal_hash(signal_df) if signal_df is not None else 'unknown'
+    
     with mlflow.start_run(run_name=f"{signal_name}_{datetime.now().strftime('%Y%m%d_%H%M')}"):
         
-        # Tags
+        # Tags (includes all reproducibility info)
         mlflow.set_tags({
             'signal_name': signal_name,
             'snapshot_id': catalog.get('snapshot_id', 'unknown'),
             'git_sha': get_git_sha(),
+            'signal_hash': signal_hash,
             'author': author or 'unknown',
         })
         
@@ -102,9 +120,23 @@ def log_run(
         if tearsheet_path and Path(tearsheet_path).exists():
             mlflow.log_artifact(tearsheet_path)
         
+        # Log full config as JSON for reproducibility
+        config_path = Path('artifacts') / f"{signal_name}_config.json"
+        config_path.parent.mkdir(exist_ok=True)
+        all_configs = {key: res.config for key, res in suite_result.results.items()}
+        reproducibility_info = {
+            'signal_name': signal_name,
+            'snapshot_id': catalog.get('snapshot_id', 'unknown'),
+            'git_sha': get_git_sha(),
+            'signal_hash': signal_hash,
+            'configs': all_configs,
+        }
+        with open(config_path, 'w') as f:
+            json.dump(reproducibility_info, f, indent=2, default=str)
+        mlflow.log_artifact(str(config_path))
+        
         # Log summary as CSV
         summary_path = Path('artifacts') / f"{signal_name}_summary.csv"
-        summary_path.parent.mkdir(exist_ok=True)
         suite_result.summary.to_csv(summary_path, index=False)
         mlflow.log_artifact(str(summary_path))
         
@@ -126,11 +158,42 @@ def log_run(
                 daily_data.append(df)
         
         if daily_data:
-            import pandas as pd
             combined_daily = pd.concat(daily_data, ignore_index=True)
             daily_path = Path('artifacts') / f"{signal_name}_daily.parquet"
             combined_daily.to_parquet(daily_path)
             mlflow.log_artifact(str(daily_path))
+        
+        # Log IC series if available
+        if suite_result.ic_series is not None and len(suite_result.ic_series) > 0:
+            ic_path = Path('artifacts') / f"{signal_name}_ic_series.parquet"
+            suite_result.ic_series.to_parquet(ic_path, index=False)
+            mlflow.log_artifact(str(ic_path))
+        
+        # Log IC stats as JSON
+        if suite_result.ic_stats is not None:
+            ic_stats_path = Path('artifacts') / f"{signal_name}_ic_stats.json"
+            with open(ic_stats_path, 'w') as f:
+                json.dump(suite_result.ic_stats, f, indent=2, default=str)
+            mlflow.log_artifact(str(ic_stats_path))
+        
+        # Log factor exposures if available
+        if suite_result.factor_exposures is not None and len(suite_result.factor_exposures) > 0:
+            factor_path = Path('artifacts') / f"{signal_name}_factor_exposures.parquet"
+            suite_result.factor_exposures.to_parquet(factor_path, index=False)
+            mlflow.log_artifact(str(factor_path))
+        
+        # Log correlations
+        if len(suite_result.correlations) > 0:
+            corr_path = Path('artifacts') / f"{signal_name}_correlations.parquet"
+            suite_result.correlations.to_parquet(corr_path, index=False)
+            mlflow.log_artifact(str(corr_path))
+        
+        # Log coverage as JSON
+        if suite_result.coverage:
+            coverage_path = Path('artifacts') / f"{signal_name}_coverage.json"
+            with open(coverage_path, 'w') as f:
+                json.dump(suite_result.coverage, f, indent=2, default=str)
+            mlflow.log_artifact(str(coverage_path))
         
         run_id = mlflow.active_run().info.run_id
     

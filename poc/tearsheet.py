@@ -7,10 +7,11 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional
 from jinja2 import Template
 
 from .suite import SuiteResult, get_best_config, RISK_FACTORS
+from .charts import get_lag_sensitivity_table
 
 
 # Simple HTML template (inline to avoid file management)
@@ -132,6 +133,18 @@ TEARSHEET_TEMPLATE = """
             {{ summary_table | safe }}
         </div>
         
+        <!-- Lag Sensitivity -->
+        {% if lag_table %}
+        <div class="section">
+            <h2>Lag Sensitivity</h2>
+            <p>How metrics change as execution lag increases (signal decay analysis):</p>
+            {{ lag_table | safe }}
+            {% if lag_decay_warning %}
+            <p style="color: #dc3545; font-weight: bold;">Warning: {{ lag_decay_warning }}</p>
+            {% endif %}
+        </div>
+        {% endif %}
+        
         <!-- Robustness Analysis -->
         <div class="section">
             <h2>Robustness Analysis</h2>
@@ -171,6 +184,38 @@ TEARSHEET_TEMPLATE = """
             <h2>Risk Factor Exposures</h2>
             <p>Correlation of signal to common risk factors (high |correlation| suggests factor overlap):</p>
             {{ factor_table | safe }}
+        </div>
+        {% endif %}
+        
+        <!-- Information Coefficient -->
+        {% if ic_stats %}
+        <div class="section">
+            <h2>Information Coefficient (IC)</h2>
+            <p>Daily cross-sectional Spearman correlation between signal and forward returns:</p>
+            <div class="metric-card">
+                <div class="value" style="color: {% if ic_stats.mean > 0.02 %}#28a745{% elif ic_stats.mean > 0 %}#17a2b8{% else %}#dc3545{% endif %};">
+                    {{ "%.4f"|format(ic_stats.mean) }}
+                </div>
+                <div class="label">Mean IC</div>
+            </div>
+            <div class="metric-card">
+                <div class="value" style="color: {% if ic_stats.t_stat > 2 %}#28a745{% elif ic_stats.t_stat > 1 %}#17a2b8{% else %}#dc3545{% endif %};">
+                    {{ "%.2f"|format(ic_stats.t_stat) }}
+                </div>
+                <div class="label">t-Statistic</div>
+            </div>
+            <div class="metric-card">
+                <div class="value">{{ "%.1f%%"|format(ic_stats.hit_rate) }}</div>
+                <div class="label">Hit Rate</div>
+            </div>
+            <div class="metric-card">
+                <div class="value">{{ "%.2f"|format(ic_stats.ir) }}</div>
+                <div class="label">Info Ratio</div>
+            </div>
+            <div class="metric-card">
+                <div class="value">{{ ic_stats.n_days }}</div>
+                <div class="label">Days</div>
+            </div>
         </div>
         {% endif %}
         
@@ -603,6 +648,21 @@ def generate_tearsheet(
     cap_data = _extract_cap_breakdown(suite_result, best_config)
     year_data = _extract_year_breakdown(suite_result, best_config)
     
+    # Extract lag sensitivity table
+    lag_data = get_lag_sensitivity_table(suite_result)
+    lag_table = None
+    lag_decay_warning = None
+    if len(lag_data) > 0:
+        # Check for lag decay warning
+        lag0_sharpe = lag_data[lag_data['Lag'] == 0]['Sharpe'].max() if 0 in lag_data['Lag'].values else None
+        if lag0_sharpe and lag0_sharpe > 0:
+            max_lag = lag_data['Lag'].max()
+            max_lag_sharpe = lag_data[lag_data['Lag'] == max_lag]['Sharpe'].max()
+            if max_lag_sharpe < lag0_sharpe * 0.5:
+                lag_decay_warning = f"Signal decays >50% from lag-0 ({lag0_sharpe:.2f}) to lag-{max_lag} ({max_lag_sharpe:.2f})"
+        
+        lag_table = lag_data.to_html(index=False, float_format='%.3f')
+    
     # Format tables
     signal_summary = suite_result.summary[suite_result.summary['type'] == 'signal']
     baseline_summary = suite_result.summary[suite_result.summary['type'] == 'baseline']
@@ -629,8 +689,11 @@ def generate_tearsheet(
         correlation_table=suite_result.correlations.to_html(index=False, float_format='%.3f'),
         cap_table=cap_data.to_html(index=False, float_format='%.3f') if len(cap_data) > 0 else None,
         year_table=year_data.to_html(index=False, float_format='%.3f') if len(year_data) > 0 else None,
+        lag_table=lag_table,
+        lag_decay_warning=lag_decay_warning,
         factor_table=factor_table,
         coverage=suite_result.coverage,
+        ic_stats=suite_result.ic_stats,
     )
     
     # Write to file
