@@ -216,3 +216,28 @@ def get_run_history(experiment_name: str = 'backtest-poc', max_results: int = 10
         return runs.to_dict('records')
     except:
         return []
+
+
+def delete_runs(run_ids: list, experiment_name: str = 'backtest-poc') -> dict:
+    """
+    Delete multiple MLflow runs.
+    
+    Args:
+        run_ids: List of run IDs to delete
+        experiment_name: MLflow experiment name
+        
+    Returns:
+        dict with 'deleted' (list of successfully deleted IDs) and 'failed' (list of failed IDs)
+    """
+    client = mlflow.tracking.MlflowClient()
+    deleted = []
+    failed = []
+    
+    for run_id in run_ids:
+        try:
+            client.delete_run(run_id)
+            deleted.append(run_id)
+        except Exception as e:
+            failed.append({'run_id': run_id, 'error': str(e)})
+    
+    return {'deleted': deleted, 'failed': failed}

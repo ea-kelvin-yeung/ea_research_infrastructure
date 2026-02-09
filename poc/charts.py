@@ -13,19 +13,20 @@ from typing import Optional, Dict, Any
 from .suite import SuiteResult
 
 
-def plot_lag_sensitivity(suite_result: SuiteResult, ic_by_lag: Optional[Dict[int, float]] = None) -> go.Figure:
+def plot_lag_sensitivity(suite_result: SuiteResult, ic_by_lag: Optional[Dict[int, float]] = None, show_turnover: bool = False) -> go.Figure:
     """
     Plot how key metrics decay as lag increases.
     
-    Shows Sharpe ratio, turnover, and optionally IC across different lag values.
+    Shows Sharpe ratio and optionally turnover/IC across different lag values.
     Highlights if signal "dies" with lag (Sharpe drops >50%).
     
     Args:
         suite_result: Result from run_suite() containing multiple lag configs
         ic_by_lag: Optional dict of {lag: IC} values (computed separately)
+        show_turnover: Whether to show turnover on secondary y-axis (default False)
         
     Returns:
-        Plotly figure with dual y-axis (Sharpe/IC on left, Turnover on right)
+        Plotly figure with Sharpe on left y-axis, optionally turnover on right
     """
     # Extract lag and metrics from results
     data = []
@@ -57,8 +58,8 @@ def plot_lag_sensitivity(suite_result: SuiteResult, ic_by_lag: Optional[Dict[int
     # Get unique resid options for coloring
     resid_options = df['resid'].unique()
     
-    # Create figure with secondary y-axis
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    # Create figure with secondary y-axis if showing turnover
+    fig = make_subplots(specs=[[{"secondary_y": show_turnover}]])
     
     colors = px.colors.qualitative.Set1
     
@@ -79,18 +80,19 @@ def plot_lag_sensitivity(suite_result: SuiteResult, ic_by_lag: Optional[Dict[int
             secondary_y=False
         )
         
-        # Turnover (right y-axis) - dashed line
-        fig.add_trace(
-            go.Scatter(
-                x=subset['lag'], 
-                y=subset['turnover'] * 100,  # Convert to percentage
-                name=f'Turnover ({resid})',
-                mode='lines+markers',
-                line=dict(color=color, width=2, dash='dash'),
-                marker=dict(size=8, symbol='diamond'),
-            ),
-            secondary_y=True
-        )
+        # Turnover (right y-axis) - dashed line (optional)
+        if show_turnover:
+            fig.add_trace(
+                go.Scatter(
+                    x=subset['lag'], 
+                    y=subset['turnover'] * 100,  # Convert to percentage
+                    name=f'Turnover ({resid})',
+                    mode='lines+markers',
+                    line=dict(color=color, width=2, dash='dash'),
+                    marker=dict(size=8, symbol='diamond'),
+                ),
+                secondary_y=True
+            )
     
     # Add IC if provided
     if ic_by_lag:
@@ -125,15 +127,113 @@ def plot_lag_sensitivity(suite_result: SuiteResult, ic_by_lag: Optional[Dict[int
             )
     
     # Update layout
+    title = 'Lag Sensitivity: Sharpe & Turnover vs Lag' if show_turnover else 'Lag Sensitivity: Sharpe vs Lag'
     fig.update_layout(
-        title='Lag Sensitivity: Sharpe & Turnover vs Lag',
+        title=title,
         xaxis_title='Lag (trading days)',
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
         hovermode='x unified',
     )
     
     fig.update_yaxes(title_text="Sharpe Ratio / IC", secondary_y=False)
-    fig.update_yaxes(title_text="Turnover (%)", secondary_y=True)
+    if show_turnover:
+        fig.update_yaxes(title_text="Turnover (%)", secondary_y=True)
+    
+    return fig
+
+
+def plot_lag_sensitivity_from_summary(summary_df: pd.DataFrame, show_turnover: bool = False) -> go.Figure:
+    """
+    Plot lag sensitivity from a summary DataFrame (for History tab).
+    
+    Args:
+        summary_df: Summary DataFrame with 'config', 'sharpe', 'turnover' columns
+        show_turnover: Whether to show turnover on secondary y-axis
+        
+    Returns:
+        Plotly figure
+    """
+    if summary_df is None or summary_df.empty:
+        fig = go.Figure()
+        fig.add_annotation(text="No data available", xref="paper", yref="paper",
+                          x=0.5, y=0.5, showarrow=False)
+        return fig
+    
+    # Filter to signal configs only
+    if 'type' in summary_df.columns:
+        df = summary_df[summary_df['type'] == 'signal'].copy()
+    else:
+        df = summary_df.copy()
+    
+    # Extract lag and resid from config column
+    data = []
+    for _, row in df.iterrows():
+        config_key = row.get('config', '')
+        if 'lag' in str(config_key):
+            parts = str(config_key).split('_')
+            lag_part = [p for p in parts if p.startswith('lag')]
+            if lag_part:
+                lag = int(lag_part[0].replace('lag', ''))
+                resid = str(config_key).split('_resid')[-1] if '_resid' in str(config_key) else 'off'
+                data.append({
+                    'lag': lag,
+                    'resid': resid,
+                    'sharpe': row.get('sharpe', 0),
+                    'turnover': row.get('turnover', 0),
+                })
+    
+    if not data:
+        fig = go.Figure()
+        fig.add_annotation(text="No lag data available", xref="paper", yref="paper",
+                          x=0.5, y=0.5, showarrow=False)
+        return fig
+    
+    plot_df = pd.DataFrame(data)
+    resid_options = plot_df['resid'].unique()
+    
+    fig = make_subplots(specs=[[{"secondary_y": show_turnover}]])
+    colors = px.colors.qualitative.Set1
+    
+    for i, resid in enumerate(resid_options):
+        subset = plot_df[plot_df['resid'] == resid].sort_values('lag')
+        color = colors[i % len(colors)]
+        
+        fig.add_trace(
+            go.Scatter(
+                x=subset['lag'], 
+                y=subset['sharpe'],
+                name=f'Sharpe ({resid})',
+                mode='lines+markers',
+                line=dict(color=color, width=2),
+                marker=dict(size=10),
+            ),
+            secondary_y=False
+        )
+        
+        if show_turnover:
+            fig.add_trace(
+                go.Scatter(
+                    x=subset['lag'], 
+                    y=subset['turnover'] * 100,
+                    name=f'Turnover ({resid})',
+                    mode='lines+markers',
+                    line=dict(color=color, width=2, dash='dash'),
+                    marker=dict(size=8, symbol='diamond'),
+                ),
+                secondary_y=True
+            )
+    
+    title = 'Lag Sensitivity: Sharpe & Turnover vs Lag' if show_turnover else 'Lag Sensitivity: Sharpe vs Lag'
+    fig.update_layout(
+        title=title,
+        xaxis_title='Lag (trading days)',
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+        hovermode='x unified',
+    )
+    
+    fig.update_yaxes(title_text="Sharpe Ratio", secondary_y=False)
+    if show_turnover:
+        fig.update_yaxes(title_text="Turnover (%)", secondary_y=True)
     
     return fig
 

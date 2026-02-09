@@ -30,10 +30,10 @@ def get_cached_catalog(snapshot_path: str):
 def get_cached_run_history():
     """Get run history with 60-second cache to avoid repeated MLflow queries."""
     return get_run_history()
-from poc.tracking import log_run, get_run_history, get_git_sha, compute_signal_hash
+from poc.tracking import log_run, get_run_history, get_git_sha, compute_signal_hash, delete_runs
 from poc.charts import (
-    plot_lag_sensitivity, plot_decile_returns, plot_factor_exposure_bars, 
-    plot_coverage_over_time, plot_ic_over_time
+    plot_lag_sensitivity, plot_lag_sensitivity_from_summary, plot_decile_returns, 
+    plot_factor_exposure_bars, plot_coverage_over_time, plot_ic_over_time
 )
 from poc.compare import compare_runs, get_overlay_data, compute_cumret_diff, clear_run_cache
 
@@ -360,8 +360,8 @@ def main():
             
             # Lag Sensitivity Chart
             st.subheader("Lag Sensitivity")
-            lag_fig = plot_lag_sensitivity(result)
-            st.plotly_chart(lag_fig, width='stretch', key="results_lag_sensitivity")
+            lag_fig = plot_lag_sensitivity(result, show_turnover=False)
+            st.plotly_chart(lag_fig, use_container_width=True, key="results_lag_sensitivity")
             
             # Signal Quality Charts section
             st.subheader("Signal Quality Charts")
@@ -565,9 +565,9 @@ def main():
     with tab4:
         st.header("Past Experiments")
         
-        col1, col2 = st.columns([1, 4])
+        col1, col2, col3 = st.columns([1, 1, 3])
         with col1:
-            if st.button("Refresh"):
+            if st.button("Refresh", key="history_refresh"):
                 # Clear the run history cache and reload
                 get_cached_run_history.clear()
                 st.rerun()
@@ -588,7 +588,63 @@ def main():
             else:
                 runs_df['label'] = runs_df['run_id'].str[:12] + '...'
             
-            # Select a run
+            # === Run Management Section ===
+            with st.expander("Manage Runs", expanded=False):
+                st.caption("Select runs to delete")
+                
+                # Get all run IDs for checkbox key management
+                all_run_ids = runs_df['run_id'].tolist()
+                
+                # Select All / Deselect All buttons
+                mgmt_col1, mgmt_col2, mgmt_col3 = st.columns([1, 1, 2])
+                with mgmt_col1:
+                    if st.button("Select All", key="select_all_runs"):
+                        # Set all checkbox states to True
+                        for rid in all_run_ids:
+                            st.session_state[f"run_select_{rid}"] = True
+                        st.rerun()
+                with mgmt_col2:
+                    if st.button("Deselect All", key="deselect_all_runs"):
+                        # Set all checkbox states to False
+                        for rid in all_run_ids:
+                            st.session_state[f"run_select_{rid}"] = False
+                        st.rerun()
+                
+                # Display runs as checkboxes
+                selected_run_ids = []
+                for idx, row in runs_df.iterrows():
+                    run_id = row['run_id']
+                    label = row['label']
+                    sharpe = row.get('metrics.best_sharpe', None)
+                    sharpe_str = f" (Sharpe: {sharpe:.2f})" if sharpe is not None else ""
+                    
+                    checkbox_key = f"run_select_{run_id}"
+                    if st.checkbox(f"{label}{sharpe_str}", key=checkbox_key):
+                        selected_run_ids.append(run_id)
+                
+                # Delete button
+                num_selected = len(selected_run_ids)
+                if num_selected > 0:
+                    st.warning(f"{num_selected} run(s) selected for deletion")
+                    if st.button(f"Delete {num_selected} Selected Run(s)", type="primary", key="delete_runs_btn"):
+                        with st.spinner("Deleting runs..."):
+                            result = delete_runs(selected_run_ids)
+                            if result['deleted']:
+                                st.success(f"Deleted {len(result['deleted'])} run(s)")
+                            if result['failed']:
+                                for fail in result['failed']:
+                                    st.error(f"Failed to delete {fail['run_id'][:12]}: {fail['error']}")
+                            # Clear checkbox states and refresh
+                            for rid in selected_run_ids:
+                                if f"run_select_{rid}" in st.session_state:
+                                    del st.session_state[f"run_select_{rid}"]
+                            get_cached_run_history.clear()
+                            st.rerun()
+            
+            # === View Selected Run ===
+            st.subheader("View Experiment")
+            
+            # Select a run to view
             selected_label = st.selectbox("Select an experiment to view", runs_df['label'].tolist())
             selected_run = runs_df[runs_df['label'] == selected_label].iloc[0]
             run_id = selected_run['run_id']
@@ -758,6 +814,12 @@ def main():
                     }, na_rep='N/A'), width='stretch')
                 else:
                     st.info("No baseline correlations available.")
+                
+                # Lag Sensitivity Chart
+                if summary_df is not None:
+                    st.subheader("Lag Sensitivity")
+                    lag_fig = plot_lag_sensitivity_from_summary(summary_df, show_turnover=False)
+                    st.plotly_chart(lag_fig, use_container_width=True, key="history_lag_sensitivity")
                 
                 # Tearsheet
                 st.subheader("Tear Sheet")
