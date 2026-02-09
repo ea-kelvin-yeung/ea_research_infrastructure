@@ -642,36 +642,14 @@ def main():
                             st.rerun()
             
             # === View Selected Run ===
-            st.subheader("View Experiment")
-            
-            # Select a run to view
             selected_label = st.selectbox("Select an experiment to view", runs_df['label'].tolist())
             selected_run = runs_df[runs_df['label'] == selected_label].iloc[0]
             run_id = selected_run['run_id']
             
-            # Show experiment details
-            st.subheader("Experiment Details")
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Signal", selected_run.get('tags.signal_name', 'N/A'))
-            with col2:
-                st.metric("Data Snapshot", selected_run.get('tags.snapshot_id', 'N/A'))
-            with col3:
-                sharpe = selected_run.get('metrics.best_sharpe', None)
-                st.metric("Best Sharpe", f"{sharpe:.2f}" if sharpe else "N/A")
-            with col4:
-                st.metric("Git SHA", selected_run.get('tags.git_sha', 'N/A'))
-            
-            # Run Info expander
-            with st.expander("Reproducibility Info", expanded=False):
-                st.markdown("**Run ID:**")
-                st.code(run_id, language=None)
-                st.markdown("**Signal Hash:**")
-                st.code(selected_run.get('tags.signal_hash', 'N/A'), language=None)
-            
             # Load artifacts from MLflow
             try:
                 import mlflow
+                import json
                 client = mlflow.tracking.MlflowClient()
                 artifacts = client.list_artifacts(run_id)
                 artifact_names = [a.path for a in artifacts]
@@ -690,8 +668,6 @@ def main():
                             return pd.read_csv(local_path)
                     return None
                 
-                import json
-                
                 # Load all artifacts
                 daily_df = load_artifact('daily', 'parquet')
                 summary_df = load_artifact('summary', 'csv')
@@ -701,21 +677,37 @@ def main():
                 correlations = load_artifact('correlations', 'parquet')
                 coverage = load_artifact('coverage', 'json')
                 
-                # Suite Summary
-                if summary_df is not None:
-                    st.subheader("Suite Summary")
-                    signal_summary = summary_df[summary_df['type'] == 'signal'] if 'type' in summary_df.columns else summary_df
-                    st.dataframe(
-                        signal_summary.style.format({
-                            'sharpe': '{:.2f}',
-                            'ann_ret': '{:.2%}',
-                            'max_dd': '{:.2%}',
-                            'turnover': '{:.2%}',
-                        }, na_rep='N/A'),
-                        width='stretch'
-                    )
+                # ==========================================
+                # 1. KEY METRICS (most important at a glance)
+                # ==========================================
+                sharpe = selected_run.get('metrics.best_sharpe', None)
+                col1, col2, col3, col4, col5 = st.columns(5)
+                with col1:
+                    st.metric("Best Sharpe", f"{sharpe:.2f}" if sharpe else "N/A")
+                with col2:
+                    if ic_stats:
+                        st.metric("Mean IC", f"{ic_stats.get('mean', 0):.4f}")
+                    else:
+                        st.metric("Mean IC", "N/A")
+                with col3:
+                    if ic_stats:
+                        st.metric("IC t-Stat", f"{ic_stats.get('t_stat', 0):.2f}")
+                    else:
+                        st.metric("IC t-Stat", "N/A")
+                with col4:
+                    if ic_stats:
+                        st.metric("Hit Rate", f"{ic_stats.get('hit_rate', 0):.1f}%")
+                    else:
+                        st.metric("Hit Rate", "N/A")
+                with col5:
+                    if coverage:
+                        st.metric("Avg Coverage", f"{coverage.get('avg_securities_per_day', 0):.0f}")
+                    else:
+                        st.metric("Avg Coverage", "N/A")
                 
-                # Cumulative Returns
+                # ==========================================
+                # 2. CUMULATIVE RETURNS (visual performance)
+                # ==========================================
                 st.subheader("Cumulative Returns")
                 if daily_df is not None and 'date' in daily_df.columns and 'cumret' in daily_df.columns:
                     if 'config' in daily_df.columns:
@@ -734,7 +726,7 @@ def main():
                             )
                         with col2:
                             selected_baselines = st.multiselect(
-                                "Baseline signals", baseline_configs,
+                                "Baselines", baseline_configs,
                                 default=baseline_configs, key="hist_baselines_multi"
                             )
                         
@@ -744,99 +736,122 @@ def main():
                         if 'type' in filtered_df.columns and len(filtered_df) > 0:
                             filtered_df = filtered_df.copy()
                             filtered_df['label'] = filtered_df.apply(
-                                lambda r: f"📊 {r['config']}" if r['type'] == 'signal' else f"📈 {r['config']}", 
+                                lambda r: f"{r['config']}" if r['type'] == 'signal' else f"baseline: {r['config']}", 
                                 axis=1
                             )
-                            fig = px.line(filtered_df, x='date', y='cumret', color='label',
-                                         title='Cumulative Return: Signal vs Baselines',
-                                         line_dash='type')
+                            fig = px.line(filtered_df, x='date', y='cumret', color='label', line_dash='type')
                         else:
-                            fig = px.line(filtered_df, x='date', y='cumret', color='config',
-                                         title='Cumulative Return by Config')
+                            fig = px.line(filtered_df, x='date', y='cumret', color='config')
                     else:
-                        fig = px.line(daily_df, x='date', y='cumret', title='Cumulative Return')
+                        fig = px.line(daily_df, x='date', y='cumret')
                     
-                    fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02))
-                    st.plotly_chart(fig, width='stretch', key="history_cumret")
+                    fig.update_layout(
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                        margin=dict(t=40, b=40),
+                        xaxis_title=None, yaxis_title="Cumulative Return"
+                    )
+                    st.plotly_chart(fig, use_container_width=True, key="history_cumret")
                 else:
-                    st.info("No daily returns data found for this run.")
+                    st.info("No daily returns data found.")
                 
-                # Signal Quality Charts
-                st.subheader("Signal Quality Charts")
+                # ==========================================
+                # 3. SUITE SUMMARY TABLE (detailed breakdown)
+                # ==========================================
+                if summary_df is not None:
+                    with st.expander("Suite Summary by Config", expanded=False):
+                        signal_summary = summary_df[summary_df['type'] == 'signal'] if 'type' in summary_df.columns else summary_df
+                        st.dataframe(
+                            signal_summary.style.format({
+                                'sharpe': '{:.2f}',
+                                'ann_ret': '{:.2%}',
+                                'max_dd': '{:.2%}',
+                                'turnover': '{:.2%}',
+                            }, na_rep='N/A'),
+                            use_container_width=True
+                        )
+                
+                # ==========================================
+                # 4. SIGNAL ANALYSIS (IC + Lag Sensitivity)
+                # ==========================================
+                st.subheader("Signal Analysis")
+                
+                # IC over time and Lag Sensitivity side by side
                 chart_col1, chart_col2 = st.columns(2)
                 
                 with chart_col1:
-                    # Factor Exposure bars
+                    if ic_series is not None and len(ic_series) > 0:
+                        ic_fig = plot_ic_over_time(ic_series)
+                        ic_fig.update_layout(margin=dict(t=40, b=40))
+                        st.plotly_chart(ic_fig, use_container_width=True, key="history_ic")
+                    else:
+                        st.info("No IC series data")
+                
+                with chart_col2:
+                    if summary_df is not None:
+                        lag_fig = plot_lag_sensitivity_from_summary(summary_df, show_turnover=False)
+                        lag_fig.update_layout(margin=dict(t=40, b=40))
+                        st.plotly_chart(lag_fig, use_container_width=True, key="history_lag_sensitivity")
+                    else:
+                        st.info("No lag data")
+                
+                # ==========================================
+                # 5. FACTOR & BASELINE ANALYSIS
+                # ==========================================
+                st.subheader("Factor & Baseline Analysis")
+                analysis_col1, analysis_col2 = st.columns(2)
+                
+                with analysis_col1:
                     if factor_exposures is not None and len(factor_exposures) > 0:
                         factor_fig = plot_factor_exposure_bars(factor_exposures)
-                        st.plotly_chart(factor_fig, width='stretch', key="history_factor_exposure")
+                        factor_fig.update_layout(margin=dict(t=40, b=40))
+                        st.plotly_chart(factor_fig, use_container_width=True, key="history_factor_exposure")
                     else:
                         st.info("No factor exposure data")
                 
-                with chart_col2:
-                    # Coverage metrics
-                    if coverage:
-                        st.markdown("**Coverage Metrics**")
-                        cov_col1, cov_col2 = st.columns(2)
-                        with cov_col1:
-                            st.metric("Avg Securities/Day", f"{coverage.get('avg_securities_per_day', 0):.0f}")
-                            st.metric("Unique Securities", coverage.get('unique_securities', 'N/A'))
-                        with cov_col2:
-                            st.metric("Total Days", coverage.get('total_days', 'N/A'))
-                            if coverage.get('coverage_pct'):
-                                st.metric("Universe Coverage", f"{coverage.get('coverage_pct', 0):.1f}%")
+                with analysis_col2:
+                    if correlations is not None and len(correlations) > 0:
+                        st.markdown("**Baseline Correlations**")
+                        st.dataframe(correlations.style.format({
+                            'signal_corr': '{:.3f}',
+                            'pnl_corr': '{:.3f}',
+                        }, na_rep='N/A'), use_container_width=True)
+                    else:
+                        st.info("No baseline correlations")
                 
-                # Information Coefficient (IC)
-                st.subheader("Information Coefficient (IC)")
-                if ic_stats:
-                    ic_col1, ic_col2, ic_col3, ic_col4 = st.columns(4)
-                    with ic_col1:
-                        st.metric("Mean IC", f"{ic_stats.get('mean', 0):.4f}")
-                    with ic_col2:
-                        st.metric("t-Statistic", f"{ic_stats.get('t_stat', 0):.2f}")
-                    with ic_col3:
-                        st.metric("Hit Rate", f"{ic_stats.get('hit_rate', 0):.1f}%")
-                    with ic_col4:
-                        st.metric("Info Ratio", f"{ic_stats.get('ir', 0):.2f}")
-                    
-                    if ic_series is not None and len(ic_series) > 0:
-                        ic_fig = plot_ic_over_time(ic_series)
-                        st.plotly_chart(ic_fig, width='stretch', key="history_ic")
-                else:
-                    st.info("No IC data available for this run.")
+                # ==========================================
+                # 6. REPRODUCIBILITY & DETAILS (collapsed)
+                # ==========================================
+                with st.expander("Reproducibility & Details", expanded=False):
+                    detail_col1, detail_col2 = st.columns(2)
+                    with detail_col1:
+                        st.markdown(f"**Signal:** {selected_run.get('tags.signal_name', 'N/A')}")
+                        st.markdown(f"**Snapshot:** {selected_run.get('tags.snapshot_id', 'N/A')}")
+                        st.markdown(f"**Git SHA:** `{selected_run.get('tags.git_sha', 'N/A')}`")
+                    with detail_col2:
+                        st.markdown(f"**Run ID:** `{run_id[:12]}...`")
+                        st.markdown(f"**Signal Hash:** `{selected_run.get('tags.signal_hash', 'N/A')}`")
+                        if coverage:
+                            st.markdown(f"**Total Days:** {coverage.get('total_days', 'N/A')}")
+                            st.markdown(f"**Unique Securities:** {coverage.get('unique_securities', 'N/A')}")
                 
-                # Baseline Correlations
-                st.subheader("Baseline Correlations")
-                if correlations is not None and len(correlations) > 0:
-                    st.dataframe(correlations.style.format({
-                        'signal_corr': '{:.3f}',
-                        'pnl_corr': '{:.3f}',
-                    }, na_rep='N/A'), width='stretch')
-                else:
-                    st.info("No baseline correlations available.")
-                
-                # Lag Sensitivity Chart
-                if summary_df is not None:
-                    st.subheader("Lag Sensitivity")
-                    lag_fig = plot_lag_sensitivity_from_summary(summary_df, show_turnover=False)
-                    st.plotly_chart(lag_fig, use_container_width=True, key="history_lag_sensitivity")
-                
-                # Tearsheet
-                st.subheader("Tear Sheet")
-                tearsheet_artifact = next((a for a in artifact_names if 'tearsheet' in a), None)
-                if tearsheet_artifact:
-                    local_path = client.download_artifacts(run_id, tearsheet_artifact)
-                    with open(local_path) as f:
-                        st.components.v1.html(f.read(), height=800, scrolling=True)
-                else:
-                    st.warning("No tearsheet found for this run.")
+                # ==========================================
+                # 7. FULL TEARSHEET (comprehensive detail)
+                # ==========================================
+                with st.expander("Full Tear Sheet", expanded=False):
+                    tearsheet_artifact = next((a for a in artifact_names if 'tearsheet' in a), None)
+                    if tearsheet_artifact:
+                        local_path = client.download_artifacts(run_id, tearsheet_artifact)
+                        with open(local_path) as f:
+                            st.components.v1.html(f.read(), height=800, scrolling=True)
+                    else:
+                        st.info("No tearsheet found for this run.")
                     
             except Exception as e:
                 st.warning(f"Could not load artifacts: {e}")
                 import traceback
                 st.code(traceback.format_exc())
             
-            st.markdown("[Open MLflow UI](http://localhost:5000)")
+            st.caption("[Open MLflow UI](http://localhost:5000)")
 
 
 if __name__ == "__main__":
