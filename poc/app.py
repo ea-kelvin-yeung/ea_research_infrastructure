@@ -147,88 +147,116 @@ def main():
             run_button = st.button("🚀 Run Suite", type="primary")
         
         if run_button and uploaded:
-            with st.spinner("Running backtest suite..."):
-                try:
-                    # Load signal
-                    if uploaded.name.endswith('.parquet'):
-                        signal_df = pd.read_parquet(uploaded)
-                    elif uploaded.name.endswith('.pkl') or uploaded.name.endswith('.pickle'):
-                        import pickle
-                        signal_df = pickle.load(uploaded)
+            import time
+            total_start = time.time()
+            step_times = []
+            
+            # Create a status container for live updates
+            status_container = st.container()
+            progress_bar = st.progress(0)
+            log_container = st.empty()
+            
+            def log_step(step_name: str, step_time: float, progress: float):
+                step_times.append((step_name, step_time))
+                progress_bar.progress(progress)
+                log_text = "\n".join([f"✓ {name}: {t:.2f}s" for name, t in step_times])
+                log_container.code(log_text, language=None)
+            
+            try:
+                # Step 1: Load signal
+                step_start = time.time()
+                if uploaded.name.endswith('.parquet'):
+                    signal_df = pd.read_parquet(uploaded)
+                elif uploaded.name.endswith('.pkl') or uploaded.name.endswith('.pickle'):
+                    import pickle
+                    signal_df = pickle.load(uploaded)
+                else:
+                    signal_df = pd.read_csv(uploaded, parse_dates=['date_sig', 'date_avail'])
+                log_step(f"Load signal ({len(signal_df):,} rows)", time.time() - step_start, 0.1)
+                
+                # Step 2: Filter signal to date range
+                step_start = time.time()
+                start_str = str(start_date)
+                end_str = str(end_date)
+                signal_df['date_sig'] = pd.to_datetime(signal_df['date_sig'])
+                original_len = len(signal_df)
+                signal_df = signal_df[
+                    (signal_df['date_sig'] >= start_str) & 
+                    (signal_df['date_sig'] <= end_str)
+                ]
+                log_step(f"Filter signal ({original_len:,} → {len(signal_df):,})", time.time() - step_start, 0.15)
+                
+                # Step 3: Load catalog (cached in memory after first load)
+                step_start = time.time()
+                catalog = get_cached_catalog(f"snapshots/{selected_snapshot}")
+                catalog = filter_catalog(catalog, start_str, end_str)
+                log_step(f"Load catalog ({len(catalog['ret']):,} ret rows)", time.time() - step_start, 0.25)
+                
+                # Step 4: Apply universe filter if requested
+                if universe_filter != "All Securities":
+                    step_start = time.time()
+                    desc_path = Path('data/descriptor.parquet')
+                    if desc_path.exists():
+                        desc = pd.read_parquet(desc_path, columns=['security_id', 'as_of_date', 'universe_flag'])
+                        desc['as_of_date'] = pd.to_datetime(desc['as_of_date'])
+                        desc = desc[(desc['as_of_date'] >= start_str) & (desc['as_of_date'] <= end_str)]
+                        
+                        target_flag = 1 if universe_filter == "Investable Universe" else 0
+                        universe_secs = desc[desc['universe_flag'] == target_flag][['security_id', 'as_of_date']].drop_duplicates()
+                        
+                        original_len = len(signal_df)
+                        signal_df = signal_df.merge(
+                            universe_secs.rename(columns={'as_of_date': 'date_sig'}),
+                            on=['security_id', 'date_sig'],
+                            how='inner'
+                        )
+                        log_step(f"Universe filter ({original_len:,} → {len(signal_df):,})", time.time() - step_start, 0.30)
                     else:
-                        signal_df = pd.read_csv(uploaded, parse_dates=['date_sig', 'date_avail'])
-                    
-                    # Filter signal to date range
-                    start_str = str(start_date)
-                    end_str = str(end_date)
-                    signal_df['date_sig'] = pd.to_datetime(signal_df['date_sig'])
-                    signal_df = signal_df[
-                        (signal_df['date_sig'] >= start_str) & 
-                        (signal_df['date_sig'] <= end_str)
-                    ]
-                    
-                    # Load catalog (cached in memory after first load)
-                    catalog = get_cached_catalog(f"snapshots/{selected_snapshot}")
-                    catalog = filter_catalog(catalog, start_str, end_str)
-                    
-                    # Apply universe filter if requested
-                    if universe_filter != "All Securities":
-                        # Load descriptor for universe flags
-                        desc_path = Path('data/descriptor.parquet')
-                        if desc_path.exists():
-                            desc = pd.read_parquet(desc_path, columns=['security_id', 'as_of_date', 'universe_flag'])
-                            desc['as_of_date'] = pd.to_datetime(desc['as_of_date'])
-                            desc = desc[(desc['as_of_date'] >= start_str) & (desc['as_of_date'] <= end_str)]
-                            
-                            # Filter by universe flag
-                            target_flag = 1 if universe_filter == "Investable Universe" else 0
-                            universe_secs = desc[desc['universe_flag'] == target_flag][['security_id', 'as_of_date']].drop_duplicates()
-                            
-                            # Merge to filter signal
-                            original_len = len(signal_df)
-                            signal_df = signal_df.merge(
-                                universe_secs.rename(columns={'as_of_date': 'date_sig'}),
-                                on=['security_id', 'date_sig'],
-                                how='inner'
-                            )
-                            st.info(f"Universe filter ({universe_filter}): {original_len:,} → {len(signal_df):,} rows")
-                        else:
-                            st.warning("descriptor.parquet not found, skipping universe filter")
-                    
-                    st.info(f"Signal: {len(signal_df):,} rows ({start_str} to {end_str})")
-                    st.info(f"Data: {len(catalog['ret']):,} returns, {len(catalog['risk']):,} risk rows")
-                    
-                    # Run suite
-                    grid = {'lags': lags, 'residualize': resid_opts}
-                    result = run_suite(
-                        signal_df, catalog, grid=grid, 
-                        include_baselines=include_baselines,
-                        baseline_start_date=start_str,
-                        baseline_end_date=end_str,
-                    )
-                    
-                    # Store in session state
-                    st.session_state['result'] = result
-                    st.session_state['catalog'] = catalog
-                    st.session_state['signal_name'] = signal_name
-                    st.session_state['signal_df'] = signal_df
-                    st.session_state['snapshot_id'] = selected_snapshot
-                    
-                    # Generate tearsheet
-                    tearsheet_path = generate_tearsheet(result, signal_name, catalog, f"artifacts/{signal_name}_tearsheet.html")
-                    st.session_state['tearsheet_path'] = tearsheet_path
-                    
-                    # Log to MLflow
-                    if log_to_mlflow:
-                        run_id = log_run(result, signal_name, catalog, tearsheet_path, signal_df=signal_df)
-                        st.session_state['run_id'] = run_id
-                    
-                    st.success("Suite completed! Check the Results tab.")
-                    
-                except Exception as e:
-                    st.error(f"Error: {e}")
-                    import traceback
-                    st.code(traceback.format_exc())
+                        st.warning("descriptor.parquet not found, skipping universe filter")
+                
+                # Step 5: Run suite (main backtest)
+                step_start = time.time()
+                grid = {'lags': lags, 'residualize': resid_opts}
+                num_configs = len(lags) * len(resid_opts)
+                result = run_suite(
+                    signal_df, catalog, grid=grid, 
+                    include_baselines=include_baselines,
+                    baseline_start_date=start_str,
+                    baseline_end_date=end_str,
+                )
+                baselines_note = f" + {len(result.baselines)} baselines" if include_baselines else ""
+                log_step(f"Run suite ({num_configs} configs{baselines_note})", time.time() - step_start, 0.75)
+                
+                # Store in session state
+                st.session_state['result'] = result
+                st.session_state['catalog'] = catalog
+                st.session_state['signal_name'] = signal_name
+                st.session_state['signal_df'] = signal_df
+                st.session_state['snapshot_id'] = selected_snapshot
+                
+                # Step 6: Generate tearsheet
+                step_start = time.time()
+                tearsheet_path = generate_tearsheet(result, signal_name, catalog, f"artifacts/{signal_name}_tearsheet.html")
+                st.session_state['tearsheet_path'] = tearsheet_path
+                log_step("Generate tearsheet", time.time() - step_start, 0.90)
+                
+                # Step 7: Log to MLflow
+                if log_to_mlflow:
+                    step_start = time.time()
+                    run_id = log_run(result, signal_name, catalog, tearsheet_path, signal_df=signal_df)
+                    st.session_state['run_id'] = run_id
+                    log_step("Log to MLflow", time.time() - step_start, 1.0)
+                else:
+                    progress_bar.progress(1.0)
+                
+                # Final summary
+                total_time = time.time() - total_start
+                st.success(f"Suite completed in {total_time:.1f}s! Check the Results tab.")
+                
+            except Exception as e:
+                st.error(f"Error: {e}")
+                import traceback
+                st.code(traceback.format_exc())
         
         elif run_button and not uploaded:
             st.warning("Please upload a signal file first.")
@@ -437,14 +465,20 @@ def main():
                 st.warning("Please select two different runs to compare.")
             else:
                 if st.button("Compare Runs", type="primary"):
-                    with st.spinner("Loading and comparing runs..."):
-                        try:
+                    import time
+                    compare_start = time.time()
+                    
+                    try:
+                        with st.spinner(f"Loading runs from MLflow..."):
                             result = compare_runs(run_a_id, run_b_id)
                             st.session_state['compare_result'] = result
-                        except Exception as e:
-                            st.error(f"Error comparing runs: {e}")
-                            import traceback
-                            st.code(traceback.format_exc())
+                        
+                        compare_time = time.time() - compare_start
+                        st.success(f"Comparison loaded in {compare_time:.2f}s")
+                    except Exception as e:
+                        st.error(f"Error comparing runs: {e}")
+                        import traceback
+                        st.code(traceback.format_exc())
                 
                 # Display comparison results
                 if 'compare_result' in st.session_state:
