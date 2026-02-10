@@ -676,6 +676,91 @@ def main():
                 else:
                     st.info("No daily returns data found.")
                 
+                # Daily Returns and Drawdowns side by side
+                perf_col1, perf_col2 = st.columns(2)
+                
+                with perf_col1:
+                    # Daily Returns bar chart
+                    if daily_df is not None and 'ret' in daily_df.columns:
+                        # Use first signal config
+                        signal_daily = daily_df[daily_df['type'] == 'signal'] if 'type' in daily_df.columns else daily_df
+                        if len(signal_daily) > 0:
+                            first_config = signal_daily['config'].iloc[0] if 'config' in signal_daily.columns else None
+                            if first_config:
+                                config_data = signal_daily[signal_daily['config'] == first_config].copy()
+                            else:
+                                config_data = signal_daily.copy()
+                            
+                            # Convert to percentage
+                            config_data['ret_pct'] = config_data['ret'] * 100
+                            
+                            ret_fig = go.Figure()
+                            ret_fig.add_trace(go.Bar(
+                                x=config_data['date'],
+                                y=config_data['ret_pct'],
+                                marker_color='#4A90D9',
+                                name='Daily Return'
+                            ))
+                            ret_fig.update_layout(
+                                title='Daily Returns',
+                                xaxis_title='Date',
+                                yaxis_title='Daily Return (%)',
+                                showlegend=False,
+                                height=300
+                            )
+                            ret_fig.add_hline(y=0, line_dash="solid", line_color="gray", line_width=1)
+                            st.plotly_chart(ret_fig, use_container_width=True, key="history_daily_ret")
+                    else:
+                        st.caption("Daily returns not available. Re-run to generate.")
+                
+                with perf_col2:
+                    # Drawdown chart
+                    if daily_df is not None and 'drawdown' in daily_df.columns:
+                        signal_daily = daily_df[daily_df['type'] == 'signal'] if 'type' in daily_df.columns else daily_df
+                        if len(signal_daily) > 0:
+                            first_config = signal_daily['config'].iloc[0] if 'config' in signal_daily.columns else None
+                            if first_config:
+                                config_data = signal_daily[signal_daily['config'] == first_config].copy()
+                            else:
+                                config_data = signal_daily.copy()
+                            
+                            # Convert to percentage
+                            config_data['dd_pct'] = config_data['drawdown'] * 100
+                            
+                            dd_fig = go.Figure()
+                            dd_fig.add_trace(go.Scatter(
+                                x=config_data['date'],
+                                y=config_data['dd_pct'],
+                                fill='tozeroy',
+                                fillcolor='rgba(220, 53, 69, 0.3)',
+                                line=dict(color='#dc3545', width=1),
+                                name='Drawdown'
+                            ))
+                            dd_fig.update_layout(
+                                title='Drawdowns',
+                                xaxis_title='Date',
+                                yaxis_title='Drawdown (%)',
+                                showlegend=False,
+                                height=300
+                            )
+                            st.plotly_chart(dd_fig, use_container_width=True, key="history_drawdown")
+                    else:
+                        st.caption("Drawdown data not available. Re-run to generate.")
+                
+                # Fractile Analysis
+                fractile_df = load_artifact('fractile', 'parquet')
+                if fractile_df is not None and len(fractile_df) > 0 and 'fractile' in fractile_df.columns:
+                    st.markdown("**Fractile Analysis**")
+                    st.caption("Shows excess returns vs universe average. Positive = outperform, Negative = underperform. "
+                              "Ideal: monotonically increasing from D1 to D10.")
+                    
+                    # Use existing plot_decile_returns function which handles column names properly
+                    frac_fig = plot_decile_returns(fractile_df, title="Returns by Decile")
+                    st.plotly_chart(frac_fig, use_container_width=True, key="history_fractile_ret")
+                else:
+                    # Check if this is an old run without fractile data
+                    st.caption("Fractile analysis not available. Re-run to generate.")
+                
                 # Lag Sensitivity
                 if summary_df is not None:
                     lag_fig = plot_lag_sensitivity_from_summary(summary_df, show_turnover=False)

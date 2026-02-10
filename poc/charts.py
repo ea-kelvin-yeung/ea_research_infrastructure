@@ -336,31 +336,39 @@ def plot_decile_returns(fractile_df: pd.DataFrame, title: str = "Returns by Deci
                           x=0.5, y=0.5, showarrow=False)
         return fig
     
-    # Use resret if available, otherwise ret
-    y_col = 'resret' if 'resret' in fractile_df.columns else 'ret'
+    # Use raw returns ('ret') by default for consistency with portfolio returns
+    y_col = 'ret' if 'ret' in fractile_df.columns else 'resret'
     
     # Sort by fractile
-    df = fractile_df.sort_values('fractile')
+    df = fractile_df.sort_values('fractile').copy()
     
-    # Color bars based on value (green for positive, red for negative)
-    colors = ['green' if v > 0 else 'red' for v in df[y_col]]
+    # Demean returns to show excess returns relative to universe average
+    # This makes the chart more meaningful: positive = outperform, negative = underperform
+    universe_mean = df[y_col].mean()
+    df['excess_ret'] = df[y_col] - universe_mean
+    
+    # Color bars based on excess return (green for outperform, red for underperform)
+    colors = ['green' if v > 0 else 'red' for v in df['excess_ret']]
     
     fig = go.Figure()
     fig.add_trace(go.Bar(
         x=df['fractile'],
-        y=df[y_col] * 100,  # Convert to percentage
+        y=df['excess_ret'] * 100,  # Convert to percentage
         marker_color=colors,
-        text=[f"{v*100:.1f}%" for v in df[y_col]],
+        text=[f"{v*100:+.1f}%" for v in df['excess_ret']],
         textposition='outside',
     ))
     
-    # Check monotonicity
-    returns = df[y_col].values
+    # Check monotonicity (using excess returns)
+    returns = df['excess_ret'].values
     is_monotonic = all(returns[i] <= returns[i+1] for i in range(len(returns)-1))
+    
+    # Calculate spread (D10 - D1)
+    spread = returns[-1] - returns[0] if len(returns) >= 2 else 0
     
     if is_monotonic:
         fig.add_annotation(
-            text="Monotonic (ideal)",
+            text=f"Monotonic | Spread: {spread*100:.1f}%",
             xref="paper", yref="paper",
             x=0.05, y=0.95,
             showarrow=False,
@@ -369,7 +377,6 @@ def plot_decile_returns(fractile_df: pd.DataFrame, title: str = "Returns by Deci
         )
     else:
         # Check if spread is meaningful (D10 - D1 > 0)
-        spread = returns[-1] - returns[0] if len(returns) >= 2 else 0
         if spread > 0:
             fig.add_annotation(
                 text=f"Spread: {spread*100:.1f}%",
@@ -382,7 +389,7 @@ def plot_decile_returns(fractile_df: pd.DataFrame, title: str = "Returns by Deci
     fig.update_layout(
         title=title,
         xaxis_title='Signal Decile',
-        yaxis_title='Annualized Return (%)',
+        yaxis_title='Excess Return vs Universe (%)',
         showlegend=False,
     )
     

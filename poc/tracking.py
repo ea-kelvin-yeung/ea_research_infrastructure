@@ -142,10 +142,17 @@ def log_run(
         mlflow.log_artifact(str(summary_path))
         
         # Log daily series for all configs + baselines (combined)
+        # Include cumret, daily returns, and drawdown
         daily_data = []
         for config_key, result in suite_result.results.items():
             if 'cumret' in result.daily.columns:
-                df = result.daily[['date', 'cumret']].copy()
+                # Select available columns
+                cols = ['date', 'cumret']
+                if 'ret' in result.daily.columns:
+                    cols.append('ret')
+                if 'drawdown' in result.daily.columns:
+                    cols.append('drawdown')
+                df = result.daily[cols].copy()
                 df['config'] = config_key
                 df['type'] = 'signal'
                 daily_data.append(df)
@@ -153,7 +160,12 @@ def log_run(
         # Include baseline daily data
         for name, result in suite_result.baselines.items():
             if 'cumret' in result.daily.columns:
-                df = result.daily[['date', 'cumret']].copy()
+                cols = ['date', 'cumret']
+                if 'ret' in result.daily.columns:
+                    cols.append('ret')
+                if 'drawdown' in result.daily.columns:
+                    cols.append('drawdown')
+                df = result.daily[cols].copy()
                 df['config'] = name
                 df['type'] = 'baseline'
                 daily_data.append(df)
@@ -163,6 +175,15 @@ def log_run(
             daily_path = Path('artifacts') / f"{signal_name}_daily.parquet"
             combined_daily.to_parquet(daily_path)
             mlflow.log_artifact(str(daily_path))
+        
+        # Log fractile analysis from best config
+        best_key = get_best_config(suite_result, 'sharpe')
+        if best_key and best_key in suite_result.results:
+            best_result = suite_result.results[best_key]
+            if best_result.fractile is not None and len(best_result.fractile) > 0:
+                fractile_path = Path('artifacts') / f"{signal_name}_fractile.parquet"
+                best_result.fractile.to_parquet(fractile_path, index=False)
+                mlflow.log_artifact(str(fractile_path))
         
         # Log IC series if available
         if suite_result.ic_series is not None and len(suite_result.ic_series) > 0:
