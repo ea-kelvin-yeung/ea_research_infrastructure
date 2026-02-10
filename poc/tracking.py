@@ -55,6 +55,7 @@ def log_run(
     experiment_name: str = 'backtest-poc',
     author: Optional[str] = None,
     signal_df: Optional[pd.DataFrame] = None,
+    suite_options: Optional[dict] = None,
 ) -> str:
     """
     Log a suite run to MLflow.
@@ -67,6 +68,13 @@ def log_run(
         experiment_name: MLflow experiment name
         author: Author name (optional)
         signal_df: Original signal DataFrame (for computing hash)
+        suite_options: Suite-level options dict with keys:
+            - lags: List of lag values tested
+            - residualize_opts: List of residualization options
+            - include_baselines: Whether baselines were included
+            - start_date: Backtest start date
+            - end_date: Backtest end date
+            - universe_filter: Universe filter setting
         
     Returns:
         MLflow run ID
@@ -88,7 +96,19 @@ def log_run(
             'author': author or 'unknown',
         })
         
-        # Params (from first config in results)
+        # Log suite-level options as params
+        if suite_options:
+            suite_params = {
+                'suite_lags': str(suite_options.get('lags', [])),
+                'suite_residualize_opts': str(suite_options.get('residualize_opts', [])),
+                'suite_include_baselines': suite_options.get('include_baselines', False),
+                'suite_start_date': str(suite_options.get('start_date', '')),
+                'suite_end_date': str(suite_options.get('end_date', '')),
+                'suite_universe_filter': suite_options.get('universe_filter', 'All Securities'),
+            }
+            mlflow.log_params(suite_params)
+        
+        # Params (from first config in results - individual backtest config)
         if suite_result.results:
             first_result = list(suite_result.results.values())[0]
             mlflow.log_params(first_result.config)

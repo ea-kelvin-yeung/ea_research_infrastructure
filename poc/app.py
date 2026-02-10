@@ -244,7 +244,15 @@ def main():
                 # Step 7: Log to MLflow
                 if log_to_mlflow:
                     step_start = time.time()
-                    run_id = log_run(result, signal_name, catalog, tearsheet_path, signal_df=signal_df)
+                    suite_options = {
+                        'lags': lags,
+                        'residualize_opts': resid_opts,
+                        'include_baselines': include_baselines,
+                        'start_date': start_date,
+                        'end_date': end_date,
+                        'universe_filter': universe_filter,
+                    }
+                    run_id = log_run(result, signal_name, catalog, tearsheet_path, signal_df=signal_df, suite_options=suite_options)
                     st.session_state['run_id'] = run_id
                     log_step("Log to MLflow", time.time() - step_start, 1.0)
                 else:
@@ -555,6 +563,60 @@ def main():
                     )
                 else:
                     verdict_data = load_artifact('verdict', 'json')
+                
+                # ============================================================
+                # 0) RUN CONFIGURATION (Suite Options)
+                # ============================================================
+                st.subheader("Run Configuration")
+                
+                # Extract suite options from params
+                suite_lags = selected_run.get('params.suite_lags', None)
+                suite_resid = selected_run.get('params.suite_residualize_opts', None)
+                suite_baselines = selected_run.get('params.suite_include_baselines', None)
+                suite_start = selected_run.get('params.suite_start_date', None)
+                suite_end = selected_run.get('params.suite_end_date', None)
+                suite_universe = selected_run.get('params.suite_universe_filter', None)
+                
+                # Also get other backtest config params (non-grid)
+                tc_model = selected_run.get('params.tc_model', None)
+                weight = selected_run.get('params.weight', None)
+                fractile = selected_run.get('params.fractile', None)
+                mincos = selected_run.get('params.mincos', None)
+                
+                if suite_lags or suite_resid:
+                    # Display in columns
+                    config_col1, config_col2, config_col3 = st.columns(3)
+                    
+                    with config_col1:
+                        st.markdown("**Grid Search**")
+                        if suite_lags:
+                            st.markdown(f"Lags: {suite_lags}")
+                        if suite_resid:
+                            st.markdown(f"Residualize: {suite_resid}")
+                    
+                    with config_col2:
+                        st.markdown("**Filters**")
+                        if suite_universe:
+                            st.markdown(f"Universe: {suite_universe}")
+                        if suite_start and suite_end:
+                            st.markdown(f"Date Range: {suite_start} → {suite_end}")
+                        if suite_baselines is not None:
+                            st.markdown(f"Baselines: {'Yes' if suite_baselines == 'True' else 'No'}")
+                    
+                    with config_col3:
+                        st.markdown("**Backtest Settings**")
+                        if tc_model:
+                            st.markdown(f"TC Model: {tc_model}")
+                        if weight:
+                            st.markdown(f"Weight: {weight}")
+                        if fractile:
+                            st.markdown(f"Fractile: {fractile}")
+                        if mincos:
+                            st.markdown(f"Min COS: {mincos}")
+                else:
+                    st.caption("Suite options not logged (older run)")
+                
+                st.divider()
                 
                 # ============================================================
                 # 1) VERDICT (Decision)
