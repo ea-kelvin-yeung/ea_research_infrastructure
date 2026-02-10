@@ -457,7 +457,8 @@ def main():
                 
                 try:
                     # Extract config
-                    uploaded = rerun_cfg['uploaded']
+                    uploaded = rerun_cfg.get('uploaded')
+                    signal_path_on_disk = rerun_cfg.get('signal_path_on_disk')
                     signal_name = rerun_cfg['signal_name']
                     lags = rerun_cfg['lags']
                     resid_opts = rerun_cfg['resid_opts']
@@ -467,16 +468,34 @@ def main():
                     universe_filter = rerun_cfg['universe_filter']
                     log_to_mlflow = rerun_cfg['log_to_mlflow']
                     
-                    # Step 1: Load signal
+                    # Step 1: Load signal (from disk or uploaded file)
                     step_start = time.time()
-                    if uploaded.name.endswith('.parquet'):
-                        signal_df = pd.read_parquet(uploaded)
-                    elif uploaded.name.endswith('.pkl') or uploaded.name.endswith('.pickle'):
-                        import pickle
-                        signal_df = pickle.load(uploaded)
+                    if signal_path_on_disk:
+                        # Load from disk
+                        signal_file_path = Path(signal_path_on_disk)
+                        signal_filename = signal_file_path.name
+                        if signal_filename.endswith('.parquet'):
+                            signal_df = pd.read_parquet(signal_file_path)
+                        elif signal_filename.endswith('.pkl') or signal_filename.endswith('.pickle'):
+                            import pickle
+                            with open(signal_file_path, 'rb') as f:
+                                signal_df = pickle.load(f)
+                        else:
+                            signal_df = pd.read_csv(signal_file_path, parse_dates=['date_sig', 'date_avail'])
+                        log_step(f"Load signal from disk ({len(signal_df):,} rows)", time.time() - step_start, 0.1)
+                    elif uploaded:
+                        # Load from uploaded file
+                        if uploaded.name.endswith('.parquet'):
+                            signal_df = pd.read_parquet(uploaded)
+                        elif uploaded.name.endswith('.pkl') or uploaded.name.endswith('.pickle'):
+                            import pickle
+                            signal_df = pickle.load(uploaded)
+                        else:
+                            signal_df = pd.read_csv(uploaded, parse_dates=['date_sig', 'date_avail'])
+                        signal_filename = uploaded.name
+                        log_step(f"Load signal ({len(signal_df):,} rows)", time.time() - step_start, 0.1)
                     else:
-                        signal_df = pd.read_csv(uploaded, parse_dates=['date_sig', 'date_avail'])
-                    log_step(f"Load signal ({len(signal_df):,} rows)", time.time() - step_start, 0.1)
+                        raise ValueError("No signal file provided")
                     
                     # Step 2: Filter signal to date range
                     step_start = time.time()
@@ -547,7 +566,7 @@ def main():
                             'start_date': start_date,
                             'end_date': end_date,
                             'universe_filter': universe_filter,
-                            'signal_path': uploaded.name,
+                            'signal_path': signal_filename,
                         }
                         run_id = log_run(result, signal_name, catalog, tearsheet_path, signal_df=signal_df, suite_options=suite_options)
                         log_step("Log to MLflow", time.time() - step_start, 1.0)
@@ -712,6 +731,7 @@ def main():
                 suite_start = selected_run.get('params.suite_start_date', None)
                 suite_end = selected_run.get('params.suite_end_date', None)
                 suite_universe = selected_run.get('params.suite_universe_filter', None)
+                suite_signal_path = selected_run.get('params.suite_signal_path', None)
                 
                 # Also get other backtest config params (non-grid)
                 tc_model = selected_run.get('params.tc_model', None)
@@ -720,6 +740,16 @@ def main():
                 mincos = selected_run.get('params.mincos', None)
                 
                 if suite_lags or suite_resid:
+                    # Display signal path and snapshot prominently if available
+                    info_col1, info_col2 = st.columns(2)
+                    with info_col1:
+                        if suite_signal_path:
+                            st.markdown(f"**Signal File:** `{suite_signal_path}`")
+                    with info_col2:
+                        snapshot_id = selected_run.get('tags.snapshot_id', None)
+                        if snapshot_id:
+                            st.markdown(f"**Data Snapshot:** `{snapshot_id}`")
+                    
                     # Display in columns
                     config_col1, config_col2, config_col3 = st.columns(3)
                     
@@ -755,7 +785,6 @@ def main():
                 # ============================================================
                 # RERUN WITH MODIFIED CONFIG
                 # ============================================================
-                signal_path = selected_run.get('params.suite_signal_path', None)
                 signal_name_from_run = selected_run.get('tags.signal_name', 'signal')
                 
                 with st.expander("Rerun with Modified Config", expanded=False):
@@ -799,6 +828,20 @@ def main():
                     
                     with rerun_col2:
                         st.markdown("**Filters**")
+                        
+                        # Data snapshot selector
+                        original_snapshot = selected_run.get('tags.snapshot_id', None)
+                        available_snapshots = list_snapshots('snapshots')
+                        default_snapshot_idx = 0
+                        if original_snapshot and original_snapshot in available_snapshots:
+                            default_snapshot_idx = available_snapshots.index(original_snapshot)
+                        rerun_snapshot = st.selectbox(
+                            "Data Snapshot",
+                            available_snapshots,
+                            index=default_snapshot_idx,
+                            key="rerun_snapshot"
+                        )
+                        
                         rerun_start = st.date_input("Start Date", value=default_start, key="rerun_start")
                         rerun_end = st.date_input("End Date", value=default_end, key="rerun_end")
                         rerun_universe = st.radio(
@@ -808,24 +851,46 @@ def main():
                             key="rerun_universe"
                         )
                     
-                    # Signal file upload
+                    # Signal file - check if original file exists on disk
                     st.markdown("**Signal File**")
-                    if signal_path:
-                        st.caption(f"Original file: `{signal_path}`")
                     
-                    rerun_uploaded = st.file_uploader(
-                        "Upload signal file (or re-upload original)", 
-                        type=['parquet', 'csv', 'pkl', 'pickle'],
-                        key="rerun_signal_upload",
-                        help=f"Expected: {signal_path}" if signal_path else "Upload signal file"
-                    )
+                    # Check common signal file locations
+                    signal_file_found = None
+                    if suite_signal_path:
+                        # Try different possible locations for the signal file
+                        possible_paths = [
+                            Path(suite_signal_path),  # As-is (if absolute or relative)
+                            Path('data') / suite_signal_path,  # In data folder
+                            Path('signals') / suite_signal_path,  # In signals folder
+                        ]
+                        for p in possible_paths:
+                            if p.exists():
+                                signal_file_found = p
+                                break
+                    
+                    if signal_file_found:
+                        st.success(f"Original file found: `{signal_file_found}`")
+                        use_original = st.checkbox("Use original file from disk", value=True, key="rerun_use_original")
+                    else:
+                        use_original = False
+                        if suite_signal_path:
+                            st.warning(f"Original file not found: `{suite_signal_path}`")
+                    
+                    rerun_uploaded = None
+                    if not use_original:
+                        rerun_uploaded = st.file_uploader(
+                            "Upload signal file", 
+                            type=['parquet', 'csv', 'pkl', 'pickle'],
+                            key="rerun_signal_upload",
+                            help=f"Expected: {suite_signal_path}" if suite_signal_path else "Upload signal file"
+                        )
                     
                     rerun_signal_name = st.text_input("Signal Name", value=signal_name_from_run, key="rerun_signal_name")
                     rerun_log_mlflow = st.checkbox("Log to MLflow", value=True, key="rerun_log_mlflow")
                     
                     # Rerun button
                     if st.button("Run Suite", type="primary", key="rerun_execute_btn"):
-                        if rerun_uploaded is None:
+                        if not use_original and rerun_uploaded is None:
                             st.error("Please upload a signal file to rerun.")
                         elif not rerun_lags:
                             st.error("Please select at least one lag value.")
@@ -835,6 +900,7 @@ def main():
                             # Store config in session state and trigger rerun
                             st.session_state['rerun_config'] = {
                                 'uploaded': rerun_uploaded,
+                                'signal_path_on_disk': str(signal_file_found) if use_original and signal_file_found else None,
                                 'signal_name': rerun_signal_name,
                                 'lags': rerun_lags,
                                 'resid_opts': rerun_resid,
@@ -843,7 +909,7 @@ def main():
                                 'end_date': rerun_end,
                                 'universe_filter': rerun_universe,
                                 'log_to_mlflow': rerun_log_mlflow,
-                                'snapshot': selected_run.get('tags.snapshot_id', selected_snapshot) if 'selected_snapshot' in dir() else None,
+                                'snapshot': rerun_snapshot,
                             }
                             st.session_state['trigger_rerun'] = True
                             st.rerun()
