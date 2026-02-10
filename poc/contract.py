@@ -120,7 +120,7 @@ def prepare_signal(
     df: pd.DataFrame,
     datefile: pd.DataFrame,
     lag: int = 0,
-    avail_hour: int = 16,
+    avail_hour: int = 8,
     validate: bool = True,
 ) -> pd.DataFrame:
     """
