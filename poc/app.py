@@ -520,8 +520,9 @@ def main():
                 year_breakdown = load_artifact('year_breakdown', 'csv')
                 
                 # ============================================================
-                # SECTION 1: SUMMARY & VERDICT (Top of page)
+                # 1) VERDICT (Decision)
                 # ============================================================
+                st.subheader("1. Verdict")
                 
                 # Get metrics first (needed for multiple sections)
                 sharpe = selected_run.get('metrics.best_sharpe', None)
@@ -543,14 +544,14 @@ def main():
                         if sharpe is None and 'sharpe' in best_row:
                             sharpe = best_row['sharpe']
                 
-                # Verdict Panel with proper colored container
+                # Verdict Panel with grade badge
                 if verdict_data:
                     verdict_color = verdict_data.get('color', 'yellow')
                     verdict_reasons = verdict_data.get('reasons', [])
                     grade = composite_score_data.get('grade', '-') if composite_score_data else '-'
                     total_score = composite_score_data.get('total_score', 0) if composite_score_data else 0
                     
-                    # Color mapping for verdict
+                    # Color mapping
                     bg_colors = {'green': '#d4edda', 'yellow': '#fff3cd', 'red': '#f8d7da'}
                     border_colors = {'green': '#c3e6cb', 'yellow': '#ffeeba', 'red': '#f5c6cb'}
                     text_colors = {'green': '#155724', 'yellow': '#856404', 'red': '#721c24'}
@@ -561,19 +562,18 @@ def main():
                     text_col = text_colors.get(verdict_color, '#212529')
                     grade_col = grade_colors.get(grade, '#6c757d')
                     
-                    # Build reasons HTML
                     reasons_html = ''.join([f'<li style="margin: 4px 0;">{r}</li>' for r in verdict_reasons])
                     
                     verdict_html = f'''
-                    <div style="background: {bg}; border: 1px solid {border}; border-radius: 8px; padding: 20px; margin-bottom: 20px;">
+                    <div style="background: {bg}; border: 1px solid {border}; border-radius: 8px; padding: 20px; margin-bottom: 16px;">
                         <div style="display: flex; justify-content: space-between; align-items: flex-start;">
                             <div style="flex: 1;">
                                 <h3 style="color: {text_col}; margin: 0 0 12px 0;">Verdict: {verdict_color.upper()}</h3>
-                                <ul style="color: {text_col}; margin: 0; padding-left: 20px;">
+                                <ul style="color: {text_col}; margin: 0; padding-left: 20px; font-size: 14px;">
                                     {reasons_html}
                                 </ul>
                             </div>
-                            <div style="text-align: center; margin-left: 30px;">
+                            <div style="text-align: center; margin-left: 30px; min-width: 80px;">
                                 <div style="font-size: 48px; font-weight: bold; color: {grade_col};">{grade}</div>
                                 <div style="font-size: 14px; color: #666;">{total_score:.0f}/100</div>
                             </div>
@@ -584,7 +584,7 @@ def main():
                 else:
                     st.info("Verdict not available. Re-run this signal to generate verdict data.")
                 
-                # Headline Metrics
+                # Headline Metrics row
                 met_col1, met_col2, met_col3, met_col4 = st.columns(4)
                 with met_col1:
                     st.metric("Sharpe Ratio", f"{sharpe:.2f}" if sharpe else "N/A")
@@ -595,63 +595,27 @@ def main():
                 with met_col4:
                     st.metric("Turnover", f"{turnover:.1%}" if turnover else "N/A")
                 
-                # ============================================================
-                # SECTION 2: QUALITY ANALYSIS
-                # ============================================================
-                st.divider()
-                
-                # Quality Score Breakdown + Robustness side by side
-                qual_col1, qual_col2 = st.columns(2)
-                
-                with qual_col1:
-                    st.subheader("Quality Score Breakdown")
-                    if composite_score_data:
-                        breakdown = composite_score_data.get('breakdown', {})
-                        if breakdown:
-                            breakdown_rows = []
-                            for name, data in breakdown.items():
-                                breakdown_rows.append({
-                                    'Metric': name.replace('_', ' ').title(),
-                                    'Score': f"{data.get('score', 0):.0f}",
-                                    'Weight': f"{data.get('weight', 0) * 100:.0f}%",
-                                    'Weighted': f"{data.get('weighted', 0):.1f}",
-                                })
-                            breakdown_df = pd.DataFrame(breakdown_rows)
-                            st.dataframe(breakdown_df, hide_index=True, use_container_width=True)
-                    else:
-                        st.caption("Re-run to generate quality score data")
-                
-                with qual_col2:
-                    st.subheader("Robustness Analysis")
-                    
-                    # Performance by Market Cap
-                    st.markdown("**By Market Cap**")
-                    if cap_breakdown is not None and len(cap_breakdown) > 0:
-                        st.dataframe(cap_breakdown.style.format({
-                            'Sharpe': '{:.2f}',
-                            'Ann Return': '{:.2%}',
-                            'Max DD': '{:.2%}',
-                            'Turnover': '{:.2%}',
-                        }, na_rep='N/A'), hide_index=True, use_container_width=True)
-                    else:
-                        st.caption("Re-run to generate cap breakdown")
-                    
-                    # Performance by Year
-                    st.markdown("**By Year**")
-                    if year_breakdown is not None and len(year_breakdown) > 0:
-                        st.dataframe(year_breakdown.style.format({
-                            'Sharpe': '{:.2f}',
-                            'Ann Return': '{:.2%}',
-                            'Max DD': '{:.2%}',
-                        }, na_rep='N/A'), hide_index=True, use_container_width=True)
-                    else:
-                        st.caption("Re-run to generate year breakdown")
+                # Quality Score Breakdown
+                if composite_score_data:
+                    breakdown = composite_score_data.get('breakdown', {})
+                    if breakdown:
+                        st.markdown("**Quality Score Breakdown**")
+                        breakdown_rows = []
+                        for name, data in breakdown.items():
+                            breakdown_rows.append({
+                                'Metric': name.replace('_', ' ').title(),
+                                'Score': f"{data.get('score', 0):.0f}",
+                                'Weight': f"{data.get('weight', 0) * 100:.0f}%",
+                                'Weighted': f"{data.get('weighted', 0):.1f}",
+                            })
+                        breakdown_df = pd.DataFrame(breakdown_rows)
+                        st.dataframe(breakdown_df, hide_index=True, use_container_width=True)
                 
                 # ============================================================
-                # SECTION 3: PERFORMANCE CHARTS
+                # 2) PERFORMANCE & RISK (What happened)
                 # ============================================================
                 st.divider()
-                st.subheader("Performance")
+                st.subheader("2. Performance & Risk")
                 
                 # Cumulative Returns
                 if daily_df is not None and 'date' in daily_df.columns and 'cumret' in daily_df.columns:
@@ -704,61 +668,118 @@ def main():
                     st.plotly_chart(lag_fig, use_container_width=True, key="history_lag_sensitivity")
                 
                 # ============================================================
-                # SECTION 4: SIGNAL DETAILS
+                # 3) RELIABILITY (Will it hold up?)
                 # ============================================================
                 st.divider()
-                st.subheader("Signal Details")
+                st.subheader("3. Reliability")
                 
-                detail_col1, detail_col2 = st.columns(2)
+                rel_col1, rel_col2 = st.columns(2)
                 
-                with detail_col1:
-                    # Information Coefficient (IC)
-                    st.markdown("**Information Coefficient (IC)**")
-                    if ic_stats:
-                        ic_col1, ic_col2 = st.columns(2)
-                        with ic_col1:
-                            st.metric("Mean IC", f"{ic_stats.get('mean', 0):.4f}")
-                            st.metric("Hit Rate", f"{ic_stats.get('hit_rate', 0):.1f}%")
-                        with ic_col2:
-                            st.metric("t-Statistic", f"{ic_stats.get('t_stat', 0):.2f}")
-                            st.metric("Info Ratio", f"{ic_stats.get('ir', 0):.2f}")
-                        
-                        if ic_series is not None and len(ic_series) > 0:
-                            ic_fig = plot_ic_over_time(ic_series)
-                            st.plotly_chart(ic_fig, use_container_width=True, key="history_ic")
+                with rel_col1:
+                    st.markdown("**Performance by Market Cap**")
+                    if cap_breakdown is not None and len(cap_breakdown) > 0:
+                        st.dataframe(cap_breakdown.style.format({
+                            'Sharpe': '{:.2f}',
+                            'Ann Return': '{:.2%}',
+                            'Max DD': '{:.2%}',
+                            'Turnover': '{:.2%}',
+                        }, na_rep='N/A'), hide_index=True, use_container_width=True)
                     else:
-                        st.caption("No IC data available")
+                        st.caption("Re-run to generate cap breakdown")
                 
-                with detail_col2:
-                    # Factor Exposures
+                with rel_col2:
+                    st.markdown("**Performance by Year**")
+                    if year_breakdown is not None and len(year_breakdown) > 0:
+                        st.dataframe(year_breakdown.style.format({
+                            'Sharpe': '{:.2f}',
+                            'Ann Return': '{:.2%}',
+                            'Max DD': '{:.2%}',
+                        }, na_rep='N/A'), hide_index=True, use_container_width=True)
+                    else:
+                        st.caption("Re-run to generate year breakdown")
+                
+                # ============================================================
+                # 4) SIGNAL HEALTH (Why it should work)
+                # ============================================================
+                st.divider()
+                st.subheader("4. Signal Health")
+                
+                # Load coverage time series
+                coverage_series = load_artifact('coverage_series', 'parquet')
+                
+                # --- IC Section ---
+                st.markdown("**Information Coefficient (IC)**")
+                if ic_stats:
+                    # IC metrics in a single row
+                    ic_col1, ic_col2, ic_col3, ic_col4 = st.columns(4)
+                    with ic_col1:
+                        st.metric("Mean IC", f"{ic_stats.get('mean', 0):.4f}")
+                    with ic_col2:
+                        st.metric("t-Statistic", f"{ic_stats.get('t_stat', 0):.2f}")
+                    with ic_col3:
+                        st.metric("Hit Rate", f"{ic_stats.get('hit_rate', 0):.1f}%")
+                    with ic_col4:
+                        st.metric("Info Ratio", f"{ic_stats.get('ir', 0):.2f}")
+                    
+                    # IC chart full width
+                    if ic_series is not None and len(ic_series) > 0:
+                        ic_fig = plot_ic_over_time(ic_series)
+                        st.plotly_chart(ic_fig, use_container_width=True, key="history_ic")
+                else:
+                    st.caption("No IC data available")
+                
+                # --- Coverage Section ---
+                st.markdown("**Coverage**")
+                if coverage:
+                    cov_col1, cov_col2, cov_col3 = st.columns(3)
+                    with cov_col1:
+                        st.metric("Avg Securities/Day", f"{coverage.get('avg_securities_per_day', 0):.0f}")
+                    with cov_col2:
+                        st.metric("Unique Securities", coverage.get('unique_securities', 'N/A'))
+                    with cov_col3:
+                        st.metric("Total Days", coverage.get('total_days', 'N/A'))
+                    
+                    # Coverage over time chart
+                    if coverage_series is not None and len(coverage_series) > 0:
+                        coverage_fig = px.line(
+                            coverage_series, x='date', y='count',
+                            title='Signal Coverage Over Time'
+                        )
+                        coverage_fig.update_layout(
+                            xaxis_title='Date',
+                            yaxis_title='Securities with Signal',
+                            showlegend=False
+                        )
+                        st.plotly_chart(coverage_fig, use_container_width=True, key="history_coverage")
+                else:
+                    st.caption("No coverage data available")
+                
+                # --- Factor Exposures & Correlations side by side ---
+                factor_col, corr_col = st.columns(2)
+                
+                with factor_col:
                     st.markdown("**Factor Exposures**")
                     if factor_exposures is not None and len(factor_exposures) > 0:
                         factor_fig = plot_factor_exposure_bars(factor_exposures)
                         st.plotly_chart(factor_fig, use_container_width=True, key="history_factor_exposure")
                     else:
                         st.caption("No factor exposure data")
-                    
-                    # Coverage
-                    if coverage:
-                        st.markdown("**Coverage**")
-                        cov_col1, cov_col2 = st.columns(2)
-                        with cov_col1:
-                            st.metric("Avg Securities/Day", f"{coverage.get('avg_securities_per_day', 0):.0f}")
-                        with cov_col2:
-                            st.metric("Total Days", coverage.get('total_days', 'N/A'))
                 
-                # Baseline Correlations (full width)
-                if correlations is not None and len(correlations) > 0:
+                with corr_col:
                     st.markdown("**Baseline Correlations**")
-                    st.dataframe(correlations.style.format({
-                        'signal_corr': '{:.3f}',
-                        'pnl_corr': '{:.3f}',
-                    }, na_rep='N/A'), use_container_width=True)
+                    if correlations is not None and len(correlations) > 0:
+                        st.dataframe(correlations.style.format({
+                            'signal_corr': '{:.3f}',
+                            'pnl_corr': '{:.3f}',
+                        }, na_rep='N/A'), hide_index=True, use_container_width=True)
+                    else:
+                        st.caption("No baseline correlations available")
                 
                 # ============================================================
-                # SECTION 5: RUN INFO (Collapsible at bottom)
+                # 5) RUN DETAILS (Audit trail)
                 # ============================================================
-                with st.expander("Run Details & Reproducibility", expanded=False):
+                st.divider()
+                with st.expander("5. Run Details (Audit Trail)", expanded=False):
                     # Experiment metadata
                     col1, col2, col3, col4 = st.columns(4)
                     with col1:

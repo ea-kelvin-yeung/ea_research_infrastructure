@@ -196,6 +196,14 @@ def log_run(
                 json.dump(suite_result.coverage, f, indent=2, default=str)
             mlflow.log_artifact(str(coverage_path))
         
+        # Log coverage time series for chart
+        if signal_df is not None and 'date_sig' in signal_df.columns:
+            coverage_ts = signal_df.groupby('date_sig').size().reset_index(name='count')
+            coverage_ts.columns = ['date', 'count']
+            coverage_ts_path = Path('artifacts') / f"{signal_name}_coverage_series.parquet"
+            coverage_ts.to_parquet(coverage_ts_path, index=False)
+            mlflow.log_artifact(str(coverage_ts_path))
+        
         # Log verdict as JSON
         verdict = compute_verdict(suite_result)
         verdict_path = Path('artifacts') / f"{signal_name}_verdict.json"
