@@ -949,6 +949,43 @@ ret_ranks = ret_day.argsort().argsort()
 corr = cov(sig_ranks, ret_ranks) / (std(sig_ranks) * std(ret_ranks))
 ```
 
+##### IC Forward-Looking Date Alignment (Bug Fix)
+
+**Problem:** The original IC calculation correlated signals with **same-day returns** instead of **forward returns**, causing:
+- Contemporaneous correlation instead of predictive correlation
+- Mechanical negative IC for reversal-type signals (signal includes today's return, correlated with today's return)
+- Mismatch between IC metrics and decile returns (which correctly use forward returns)
+
+**Symptoms:**
+- IC consistently negative (~-0.30) while decile spread shows positive relationship (+16% spread)
+- 0% hit rate despite strong monotonic decile performance
+- IC and backtest results telling opposite stories
+
+**Fix:** Look up returns at `date_avail + 1` (or `date_sig + 1` if no `date_avail`) to measure true predictive power:
+
+```python
+# Before (buggy - same-day returns)
+lookup_idx = pd.MultiIndex.from_arrays(
+    [signal['security_id'].values, signal['date_sig'].values],  # Same day!
+    names=['security_id', 'date']
+)
+
+# After (fixed - forward returns)
+signal['lookup_date'] = signal[sig_date_col] + pd.Timedelta(days=1)  # Next day
+lookup_idx = pd.MultiIndex.from_arrays(
+    [signal['security_id'].values, signal['lookup_date'].values],
+    names=['security_id', 'date']
+)
+```
+
+**Date alignment logic:**
+| Signal Date Column | Return Lookup Date | Rationale |
+|--------------------|-------------------|-----------|
+| `date_avail` | `date_avail + 1` | Signal available at open, trade at close, return realized next day |
+| `date_sig` (fallback) | `date_sig + 1` | Assume 1-day delay to availability |
+
+This ensures IC measures the same predictive relationship as the backtest engine.
+
 #### 3. Fast Factor Exposures
 
 Uses pre-indexed `factors` DataFrame from catalog:

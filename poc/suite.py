@@ -389,17 +389,29 @@ def _compute_ic(signal_df: pd.DataFrame, catalog: dict) -> tuple:
     if 'signal' not in signal_df.columns:
         return None, None
     
+    # Determine which date column to use for the signal date
+    # We'll group IC by this date for the time series
+    if 'date_avail' in signal_df.columns:
+        sig_date_col = 'date_avail'
+    else:
+        sig_date_col = 'date_sig'
+    
     # Get returns data - prefer master_data (pre-indexed)
     master_data = catalog.get('master')
     if master_data is not None:
         # Fast path: use pre-indexed master_data
-        signal = signal_df[['security_id', 'date_sig', 'signal']].copy()
+        signal = signal_df[['security_id', sig_date_col, 'signal']].copy()
         signal['security_id'] = signal['security_id'].astype(np.int32)
-        signal['date_sig'] = pd.to_datetime(signal['date_sig'])
+        signal[sig_date_col] = pd.to_datetime(signal[sig_date_col])
         
-        # Build lookup index
+        # Look up forward return: return on the NEXT trading day after signal is available
+        # This ensures IC measures predictive power, not contemporaneous correlation
+        # Note: Using calendar day + 1; for exact trading day alignment, would need datefile
+        signal['lookup_date'] = signal[sig_date_col] + pd.Timedelta(days=1)
+        
+        # Build lookup index using the forward-looking date
         lookup_idx = pd.MultiIndex.from_arrays(
-            [signal['security_id'].values, signal['date_sig'].values],
+            [signal['security_id'].values, signal['lookup_date'].values],
             names=['security_id', 'date']
         )
         
@@ -413,23 +425,29 @@ def _compute_ic(signal_df: pd.DataFrame, catalog: dict) -> tuple:
         # Build merged DataFrame using numpy take
         merged = signal.loc[valid_mask].copy()
         merged['fwd_ret'] = np.take(master_data['ret'].values, positions[valid_mask])
+        # Use signal date for grouping IC by date (not the return date)
+        merged['date_sig'] = merged[sig_date_col]
     else:
         # Fallback to merge
         ret_df = catalog.get('ret')
         if ret_df is None or 'ret' not in ret_df.columns:
             return None, None
         
-        signal = signal_df[['security_id', 'date_sig', 'signal']].copy()
-        signal['date_sig'] = pd.to_datetime(signal['date_sig'])
+        signal = signal_df[['security_id', sig_date_col, 'signal']].copy()
+        signal[sig_date_col] = pd.to_datetime(signal[sig_date_col])
+        
+        # Look up forward return: return on the NEXT day after signal is available
+        signal['lookup_date'] = signal[sig_date_col] + pd.Timedelta(days=1)
         
         ret = ret_df[['security_id', 'date', 'ret']].copy()
         ret['date'] = pd.to_datetime(ret['date'])
         
         merged = signal.merge(
-            ret.rename(columns={'date': 'date_sig', 'ret': 'fwd_ret'}),
-            on=['security_id', 'date_sig'],
+            ret.rename(columns={'date': 'lookup_date', 'ret': 'fwd_ret'}),
+            on=['security_id', 'lookup_date'],
             how='inner'
         )
+        merged['date_sig'] = merged[sig_date_col]
     
     if len(merged) == 0:
         return None, None
