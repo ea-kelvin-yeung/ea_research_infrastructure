@@ -249,6 +249,134 @@ TEARSHEET_TEMPLATE = """
 """
 
 
+def compute_verdict_from_summary(
+    summary_df: pd.DataFrame,
+    correlations: Optional[pd.DataFrame] = None,
+    factor_exposures: Optional[pd.DataFrame] = None,
+    cap_breakdown: Optional[pd.DataFrame] = None,
+    year_breakdown: Optional[pd.DataFrame] = None,
+) -> Dict:
+    """
+    Compute verdict from summary DataFrame (for use with cached artifacts).
+    
+    Returns:
+        {'color': 'green'/'yellow'/'red', 'reasons': [...]}
+    """
+    reasons = []
+    
+    # Filter to signal configs only
+    if 'type' in summary_df.columns:
+        signal_summary = summary_df[summary_df['type'] == 'signal']
+    else:
+        signal_summary = summary_df
+    
+    if len(signal_summary) == 0:
+        return {'color': 'red', 'reasons': ['No valid backtest results']}
+    
+    # Get best config by Sharpe
+    best_row = signal_summary.loc[signal_summary['sharpe'].idxmax()]
+    sharpe = best_row['sharpe']
+    turnover = best_row.get('turnover', 0)
+    max_dd = best_row.get('max_dd', 0)
+    
+    if np.isnan(sharpe):
+        return {'color': 'red', 'reasons': ['Best config has NaN Sharpe']}
+    
+    # Check Sharpe decay with lag
+    sharpe_decay = False
+    lag0_row = signal_summary[signal_summary['config'] == 'lag0_residoff']
+    if len(lag0_row) > 0:
+        s0 = lag0_row['sharpe'].iloc[0]
+        if not np.isnan(s0) and s0 > 0:
+            for lag in [1, 2, 3, 5]:
+                lag_key = f'lag{lag}_residoff'
+                lag_row = signal_summary[signal_summary['config'] == lag_key]
+                if len(lag_row) > 0:
+                    s_lag = lag_row['sharpe'].iloc[0]
+                    if not np.isnan(s_lag):
+                        retention = s_lag / s0
+                        thresholds = {1: 0.7, 2: 0.6, 3: 0.5, 5: 0.4}
+                        threshold = thresholds.get(lag, 0.5)
+                        if retention < threshold:
+                            sharpe_decay = True
+                            reasons.append(f"Sharpe decays with lag (lag0: {s0:.2f} -> lag{lag}: {s_lag:.2f}, {retention*100:.0f}% retained)")
+                            break
+    
+    # Check residualization impact
+    resid_sensitive = False
+    off_row = signal_summary[signal_summary['config'] == 'lag0_residoff']
+    on_row = signal_summary[signal_summary['config'] == 'lag0_residindustry']
+    if len(off_row) > 0 and len(on_row) > 0:
+        s_off = off_row['sharpe'].iloc[0]
+        s_on = on_row['sharpe'].iloc[0]
+        if not np.isnan(s_off) and not np.isnan(s_on) and s_off > 0 and (s_on / s_off) < 0.5:
+            resid_sensitive = True
+            reasons.append(f"Signal doesn't survive industry neutralization ({s_off:.2f} -> {s_on:.2f})")
+    
+    # Check baseline correlation
+    high_baseline_corr = False
+    if correlations is not None and len(correlations) > 0:
+        for _, row in correlations.iterrows():
+            if abs(row.get('signal_corr', 0)) > 0.5:
+                high_baseline_corr = True
+                reasons.append(f"High correlation with {row.get('baseline', 'unknown')}: {row['signal_corr']:.2f}")
+    
+    # Check factor exposures
+    high_factor_exposure = False
+    if factor_exposures is not None and len(factor_exposures) > 0:
+        for _, row in factor_exposures.iterrows():
+            if abs(row.get('correlation', 0)) > 0.3:
+                high_factor_exposure = True
+                reasons.append(f"High {row.get('factor', 'unknown')} factor exposure: {row['correlation']:.2f}")
+    
+    # Check cap breakdown
+    small_cap_driven = False
+    if cap_breakdown is not None and len(cap_breakdown) > 0 and 'Sharpe' in cap_breakdown.columns:
+        cap_col = 'Cap Tier' if 'Cap Tier' in cap_breakdown.columns else cap_breakdown.columns[0]
+        cap_sharpes = cap_breakdown.set_index(cap_col)['Sharpe']
+        small_sharpe = cap_sharpes.get('Small Cap', np.nan)
+        large_sharpe = cap_sharpes.get('Large Cap', np.nan)
+        if not np.isnan(small_sharpe) and not np.isnan(large_sharpe):
+            if large_sharpe > 0 and small_sharpe / large_sharpe > 2.0:
+                small_cap_driven = True
+                reasons.append(f"Driven by small caps (Small: {small_sharpe:.2f} vs Large: {large_sharpe:.2f})")
+            elif large_sharpe <= 0 and small_sharpe > 0.5:
+                small_cap_driven = True
+                reasons.append(f"Only works in small caps (Small: {small_sharpe:.2f} vs Large: {large_sharpe:.2f})")
+    
+    # Check year breakdown
+    year_inconsistent = False
+    if year_breakdown is not None and len(year_breakdown) >= 2 and 'Sharpe' in year_breakdown.columns:
+        year_sharpes = year_breakdown['Sharpe'].dropna()
+        if len(year_sharpes) >= 2:
+            neg_years = (year_sharpes < 0).sum()
+            total_years = len(year_sharpes)
+            if neg_years >= total_years / 2:
+                year_inconsistent = True
+                reasons.append(f"Inconsistent across years ({neg_years}/{total_years} years negative)")
+    
+    # Determine color
+    if sharpe >= 1.0 and not sharpe_decay and not resid_sensitive and not high_baseline_corr and not small_cap_driven and not year_inconsistent:
+        color = 'green'
+        reasons.insert(0, f"Strong Sharpe ratio: {sharpe:.2f}")
+        reasons.append("Survives lag and residualization tests")
+        reasons.append("Low correlation to standard baselines")
+        reasons.append("Consistent across cap tiers and years")
+    elif sharpe >= 0.5:
+        color = 'yellow'
+        if sharpe < 1.0:
+            reasons.insert(0, f"Moderate Sharpe ratio: {sharpe:.2f}")
+        if turnover > 2.0:
+            reasons.append(f"High turnover: {turnover:.1%}")
+        if max_dd < -0.3:
+            reasons.append(f"Large max drawdown: {max_dd:.1%}")
+    else:
+        color = 'red'
+        reasons.insert(0, f"Weak Sharpe ratio: {sharpe:.2f}")
+    
+    return {'color': color, 'reasons': reasons}
+
+
 def compute_verdict(suite_result: SuiteResult) -> Dict:
     """
     Compute traffic-light verdict from suite results.
@@ -272,18 +400,27 @@ def compute_verdict(suite_result: SuiteResult) -> Dict:
     if np.isnan(sharpe):
         return {'color': 'red', 'reasons': ['Best config has NaN Sharpe - insufficient data']}
     
-    # Check Sharpe decay with lag
-    lag0_key = 'lag0_residoff'
-    lag1_key = 'lag1_residoff'
-    lag2_key = 'lag2_residoff'
-    
+    # Check Sharpe decay with lag - check all available lags
     sharpe_decay = False
-    if lag0_key in suite_result.results and lag2_key in suite_result.results:
+    lag0_key = 'lag0_residoff'
+    if lag0_key in suite_result.results:
         s0 = suite_result.results[lag0_key].sharpe
-        s2 = suite_result.results[lag2_key].sharpe
-        if not np.isnan(s0) and not np.isnan(s2) and s0 > 0 and (s2 / s0) < 0.5:
-            sharpe_decay = True
-            reasons.append(f"Sharpe decays significantly with lag (lag0: {s0:.2f} -> lag2: {s2:.2f})")
+        if not np.isnan(s0) and s0 > 0:
+            # Check all higher lags for decay
+            for lag in [1, 2, 3, 5]:
+                lag_key = f'lag{lag}_residoff'
+                if lag_key in suite_result.results:
+                    s_lag = suite_result.results[lag_key].sharpe
+                    if not np.isnan(s_lag):
+                        retention = s_lag / s0
+                        # Flag if decay exceeds threshold for that lag
+                        # lag1: 70%, lag2: 60%, lag3: 50%, lag5: 40%
+                        thresholds = {1: 0.7, 2: 0.6, 3: 0.5, 5: 0.4}
+                        threshold = thresholds.get(lag, 0.5)
+                        if retention < threshold:
+                            sharpe_decay = True
+                            reasons.append(f"Sharpe decays with lag (lag0: {s0:.2f} -> lag{lag}: {s_lag:.2f}, {retention*100:.0f}% retained)")
+                            break  # Only report the first significant decay
     
     # Check residualization impact
     resid_sensitive = False

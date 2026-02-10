@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from poc.catalog import load_catalog, list_snapshots, create_snapshot
 from poc.suite import run_suite, DEFAULT_GRID
-from poc.tearsheet import generate_tearsheet, compute_verdict, compute_composite_score, _extract_cap_breakdown, _extract_year_breakdown
+from poc.tearsheet import generate_tearsheet, compute_verdict, compute_verdict_from_summary, compute_composite_score, _extract_cap_breakdown, _extract_year_breakdown
 from poc.suite import get_best_config
 
 
@@ -537,10 +537,21 @@ def main():
                 factor_exposures = load_artifact('factor_exposures', 'parquet')
                 correlations = load_artifact('correlations', 'parquet')
                 coverage = load_artifact('coverage', 'json')
-                verdict_data = load_artifact('verdict', 'json')
                 composite_score_data = load_artifact('composite_score', 'json')
                 cap_breakdown = load_artifact('cap_breakdown', 'csv')
                 year_breakdown = load_artifact('year_breakdown', 'csv')
+                
+                # Recompute verdict from summary data (ensures latest logic is used)
+                if summary_df is not None and len(summary_df) > 0:
+                    verdict_data = compute_verdict_from_summary(
+                        summary_df,
+                        correlations=correlations,
+                        factor_exposures=factor_exposures,
+                        cap_breakdown=cap_breakdown,
+                        year_breakdown=year_breakdown,
+                    )
+                else:
+                    verdict_data = load_artifact('verdict', 'json')
                 
                 # ============================================================
                 # 1) VERDICT (Decision)
