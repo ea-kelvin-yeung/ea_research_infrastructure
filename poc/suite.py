@@ -121,7 +121,9 @@ def run_suite(
                 baselines[name] = run_backtest(baseline_df, catalog, config, validate=False)
                 print(f"  {name}: Sharpe = {baselines[name].sharpe:.2f}")
             except Exception as e:
+                import traceback
                 print(f"  {name}: Failed - {e}")
+                print(f"    Traceback: {traceback.format_exc()}")
     
     # Build summary table
     summary = _build_summary(results, baselines)

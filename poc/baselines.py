@@ -41,9 +41,9 @@ def _filter_dates(df: pd.DataFrame, date_col: str, start_date: Optional[str], en
 def _compute_reversal(ret_df: pd.DataFrame, lookback: int, start_date: str, end_date: str, catalog_hash: str) -> pd.DataFrame:
     """Cached reversal computation."""
     ret = ret_df[['security_id', 'date', 'ret']].copy()
-    ret = _filter_dates(ret, 'date', start_date, end_date)
     ret = ret.sort_values(['security_id', 'date'])
     
+    # Compute rolling return BEFORE filtering dates (need lookback period data)
     ret['cum_ret'] = ret.groupby('security_id')['ret'].transform(
         lambda x: (1 + x).rolling(lookback, min_periods=lookback).apply(
             lambda y: y.prod() - 1, raw=True
@@ -51,8 +51,13 @@ def _compute_reversal(ret_df: pd.DataFrame, lookback: int, start_date: str, end_
     )
     ret['signal'] = -ret['cum_ret']
     
+    # Filter to requested date range AFTER computing
+    ret = _filter_dates(ret, 'date', start_date, end_date)
+    
     result = ret[['security_id', 'date', 'signal']].copy()
     result = result.rename(columns={'date': 'date_sig'})
+    # Ensure datetime64[ns] for compatibility with catalog (avoid merge dtype mismatch)
+    result['date_sig'] = pd.to_datetime(result['date_sig']).astype('datetime64[ns]')
     result['date_avail'] = result['date_sig'] + pd.Timedelta(days=1)
     return result.dropna()
 
@@ -88,6 +93,8 @@ def _compute_momentum(ret_df: pd.DataFrame, lookback: int, skip: int, start_date
     
     result = ret[['security_id', 'date', 'signal']].copy()
     result = result.rename(columns={'date': 'date_sig'})
+    # Ensure datetime64[ns] for compatibility with catalog
+    result['date_sig'] = pd.to_datetime(result['date_sig']).astype('datetime64[ns]')
     result['date_avail'] = result['date_sig'] + pd.Timedelta(days=1)
     return result.dropna()
 
@@ -115,6 +122,8 @@ def _compute_value(risk_df: pd.DataFrame, start_date: str, end_date: str, catalo
     risk = _filter_dates(risk, 'date', start_date, end_date)
     
     result = risk.rename(columns={'date': 'date_sig', 'value': 'signal'})
+    # Ensure datetime64[ns] for compatibility with catalog
+    result['date_sig'] = pd.to_datetime(result['date_sig']).astype('datetime64[ns]')
     result['date_avail'] = result['date_sig'] + pd.Timedelta(days=1)
     return result.dropna()
 
