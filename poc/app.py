@@ -17,7 +17,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from poc.catalog import load_catalog, list_snapshots, create_snapshot
 from poc.suite import run_suite, DEFAULT_GRID
-from poc.tearsheet import generate_tearsheet
+from poc.tearsheet import generate_tearsheet, compute_verdict, compute_composite_score, _extract_cap_breakdown, _extract_year_breakdown
+from poc.suite import get_best_config
 
 
 @st.cache_resource(show_spinner="Loading data snapshot...")
@@ -129,7 +130,7 @@ def main():
         )
     
     # Main area - tabs
-    tab1, tab2, tab3, tab4 = st.tabs(["Run Suite", "Results", "Compare", "History"])
+    tab1, tab2, tab3 = st.tabs(["Run Suite", "Compare", "History"])
     
     # Tab 1: Run Suite
     with tab1:
@@ -251,7 +252,7 @@ def main():
                 
                 # Final summary
                 total_time = time.time() - total_start
-                st.success(f"Suite completed in {total_time:.1f}s! Check the Results tab.")
+                st.success(f"Suite completed in {total_time:.1f}s! Check the History tab to view results.")
                 
             except Exception as e:
                 st.error(f"Error: {e}")
@@ -261,174 +262,8 @@ def main():
         elif run_button and not uploaded:
             st.warning("Please upload a signal file first.")
     
-    # Tab 2: Results
+    # Tab 2: Compare
     with tab2:
-        if 'result' not in st.session_state:
-            st.info("Run a suite first to see results.")
-        else:
-            result = st.session_state['result']
-            signal_name = st.session_state.get('signal_name', 'signal')
-            
-            st.header(f"Results: {signal_name}")
-            
-            # Run Info expander for reproducibility
-            with st.expander("Run Info (Reproducibility)", expanded=False):
-                run_id = st.session_state.get('run_id', 'N/A')
-                git_sha = get_git_sha()
-                snapshot_id = st.session_state.get('snapshot_id', 'N/A')
-                signal_df = st.session_state.get('signal_df')
-                signal_hash = compute_signal_hash(signal_df) if signal_df is not None else 'N/A'
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.markdown("**MLflow Run ID:**")
-                    st.code(run_id, language=None)
-                    st.markdown("**Git SHA:**")
-                    st.code(git_sha, language=None)
-                with col2:
-                    st.markdown("**Data Snapshot:**")
-                    st.code(snapshot_id, language=None)
-                    st.markdown("**Signal Hash:**")
-                    st.code(signal_hash, language=None)
-                
-                # Reproducibility command
-                st.markdown("**Reproduce this run:**")
-                repro_cmd = f"# Load signal with hash {signal_hash}, snapshot {snapshot_id}, git checkout {git_sha}"
-                st.code(repro_cmd, language="bash")
-            
-            # Summary table
-            st.subheader("Suite Summary")
-            st.dataframe(
-                result.summary.style.format({
-                    'sharpe': '{:.2f}',
-                    'ann_ret': '{:.2%}',
-                    'max_dd': '{:.2%}',
-                    'turnover': '{:.2%}',
-                }),
-                width='stretch'
-            )
-            
-            # Cumulative return plot
-            st.subheader("Cumulative Returns")
-            
-            # Get available configs
-            signal_configs = list(result.results.keys())
-            baseline_configs = list(result.baselines.keys()) if result.baselines else []
-            
-            # Multiselect for which to show
-            col1, col2 = st.columns(2)
-            with col1:
-                selected_signals = st.multiselect(
-                    "Signal configs", signal_configs, 
-                    default=signal_configs, key="results_signals"
-                )
-            with col2:
-                selected_baselines = st.multiselect(
-                    "Baseline signals", baseline_configs,
-                    default=baseline_configs, key="results_baselines"
-                )
-            
-            # Collect daily series from selected configs
-            daily_data = []
-            for key in selected_signals:
-                res = result.results[key]
-                if 'cumret' in res.daily.columns:
-                    df = res.daily[['date', 'cumret']].copy()
-                    df['config'] = f"📊 {key}"
-                    df['type'] = 'signal'
-                    daily_data.append(df)
-            
-            # Add selected baselines
-            for name in selected_baselines:
-                if name in result.baselines:
-                    res = result.baselines[name]
-                    if 'cumret' in res.daily.columns:
-                        df = res.daily[['date', 'cumret']].copy()
-                        df['config'] = f"📈 {name}"
-                        df['type'] = 'baseline'
-                        daily_data.append(df)
-            
-            if daily_data:
-                combined = pd.concat(daily_data)
-                fig = px.line(combined, x='date', y='cumret', color='config', 
-                             title='Cumulative Return: Signal vs Baselines',
-                             line_dash='type')
-                fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02))
-                st.plotly_chart(fig, width='stretch', key="results_cumret")
-            else:
-                st.info("Select at least one config to display")
-            
-            # Lag Sensitivity Chart
-            st.subheader("Lag Sensitivity")
-            lag_fig = plot_lag_sensitivity(result, show_turnover=False)
-            st.plotly_chart(lag_fig, use_container_width=True, key="results_lag_sensitivity")
-            
-            # Signal Quality Charts section
-            st.subheader("Signal Quality Charts")
-            chart_col1, chart_col2 = st.columns(2)
-            
-            with chart_col1:
-                # Coverage over time
-                signal_df = st.session_state.get('signal_df')
-                if signal_df is not None:
-                    coverage_fig = plot_coverage_over_time(signal_df)
-                    st.plotly_chart(coverage_fig, width='stretch', key="results_coverage")
-                else:
-                    st.info("Signal data not available for coverage chart")
-                
-                # Factor Exposure bars
-                if result.factor_exposures is not None and len(result.factor_exposures) > 0:
-                    factor_fig = plot_factor_exposure_bars(result.factor_exposures)
-                    st.plotly_chart(factor_fig, width='stretch', key="results_factor_exposure")
-            
-            with chart_col2:
-                # Decile Returns - use best config's fractile data
-                best_key = list(result.results.keys())[0] if result.results else None
-                if best_key and result.results[best_key].fractile is not None:
-                    fractile_df = result.results[best_key].fractile
-                    decile_fig = plot_decile_returns(fractile_df)
-                    st.plotly_chart(decile_fig, width='stretch', key="results_decile")
-                else:
-                    st.info("No fractile data available")
-            
-            # Information Coefficient (IC)
-            st.subheader("Information Coefficient (IC)")
-            if result.ic_stats:
-                ic_col1, ic_col2, ic_col3, ic_col4 = st.columns(4)
-                with ic_col1:
-                    st.metric("Mean IC", f"{result.ic_stats['mean']:.4f}")
-                with ic_col2:
-                    st.metric("t-Statistic", f"{result.ic_stats['t_stat']:.2f}")
-                with ic_col3:
-                    st.metric("Hit Rate", f"{result.ic_stats['hit_rate']:.1f}%")
-                with ic_col4:
-                    st.metric("Info Ratio", f"{result.ic_stats['ir']:.2f}")
-                
-                # IC over time chart
-                if result.ic_series is not None and len(result.ic_series) > 0:
-                    ic_fig = plot_ic_over_time(result.ic_series)
-                    st.plotly_chart(ic_fig, width='stretch', key="results_ic")
-            else:
-                st.info("IC not available (requires signal and return data)")
-            
-            # Correlations
-            st.subheader("Baseline Correlations")
-            st.dataframe(result.correlations.style.format({
-                'signal_corr': '{:.3f}',
-                'pnl_corr': '{:.3f}',
-            }))
-            
-            # Tearsheet link
-            if 'tearsheet_path' in st.session_state:
-                st.subheader("Tear Sheet")
-                tearsheet_path = st.session_state['tearsheet_path']
-                st.markdown(f"[Open Tear Sheet]({tearsheet_path})")
-                
-                with open(tearsheet_path) as f:
-                    st.components.v1.html(f.read(), height=800, scrolling=True)
-    
-    # Tab 3: Compare
-    with tab3:
         st.header("Compare Runs")
         
         runs = get_cached_run_history()
@@ -561,8 +396,8 @@ def main():
                     else:
                         st.info("Daily data not available for one or both runs.")
     
-    # Tab 4: History
-    with tab4:
+    # Tab 3: History
+    with tab3:
         st.header("Past Experiments")
         
         col1, col2, col3 = st.columns([1, 1, 3])
@@ -649,29 +484,10 @@ def main():
             selected_run = runs_df[runs_df['label'] == selected_label].iloc[0]
             run_id = selected_run['run_id']
             
-            # Show experiment details
-            st.subheader("Experiment Details")
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Signal", selected_run.get('tags.signal_name', 'N/A'))
-            with col2:
-                st.metric("Data Snapshot", selected_run.get('tags.snapshot_id', 'N/A'))
-            with col3:
-                sharpe = selected_run.get('metrics.best_sharpe', None)
-                st.metric("Best Sharpe", f"{sharpe:.2f}" if sharpe else "N/A")
-            with col4:
-                st.metric("Git SHA", selected_run.get('tags.git_sha', 'N/A'))
-            
-            # Run Info expander
-            with st.expander("Reproducibility Info", expanded=False):
-                st.markdown("**Run ID:**")
-                st.code(run_id, language=None)
-                st.markdown("**Signal Hash:**")
-                st.code(selected_run.get('tags.signal_hash', 'N/A'), language=None)
-            
             # Load artifacts from MLflow
             try:
                 import mlflow
+                import json
                 client = mlflow.tracking.MlflowClient()
                 artifacts = client.list_artifacts(run_id)
                 artifact_names = [a.path for a in artifacts]
@@ -690,8 +506,6 @@ def main():
                             return pd.read_csv(local_path)
                     return None
                 
-                import json
-                
                 # Load all artifacts
                 daily_df = load_artifact('daily', 'parquet')
                 summary_df = load_artifact('summary', 'csv')
@@ -700,6 +514,134 @@ def main():
                 factor_exposures = load_artifact('factor_exposures', 'parquet')
                 correlations = load_artifact('correlations', 'parquet')
                 coverage = load_artifact('coverage', 'json')
+                verdict_data = load_artifact('verdict', 'json')
+                composite_score_data = load_artifact('composite_score', 'json')
+                cap_breakdown = load_artifact('cap_breakdown', 'csv')
+                year_breakdown = load_artifact('year_breakdown', 'csv')
+                
+                # === Verdict Panel (at top) ===
+                if verdict_data:
+                    verdict_color = verdict_data.get('color', 'yellow')
+                    verdict_reasons = verdict_data.get('reasons', [])
+                    
+                    if verdict_color == 'green':
+                        st.success(f"**Verdict: GREEN**")
+                    elif verdict_color == 'yellow':
+                        st.warning(f"**Verdict: YELLOW**")
+                    else:
+                        st.error(f"**Verdict: RED**")
+                    
+                    for reason in verdict_reasons:
+                        st.write(f"• {reason}")
+                else:
+                    st.caption("Verdict not available for this run. Re-run to generate verdict data.")
+                
+                # === Quality Score Breakdown ===
+                if composite_score_data:
+                    st.subheader("Quality Score Breakdown")
+                    score_col1, score_col2 = st.columns([1, 3])
+                    with score_col1:
+                        grade = composite_score_data.get('grade', 'N/A')
+                        total_score = composite_score_data.get('total_score', 0)
+                        grade_color = {'A': 'green', 'B': 'blue', 'C': 'orange', 'D': 'red', 'F': 'red'}.get(grade, 'gray')
+                        st.markdown(f"<h1 style='color: {grade_color}; text-align: center;'>{grade}</h1>", unsafe_allow_html=True)
+                        st.markdown(f"<p style='text-align: center;'>{total_score:.0f}/100</p>", unsafe_allow_html=True)
+                    
+                    with score_col2:
+                        breakdown = composite_score_data.get('breakdown', {})
+                        if breakdown:
+                            breakdown_rows = []
+                            for name, data in breakdown.items():
+                                breakdown_rows.append({
+                                    'Metric': name.replace('_', ' ').title(),
+                                    'Score': data.get('score', 0),
+                                    'Weight': f"{data.get('weight', 0) * 100:.0f}%",
+                                    'Weighted': data.get('weighted', 0),
+                                    'Detail': data.get('detail', '')
+                                })
+                            breakdown_df = pd.DataFrame(breakdown_rows)
+                            st.dataframe(breakdown_df, hide_index=True, use_container_width=True)
+                
+                # === Headline Metrics ===
+                st.subheader("Headline Metrics")
+                sharpe = selected_run.get('metrics.best_sharpe', None)
+                ann_ret = selected_run.get('metrics.best_ann_ret', None)
+                max_dd = selected_run.get('metrics.best_max_dd', None)
+                turnover = selected_run.get('metrics.best_turnover', None)
+                
+                # Backward compatibility: extract from summary_df if metrics not in run
+                if summary_df is not None and (ann_ret is None or max_dd is None or turnover is None):
+                    signal_rows = summary_df[summary_df['type'] == 'signal'] if 'type' in summary_df.columns else summary_df
+                    if len(signal_rows) > 0:
+                        # Find best config by sharpe
+                        if 'sharpe' in signal_rows.columns:
+                            best_row = signal_rows.loc[signal_rows['sharpe'].idxmax()]
+                            if ann_ret is None and 'ann_ret' in best_row:
+                                ann_ret = best_row['ann_ret']
+                            if max_dd is None and 'max_dd' in best_row:
+                                max_dd = best_row['max_dd']
+                            if turnover is None and 'turnover' in best_row:
+                                turnover = best_row['turnover']
+                            if sharpe is None and 'sharpe' in best_row:
+                                sharpe = best_row['sharpe']
+                
+                met_col1, met_col2, met_col3, met_col4 = st.columns(4)
+                with met_col1:
+                    st.metric("Sharpe Ratio", f"{sharpe:.2f}" if sharpe else "N/A")
+                with met_col2:
+                    st.metric("Annual Return", f"{ann_ret:.1%}" if ann_ret else "N/A")
+                with met_col3:
+                    st.metric("Max Drawdown", f"{max_dd:.1%}" if max_dd else "N/A")
+                with met_col4:
+                    st.metric("Turnover", f"{turnover:.1%}" if turnover else "N/A")
+                
+                # === Robustness Analysis ===
+                st.subheader("Robustness Analysis")
+                robust_col1, robust_col2 = st.columns(2)
+                
+                with robust_col1:
+                    st.markdown("**Performance by Market Cap**")
+                    if cap_breakdown is not None and len(cap_breakdown) > 0:
+                        st.dataframe(cap_breakdown.style.format({
+                            'Sharpe': '{:.2f}',
+                            'Ann Return': '{:.2%}',
+                            'Max DD': '{:.2%}',
+                            'Turnover': '{:.2%}',
+                        }, na_rep='N/A'), hide_index=True, use_container_width=True)
+                    else:
+                        st.caption("Re-run this signal to generate cap breakdown data")
+                
+                with robust_col2:
+                    st.markdown("**Performance by Year**")
+                    if year_breakdown is not None and len(year_breakdown) > 0:
+                        st.dataframe(year_breakdown.style.format({
+                            'Sharpe': '{:.2f}',
+                            'Ann Return': '{:.2%}',
+                            'Max DD': '{:.2%}',
+                        }, na_rep='N/A'), hide_index=True, use_container_width=True)
+                    else:
+                        st.caption("Re-run this signal to generate year breakdown data")
+                
+                st.divider()
+                
+                # === Experiment Details ===
+                st.subheader("Experiment Details")
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Signal", selected_run.get('tags.signal_name', 'N/A'))
+                with col2:
+                    st.metric("Data Snapshot", selected_run.get('tags.snapshot_id', 'N/A'))
+                with col3:
+                    st.metric("Best Sharpe", f"{sharpe:.2f}" if sharpe else "N/A")
+                with col4:
+                    st.metric("Git SHA", selected_run.get('tags.git_sha', 'N/A'))
+                
+                # Run Info expander
+                with st.expander("Reproducibility Info", expanded=False):
+                    st.markdown("**Run ID:**")
+                    st.code(run_id, language=None)
+                    st.markdown("**Signal Hash:**")
+                    st.code(selected_run.get('tags.signal_hash', 'N/A'), language=None)
                 
                 # Suite Summary
                 if summary_df is not None:
@@ -712,7 +654,7 @@ def main():
                             'max_dd': '{:.2%}',
                             'turnover': '{:.2%}',
                         }, na_rep='N/A'),
-                        width='stretch'
+                        use_container_width=True
                     )
                 
                 # Cumulative Returns
@@ -757,7 +699,7 @@ def main():
                         fig = px.line(daily_df, x='date', y='cumret', title='Cumulative Return')
                     
                     fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02))
-                    st.plotly_chart(fig, width='stretch', key="history_cumret")
+                    st.plotly_chart(fig, use_container_width=True, key="history_cumret")
                 else:
                     st.info("No daily returns data found for this run.")
                 
@@ -769,7 +711,7 @@ def main():
                     # Factor Exposure bars
                     if factor_exposures is not None and len(factor_exposures) > 0:
                         factor_fig = plot_factor_exposure_bars(factor_exposures)
-                        st.plotly_chart(factor_fig, width='stretch', key="history_factor_exposure")
+                        st.plotly_chart(factor_fig, use_container_width=True, key="history_factor_exposure")
                     else:
                         st.info("No factor exposure data")
                 
@@ -801,7 +743,7 @@ def main():
                     
                     if ic_series is not None and len(ic_series) > 0:
                         ic_fig = plot_ic_over_time(ic_series)
-                        st.plotly_chart(ic_fig, width='stretch', key="history_ic")
+                        st.plotly_chart(ic_fig, use_container_width=True, key="history_ic")
                 else:
                     st.info("No IC data available for this run.")
                 
@@ -811,7 +753,7 @@ def main():
                     st.dataframe(correlations.style.format({
                         'signal_corr': '{:.3f}',
                         'pnl_corr': '{:.3f}',
-                    }, na_rep='N/A'), width='stretch')
+                    }, na_rep='N/A'), use_container_width=True)
                 else:
                     st.info("No baseline correlations available.")
                 
@@ -820,16 +762,6 @@ def main():
                     st.subheader("Lag Sensitivity")
                     lag_fig = plot_lag_sensitivity_from_summary(summary_df, show_turnover=False)
                     st.plotly_chart(lag_fig, use_container_width=True, key="history_lag_sensitivity")
-                
-                # Tearsheet
-                st.subheader("Tear Sheet")
-                tearsheet_artifact = next((a for a in artifact_names if 'tearsheet' in a), None)
-                if tearsheet_artifact:
-                    local_path = client.download_artifacts(run_id, tearsheet_artifact)
-                    with open(local_path) as f:
-                        st.components.v1.html(f.read(), height=800, scrolling=True)
-                else:
-                    st.warning("No tearsheet found for this run.")
                     
             except Exception as e:
                 st.warning(f"Could not load artifacts: {e}")

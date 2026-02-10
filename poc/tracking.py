@@ -22,7 +22,8 @@ from typing import Optional
 from datetime import datetime
 
 import pandas as pd
-from .suite import SuiteResult
+from .suite import SuiteResult, get_best_config
+from .tearsheet import compute_verdict, compute_composite_score, _extract_cap_breakdown, _extract_year_breakdown
 
 
 def get_git_sha() -> str:
@@ -194,6 +195,44 @@ def log_run(
             with open(coverage_path, 'w') as f:
                 json.dump(suite_result.coverage, f, indent=2, default=str)
             mlflow.log_artifact(str(coverage_path))
+        
+        # Log verdict as JSON
+        verdict = compute_verdict(suite_result)
+        verdict_path = Path('artifacts') / f"{signal_name}_verdict.json"
+        with open(verdict_path, 'w') as f:
+            json.dump(verdict, f, indent=2, default=str)
+        mlflow.log_artifact(str(verdict_path))
+        
+        # Log composite score as JSON
+        composite_score = compute_composite_score(suite_result)
+        score_path = Path('artifacts') / f"{signal_name}_composite_score.json"
+        with open(score_path, 'w') as f:
+            json.dump(composite_score, f, indent=2, default=str)
+        mlflow.log_artifact(str(score_path))
+        
+        # Log best metrics for History tab headline display
+        best_key = get_best_config(suite_result, 'sharpe')
+        if best_key and best_key in suite_result.results:
+            best_result = suite_result.results[best_key]
+            mlflow.log_metric('best_ann_ret', best_result.annual_return)
+            mlflow.log_metric('best_max_dd', best_result.max_drawdown)
+            mlflow.log_metric('best_turnover', best_result.turnover)
+        
+        # Log cap breakdown as CSV
+        if best_key:
+            cap_data = _extract_cap_breakdown(suite_result, best_key)
+            if len(cap_data) > 0:
+                cap_path = Path('artifacts') / f"{signal_name}_cap_breakdown.csv"
+                cap_data.to_csv(cap_path, index=False)
+                mlflow.log_artifact(str(cap_path))
+        
+        # Log year breakdown as CSV
+        if best_key:
+            year_data = _extract_year_breakdown(suite_result, best_key)
+            if len(year_data) > 0:
+                year_path = Path('artifacts') / f"{signal_name}_year_breakdown.csv"
+                year_data.to_csv(year_path, index=False)
+                mlflow.log_artifact(str(year_path))
         
         run_id = mlflow.active_run().info.run_id
     
