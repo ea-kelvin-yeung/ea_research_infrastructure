@@ -987,14 +987,17 @@ def main():
                 st.divider()
                 with st.expander("6. Run Details (Audit Trail)", expanded=False):
                     # Experiment metadata
-                    col1, col2, col3, col4 = st.columns(4)
+                    col1, col2, col3, col4, col5 = st.columns(5)
                     with col1:
                         st.metric("Signal", selected_run.get('tags.signal_name', 'N/A'))
                     with col2:
                         st.metric("Data Snapshot", selected_run.get('tags.snapshot_id', 'N/A'))
                     with col3:
-                        st.metric("Git SHA", selected_run.get('tags.git_sha', 'N/A'))
+                        fingerprint = selected_run.get('tags.data_fingerprint', 'N/A')
+                        st.metric("Data Fingerprint", fingerprint if fingerprint != 'unknown' else 'N/A')
                     with col4:
+                        st.metric("Git SHA", selected_run.get('tags.git_sha', 'N/A'))
+                    with col5:
                         st.metric("Signal Hash", selected_run.get('tags.signal_hash', 'N/A')[:8] + '...' if selected_run.get('tags.signal_hash') else 'N/A')
                     
                     st.markdown("**Run ID:**")

@@ -177,7 +177,7 @@ V5 snapshots provide content hashing and optional source lineage:
 **V5 Manifest:**
 ```json
 {
-  "snapshot_id": "full-history",
+  "snapshot_id": "2026-02-10-v1",
   "version": 5,
   "fingerprint": "e570278e9355",
   "components": {
@@ -244,7 +244,7 @@ Large tables (like `ret`) can be partitioned by year for efficient incremental u
 
 ```python
 # Update only changed partitions
-update_snapshot_incremental('snapshots/full-history', {'ret': new_ret_df})
+update_snapshot_incremental('snapshots/2026-02-10-v1', {'ret': new_ret_df})
 ```
 
 **Reproducibility Benefits:**
@@ -1016,10 +1016,10 @@ To get full benefit of optimizations, recreate snapshots with v2 format:
 
 ```bash
 # Delete old snapshot
-rm -rf snapshots/full-history
+rm -rf snapshots/2026-02-10-v1
 
 # Create new v2 snapshot with all precomputation
-python -c "from poc.catalog import create_snapshot; create_snapshot('data', 'snapshots', 'full-history')"
+python -c "from poc.catalog import create_snapshot; create_snapshot('data', 'snapshots', '2026-02-10-v1')"
 ```
 
 This runs the heavy normalization and pre-indexing once, making all subsequent `load_catalog()` calls fast.
