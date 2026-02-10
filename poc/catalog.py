@@ -15,13 +15,201 @@ Performance optimizations:
 import pandas as pd
 import numpy as np
 import json
+import hashlib
 from pathlib import Path
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict, Tuple
 
 
 # Standard risk factors used for signal quality assessment
 RISK_FACTORS = ['size', 'value', 'growth', 'leverage', 'volatility', 'momentum']
+
+
+# =============================================================================
+# Content-Based Hashing for Reproducibility
+# =============================================================================
+
+def compute_table_hash(df: pd.DataFrame, sample_rows: int = 10000) -> str:
+    """
+    Compute deterministic hash of DataFrame content.
+    
+    Uses sampling for speed on large tables while ensuring reproducibility.
+    Same data content → same hash, regardless of when snapshot was created.
+    
+    Components hashed:
+    - Schema (column names + dtypes)
+    - Shape (rows x cols)
+    - Date range (if date column exists)
+    - Sampled content (deterministic sampling)
+    
+    Args:
+        df: DataFrame to hash
+        sample_rows: Max rows to sample for content hashing (default 10000)
+        
+    Returns:
+        16-character hex hash string
+    """
+    # Include schema in hash (column names + dtypes, sorted for determinism)
+    schema = str([(c, str(df[c].dtype)) for c in sorted(df.columns)])
+    
+    # Include shape
+    shape = f"{len(df)}x{len(df.columns)}"
+    
+    # Include date range if present
+    date_range = ""
+    if 'date' in df.columns:
+        date_range = f"{df['date'].min()}:{df['date'].max()}"
+    
+    # Deterministic content sampling
+    if len(df) > sample_rows:
+        # Sample: first 1000 + last 1000 + evenly spaced
+        n = len(df)
+        indices = (
+            list(range(min(1000, n))) +  # First 1000
+            list(range(max(0, n - 1000), n)) +  # Last 1000
+            list(range(0, n, max(1, n // (sample_rows - 2000))))  # Evenly spaced
+        )
+        sample = df.iloc[sorted(set(indices))]
+    else:
+        sample = df
+    
+    # Convert to CSV for deterministic string representation
+    # Use consistent date format and handle NaN consistently
+    content = sample.to_csv(index=False, date_format='%Y-%m-%d', na_rep='NA')
+    
+    # Combine all components
+    fingerprint = f"SCHEMA:{schema}|SHAPE:{shape}|DATES:{date_range}|CONTENT:{content}"
+    return hashlib.sha256(fingerprint.encode()).hexdigest()[:16]
+
+
+def compute_snapshot_fingerprint(component_hashes: Dict[str, str]) -> str:
+    """
+    Combine component table hashes into a single snapshot fingerprint.
+    
+    Args:
+        component_hashes: Dict mapping table name to hash
+            e.g., {'ret': 'abc123...', 'risk': 'def456...', 'dates': 'ghi789...'}
+    
+    Returns:
+        12-character hex meta-hash
+    """
+    # Sort keys for determinism
+    combined = "|".join(f"{k}:{v}" for k, v in sorted(component_hashes.items()))
+    return hashlib.sha256(combined.encode()).hexdigest()[:12]
+
+
+def verify_snapshot_integrity(catalog: dict) -> Tuple[bool, Dict[str, str]]:
+    """
+    Verify that loaded data matches the hashes stored in manifest.
+    
+    Args:
+        catalog: Loaded catalog dict
+        
+    Returns:
+        (is_valid, details) - is_valid is True if all hashes match
+    """
+    manifest = catalog.get('manifest', {})
+    fingerprint = manifest.get('fingerprint', {})
+    stored_hashes = fingerprint.get('components', {})
+    
+    if not stored_hashes:
+        return True, {'status': 'no_hashes_stored', 'message': 'Legacy snapshot without hashes'}
+    
+    details = {}
+    all_match = True
+    
+    # Check each component
+    for table_name, stored_info in stored_hashes.items():
+        stored_hash = stored_info.get('hash', '')
+        if table_name in catalog and catalog[table_name] is not None:
+            current_hash = compute_table_hash(catalog[table_name])
+            matches = current_hash == stored_hash
+            details[table_name] = {
+                'stored': stored_hash,
+                'current': current_hash,
+                'matches': matches
+            }
+            if not matches:
+                all_match = False
+        else:
+            details[table_name] = {'status': 'not_loaded'}
+    
+    return all_match, details
+
+
+# =============================================================================
+# Content-Addressable Storage (Component Reuse)
+# =============================================================================
+
+OBJECTS_DIR = "objects"  # Shared storage for deduplicated components
+
+
+def _get_object_path(base_dir: Path, table_hash: str, table_name: str) -> Path:
+    """Get path to a content-addressed object file."""
+    # Use first 2 chars as subdirectory (like git) for filesystem efficiency
+    return base_dir / OBJECTS_DIR / table_hash[:2] / f"{table_hash}_{table_name}.parquet"
+
+
+def _store_object(df: pd.DataFrame, base_dir: Path, table_name: str) -> Tuple[str, Path, bool]:
+    """
+    Store a DataFrame in content-addressable storage.
+    
+    Returns:
+        (hash, path, is_new) - is_new=False if object already existed (reused)
+    """
+    table_hash = compute_table_hash(df)
+    object_path = _get_object_path(base_dir, table_hash, table_name)
+    
+    if object_path.exists():
+        # Object already exists - reuse it!
+        return table_hash, object_path, False
+    
+    # New object - store it
+    object_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(object_path, index=False)
+    return table_hash, object_path, True
+
+
+def _load_object(base_dir: Path, table_hash: str, table_name: str) -> Optional[pd.DataFrame]:
+    """Load a DataFrame from content-addressable storage."""
+    object_path = _get_object_path(base_dir, table_hash, table_name)
+    if object_path.exists():
+        return pd.read_parquet(object_path)
+    return None
+
+
+def get_object_stats(base_dir: str = "snapshots") -> Dict:
+    """
+    Get statistics about the content-addressable object store.
+    
+    Returns:
+        Dict with counts of unique objects, total size, etc.
+    """
+    objects_path = Path(base_dir) / OBJECTS_DIR
+    if not objects_path.exists():
+        return {'exists': False, 'unique_objects': 0, 'total_size_mb': 0}
+    
+    total_size = 0
+    object_count = 0
+    objects_by_type = {}
+    
+    for subdir in objects_path.iterdir():
+        if subdir.is_dir():
+            for obj_file in subdir.glob("*.parquet"):
+                object_count += 1
+                total_size += obj_file.stat().st_size
+                # Extract table name from filename
+                parts = obj_file.stem.split('_', 1)
+                if len(parts) == 2:
+                    table_name = parts[1]
+                    objects_by_type[table_name] = objects_by_type.get(table_name, 0) + 1
+    
+    return {
+        'exists': True,
+        'unique_objects': object_count,
+        'total_size_mb': total_size / (1024 * 1024),
+        'by_type': objects_by_type,
+    }
 
 
 def _normalize_dataframe(df: pd.DataFrame, name: str = "") -> pd.DataFrame:
@@ -170,7 +358,11 @@ def _create_factor_data(risk_df: pd.DataFrame) -> pd.DataFrame:
     return factors
 
 
-def load_catalog(snapshot_path: str = "snapshots/default", use_master: bool = True) -> dict:
+def load_catalog(
+    snapshot_path: str = "snapshots/default",
+    use_master: bool = True,
+    verify_integrity: bool = False,
+) -> dict:
     """
     Load data catalog from a snapshot directory.
     
@@ -180,9 +372,10 @@ def load_catalog(snapshot_path: str = "snapshots/default", use_master: bool = Tr
     Args:
         snapshot_path: Path to snapshot directory containing parquet files
         use_master: If True, load master_data for fast backtest joins
+        verify_integrity: If True, verify content hashes match manifest (slower)
         
     Returns:
-        dict with keys: 'ret', 'risk', 'dates', 'snapshot_id', 'manifest'
+        dict with keys: 'ret', 'risk', 'dates', 'snapshot_id', 'manifest', 'fingerprint'
         If use_master=True, also includes:
         - 'master': pre-merged ret+risk indexed by (security_id, date)
         - 'dates_indexed': dict with 'by_date' and 'by_n' indexed DataFrames
@@ -203,17 +396,43 @@ def load_catalog(snapshot_path: str = "snapshots/default", use_master: bool = Tr
     
     # Check if this is a v2 snapshot (all precomputation done at snapshot time)
     is_v2 = manifest.get('version', 1) >= 2
+    is_v4 = manifest.get('version', 1) >= 4  # V4 = content-addressable with object references
+    
+    # Helper to resolve object paths (for V4 snapshots with deduplicated storage)
+    def _resolve_table_path(table_name: str, default_filename: str) -> Path:
+        """Resolve path to table file, checking object store first for V4."""
+        default_path = path / default_filename
+        
+        # If symlink or regular file exists, use it
+        if default_path.exists():
+            return default_path
+        
+        # For V4 snapshots, try loading from object store
+        if is_v4:
+            objects = manifest.get('objects', {})
+            if table_name in objects:
+                # Reconstruct path from snapshot parent dir + object path
+                obj_path = path.parent / objects[table_name]['object_path']
+                if obj_path.exists():
+                    return obj_path
+        
+        # Fallback to default
+        return default_path
     
     # Load base data files (already normalized in v2 snapshots)
-    ret_df = pd.read_parquet(path / 'ret.parquet')
-    risk_df = pd.read_parquet(path / 'risk.parquet')
-    dates_df = pd.read_parquet(path / 'trading_date.parquet')
+    ret_df = pd.read_parquet(_resolve_table_path('ret', 'ret.parquet'))
+    risk_df = pd.read_parquet(_resolve_table_path('risk', 'risk.parquet'))
+    dates_df = pd.read_parquet(_resolve_table_path('dates', 'trading_date.parquet'))
     
     # For v1 snapshots, normalize on load (backwards compatibility)
     if not is_v2:
         ret_df = _normalize_dataframe(ret_df, 'ret')
         risk_df = _normalize_dataframe(risk_df, 'risk')
         dates_df = _normalize_datefile(dates_df)
+    
+    # Extract fingerprint from manifest (v3+)
+    fingerprint = manifest.get('fingerprint', {})
+    meta_hash = fingerprint.get('meta_hash', None)
     
     catalog = {
         'ret': ret_df,
@@ -222,11 +441,22 @@ def load_catalog(snapshot_path: str = "snapshots/default", use_master: bool = Tr
         'snapshot_id': path.name,
         'snapshot_path': str(path.resolve()),
         'manifest': manifest,
+        'fingerprint': meta_hash,  # Quick access to content fingerprint
     }
+    
+    # Verify integrity if requested
+    if verify_integrity and fingerprint:
+        print("Verifying snapshot integrity...")
+        is_valid, details = verify_snapshot_integrity(catalog)
+        if not is_valid:
+            import warnings
+            warnings.warn(f"Snapshot integrity check failed: {details}")
+        catalog['integrity_verified'] = is_valid
+        catalog['integrity_details'] = details
     
     if use_master:
         # Load master_data (pre-merged ret+risk)
-        master_path = path / 'master.parquet'
+        master_path = _resolve_table_path('master', 'master.parquet')
         if master_path.exists():
             master_df = pd.read_parquet(master_path)
             # Restore MultiIndex (cheap operation - skip sort_index for speed)
@@ -297,6 +527,9 @@ def create_snapshot(
     source_dir: str = 'data',
     output_dir: str = 'snapshots',
     snapshot_id: Optional[str] = None,
+    use_content_hash: bool = False,
+    deduplicate: bool = False,
+    sources: Optional[Dict[str, Dict]] = None,
 ) -> Path:
     """
     Create a snapshot from existing data files with ALL precomputation done upfront.
@@ -306,13 +539,23 @@ def create_snapshot(
     2. Create master_data (pre-merged ret+risk)
     3. Create pre-sorted asof tables for merge_asof
     4. Create factors table
+    5. Compute content fingerprints for reproducibility
+    6. (Optional) Store components in shared object store for reuse
     
     After this, load_catalog() is just fast file reads.
     
     Args:
         source_dir: Directory containing ret.parquet, risk.parquet, trading_date.pkl
         output_dir: Directory to store snapshots
-        snapshot_id: Optional custom snapshot ID (default: date-based)
+        snapshot_id: Optional custom snapshot ID (default: date-based, or content-hash if use_content_hash=True)
+        use_content_hash: If True, use content-based hash as snapshot ID (enables deduplication)
+        deduplicate: If True, store components in shared object store by hash (saves disk space)
+        sources: Optional dict with source lineage for each component, e.g.:
+            {
+                'ret': {'type': 'prod_export', 'uri': 's3://...', 'extraction_id': '...'},
+                'risk': {'type': 'prod_export', 'uri': 's3://...'},
+                'dates': {'type': 'static_file', 'uri': 's3://...'},
+            }
         
     Returns:
         Path to created snapshot directory
@@ -321,8 +564,10 @@ def create_snapshot(
     start_time = time.time()
     
     source = Path(source_dir)
-    snapshot_id = snapshot_id or f"{datetime.now().strftime('%Y-%m-%d')}-v1"
-    snapshot_path = Path(output_dir) / snapshot_id
+    
+    # Defer snapshot_id assignment if using content hash (computed after loading data)
+    temp_snapshot_id = snapshot_id or f"{datetime.now().strftime('%Y-%m-%d')}-v1"
+    snapshot_path = Path(output_dir) / temp_snapshot_id
     snapshot_path.mkdir(parents=True, exist_ok=True)
     
     print(f"Creating snapshot: {snapshot_id}")
@@ -360,15 +605,41 @@ def create_snapshot(
     print(f"  Time: {time.time() - step_start:.1f}s")
     
     # =========================================================================
-    # Step 3: Save normalized base files
+    # Step 3: Save normalized base files (with optional deduplication)
     # =========================================================================
     print("\nStep 3: Saving normalized base files...")
     step_start = time.time()
     
-    ret_df.to_parquet(snapshot_path / 'ret.parquet', index=False)
-    risk_df.to_parquet(snapshot_path / 'risk.parquet', index=False)
-    datefile.to_parquet(snapshot_path / 'trading_date.parquet', index=False)
+    base_dir = Path(output_dir)
+    object_refs = {}  # Track object references for manifest
+    reused_count = 0
     
+    if deduplicate:
+        # Use content-addressable storage - store once, reference by hash
+        for table_name, df in [('ret', ret_df), ('risk', risk_df), ('dates', datefile)]:
+            table_hash, obj_path, is_new = _store_object(df, base_dir, table_name)
+            object_refs[table_name] = {
+                'hash': table_hash,
+                'object_path': str(obj_path.relative_to(base_dir)),
+            }
+            # Create symlink in snapshot dir for easy access
+            snapshot_link = snapshot_path / f'{table_name}.parquet'
+            if snapshot_link.exists():
+                snapshot_link.unlink()
+            snapshot_link.symlink_to(obj_path.resolve())
+            
+            status = "NEW" if is_new else "REUSED"
+            if not is_new:
+                reused_count += 1
+            print(f"  {table_name}: {table_hash} [{status}]")
+    else:
+        # Traditional: copy files directly to snapshot dir
+        ret_df.to_parquet(snapshot_path / 'ret.parquet', index=False)
+        risk_df.to_parquet(snapshot_path / 'risk.parquet', index=False)
+        datefile.to_parquet(snapshot_path / 'trading_date.parquet', index=False)
+    
+    if reused_count > 0:
+        print(f"  Reused {reused_count} existing components (saved disk space)")
     print(f"  Time: {time.time() - step_start:.1f}s")
     
     # =========================================================================
@@ -378,7 +649,24 @@ def create_snapshot(
     step_start = time.time()
     
     master_df = _create_master_data(ret_df, risk_df)
-    master_df.reset_index().to_parquet(snapshot_path / 'master.parquet', index=False)
+    master_flat = master_df.reset_index()
+    
+    if deduplicate:
+        master_hash, obj_path, is_new = _store_object(master_flat, base_dir, 'master')
+        object_refs['master'] = {
+            'hash': master_hash,
+            'object_path': str(obj_path.relative_to(base_dir)),
+        }
+        snapshot_link = snapshot_path / 'master.parquet'
+        if snapshot_link.exists():
+            snapshot_link.unlink()
+        snapshot_link.symlink_to(obj_path.resolve())
+        status = "NEW" if is_new else "REUSED"
+        if not is_new:
+            reused_count += 1
+        print(f"  master: {master_hash} [{status}]")
+    else:
+        master_flat.to_parquet(snapshot_path / 'master.parquet', index=False)
     
     print(f"  master_data: {len(master_df):,} rows")
     print(f"  Time: {time.time() - step_start:.1f}s")
@@ -429,39 +717,99 @@ def create_snapshot(
     print(f"  Time: {time.time() - step_start:.1f}s")
     
     # =========================================================================
-    # Step 7: Create manifest
+    # Step 7: Compute content hashes for reproducibility
     # =========================================================================
+    print("\nStep 7: Computing content fingerprints...")
+    step_start = time.time()
+    
+    ret_hash = compute_table_hash(ret_df)
+    risk_hash = compute_table_hash(risk_df)
+    dates_hash = compute_table_hash(datefile)
+    master_hash = compute_table_hash(master_df.reset_index())
+    
+    component_hashes = {
+        'ret': ret_hash,
+        'risk': risk_hash,
+        'dates': dates_hash,
+        'master': master_hash,
+    }
+    meta_hash = compute_snapshot_fingerprint(component_hashes)
+    
+    print(f"  ret:    {ret_hash}")
+    print(f"  risk:   {risk_hash}")
+    print(f"  dates:  {dates_hash}")
+    print(f"  master: {master_hash}")
+    print(f"  META:   {meta_hash}")
+    print(f"  Time: {time.time() - step_start:.1f}s")
+    
+    # If using content-based ID, rename snapshot directory
+    if use_content_hash and snapshot_id is None:
+        content_snapshot_id = f"snap_{meta_hash}"
+        new_snapshot_path = Path(output_dir) / content_snapshot_id
+        
+        # Check if this exact data already exists
+        if new_snapshot_path.exists():
+            print(f"\n  Snapshot with identical content already exists: {content_snapshot_id}")
+            # Clean up temporary directory
+            import shutil
+            shutil.rmtree(snapshot_path)
+            return new_snapshot_path
+        
+        # Rename to content-based ID
+        snapshot_path.rename(new_snapshot_path)
+        snapshot_path = new_snapshot_path
+        snapshot_id = content_snapshot_id
+    else:
+        snapshot_id = temp_snapshot_id
+    
+    # =========================================================================
+    # Step 8: Create manifest (simplified)
+    # =========================================================================
+    
+    source_info = sources or {}
+    
     manifest = {
         'snapshot_id': snapshot_id,
         'created_at': datetime.now().isoformat(),
-        'version': 2,  # Version 2 = all precomputation done at snapshot time
-        'files': {
+        'version': 5,
+        'fingerprint': meta_hash,
+        'components': {
             'ret': {
+                'source': source_info.get('ret', {}).get('source', str(source / 'ret.parquet')),
+                'hash': ret_hash,
                 'rows': len(ret_df),
                 'securities': int(ret_df['security_id'].nunique()),
-                'date_range': [str(ret_df['date'].min()), str(ret_df['date'].max())],
-                'normalized': True,
+                'date_range': [str(ret_df['date'].min().date()), str(ret_df['date'].max().date())],
             },
             'risk': {
+                'source': source_info.get('risk', {}).get('source', str(source / 'risk.parquet')),
+                'hash': risk_hash,
                 'rows': len(risk_df),
-                'columns': list(risk_df.columns),
-                'normalized': True,
             },
-            'trading_date': {
+            'dates': {
+                'source': source_info.get('dates', {}).get('source', str(source / 'trading_date.pkl')),
+                'hash': dates_hash,
                 'rows': len(datefile),
             },
             'master': {
+                'derived_from': ['ret', 'risk'],
+                'hash': master_hash,
                 'rows': len(master_df),
             },
             'factors': {
+                'derived_from': ['risk'],
                 'rows': len(factor_df),
-                'columns': list(factor_df.columns) if len(factor_df) > 0 else [],
             },
             'asof_resid': {
+                'derived_from': ['risk'],
                 'rows': len(resid_table),
             },
         },
     }
+    
+    # Add object store refs if using deduplication
+    if deduplicate and object_refs:
+        manifest['objects'] = object_refs
     
     with open(snapshot_path / 'manifest.json', 'w') as f:
         json.dump(manifest, f, indent=2)
@@ -469,6 +817,7 @@ def create_snapshot(
     total_time = time.time() - start_time
     print("\n" + "=" * 60)
     print(f"Snapshot created: {snapshot_path}")
+    print(f"Fingerprint: {meta_hash}")
     print(f"Total time: {total_time:.1f}s")
     
     return snapshot_path

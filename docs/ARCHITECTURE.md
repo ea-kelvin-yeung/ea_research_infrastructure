@@ -136,9 +136,15 @@ Manages versioned data snapshots for reproducibility. **All heavy computation is
 
 **Key functions:**
 ```python
-create_snapshot(source_dir, output_dir) -> Path  # Create snapshot + ALL precomputation
-load_catalog(snapshot_path) -> dict              # Fast load (just reads files)
-list_snapshots(snapshots_dir) -> List[str]       # List available snapshots
+# Hashing functions for reproducibility
+compute_table_hash(df) -> str                    # 16-char content hash of DataFrame
+compute_snapshot_fingerprint(hashes) -> str      # 12-char meta-hash of all components
+verify_snapshot_integrity(catalog) -> (bool, details)  # Verify loaded data matches manifest
+
+# Snapshot management
+create_snapshot(source_dir, output_dir, use_content_hash=False) -> Path
+load_catalog(snapshot_path, use_master=True, verify_integrity=False) -> dict
+list_snapshots(snapshots_dir) -> List[str]
 ```
 
 **Catalog dict structure:**
@@ -152,13 +158,73 @@ list_snapshots(snapshots_dir) -> List[str]       # List available snapshots
     'dates_indexed': dict,         # {'by_date': df, 'by_n': df}
     'asof_tables': dict,           # {'resid': df, 'byvars_cap': df}
     'snapshot_id': str,
-    'manifest': dict,              # Includes version: 2 for optimized snapshots
+    'fingerprint': str,            # 12-char content fingerprint (V3+)
+    'manifest': dict,              # Includes version and fingerprint details
 }
 ```
 
-**V2 Snapshot Format:**
+**V5 Snapshot Format (Content-Addressable with Lineage):**
 
-V2 snapshots (version >= 2 in manifest) have all precomputation done at creation time:
+V5 snapshots provide content hashing and optional source lineage:
+
+| Feature | Description |
+|---------|-------------|
+| **Fingerprint** | 12-char meta-hash of all component hashes |
+| **Source lineage** | Optional: where each table originated (path, URI) |
+| **Per-table hashes** | 16-char SHA256 hash per table |
+| **Component deduplication** | `deduplicate=True` stores tables once in shared object store |
+
+**V5 Manifest:**
+```json
+{
+  "snapshot_id": "full-history",
+  "version": 5,
+  "fingerprint": "e570278e9355",
+  "components": {
+    "ret": {
+      "source": "data/ret.parquet",
+      "hash": "7ed19eeda288aa6e",
+      "rows": 30445515,
+      "securities": 12482,
+      "date_range": ["2001-01-02", "2025-10-07"]
+    },
+    "risk": {"source": "data/risk.parquet", "hash": "345677db35fb17bc", "rows": 30628078},
+    "dates": {"source": "data/trading_date.pkl", "hash": "a65d479e1bf659f5", "rows": 15603},
+    "master": {"derived_from": ["ret", "risk"], "hash": "dfa58371b1267141", "rows": 30434746},
+    "factors": {"derived_from": ["risk"], "rows": 30628078},
+    "asof_resid": {"derived_from": ["risk"], "rows": 30628078}
+  }
+}
+```
+
+**Creating Snapshots with Source Lineage:**
+```python
+# Basic (local paths)
+create_snapshot('data/', 'snapshots/')
+
+# With source tracking
+sources = {
+    'ret': {'uri': 's3://exports/returns/2026-02-08/', 'extraction_id': 'ret_001'},
+    'risk': {'uri': 's3://exports/risk/2026-02-08/'},
+}
+create_snapshot('data/', 'snapshots/', sources=sources)
+
+# With component deduplication (saves disk space)
+create_snapshot('data/', 'snapshots/', deduplicate=True)
+```
+
+**Reproducibility Benefits:**
+
+| Feature | Benefit |
+|---------|---------|
+| **Fingerprint** | Single hash to verify entire snapshot |
+| **Source tracking** | Trace data back to original exports |
+| **Same data → Same hash** | Detect when data changes |
+| **Component deduplication** | Reuse unchanged tables across snapshots |
+
+**V2 Snapshot Format (Legacy):**
+
+V2 snapshots (version >= 2) have all precomputation done at creation time:
 
 | File | Created At | Contents |
 |------|------------|----------|
@@ -171,11 +237,68 @@ V2 snapshots (version >= 2 in manifest) have all precomputation done at creation
 
 **Loading Flow:**
 ```python
+# V3 snapshots: Read files, restore indexes, optionally verify integrity
+load_catalog('snapshots/snap_a1b2c3d4', verify_integrity=True)
+
 # V2 snapshots: Just read files, restore indexes
 load_catalog('snapshots/v2-snapshot')  # ~2-5 seconds
 
 # V1 snapshots (backwards compat): Normalize on load
 load_catalog('snapshots/v1-snapshot')  # Slower, normalizes each time
+```
+
+**Content-Addressable Snapshot Creation:**
+```python
+# Date-based ID (default)
+create_snapshot('data/', 'snapshots/')  # Creates snapshots/2026-02-10-v1/
+
+# Content-based ID (for deduplication)
+create_snapshot('data/', 'snapshots/', use_content_hash=True)  # Creates snapshots/snap_a1b2c3d4e5f6/
+# If identical data already exists, returns existing snapshot path
+```
+
+**V4 Format: Component Reuse Across Snapshots:**
+
+V4 snapshots (`deduplicate=True`) store each table once in a shared object store, identified by content hash:
+
+```python
+# Create snapshot with component deduplication
+create_snapshot('data/', 'snapshots/', deduplicate=True)
+
+# Directory structure:
+# snapshots/
+#   objects/          # Shared content-addressable storage
+#     44/
+#       4479db9c06a95a78_ret.parquet   # Unique by content hash
+#     a1/
+#       a1b2c3d4e5f6_master.parquet
+#   snap1/
+#     manifest.json   # References objects by hash
+#     ret.parquet     # Symlink → ../objects/44/4479db...parquet
+#   snap2/
+#     manifest.json   # May reference SAME objects if data unchanged
+#     ret.parquet     # Symlink → ../objects/44/4479db...parquet (REUSED)
+```
+
+**Benefits:**
+- **Disk savings**: Identical tables stored once, not duplicated per snapshot
+- **Automatic deduplication**: If `ret` data hasn't changed, new snapshot reuses existing object
+- **Fast snapshots**: Creating a snapshot with unchanged data is near-instant
+
+**Object Store Functions:**
+```python
+# Check object store stats
+get_object_stats('snapshots/')
+# Returns: {'unique_objects': 12, 'total_size_mb': 1500.5, 'by_type': {'ret': 3, 'risk': 3, ...}}
+
+# Manifest includes object references
+manifest = {
+    'version': 4,
+    'objects': {
+        'ret': {'hash': '4479db9c06a95a78', 'object_path': 'objects/44/4479db...parquet'},
+        'master': {'hash': 'a1b2c3d4e5f6', 'object_path': 'objects/a1/a1b2c3...parquet'},
+    }
+}
 ```
 
 **Master Data:**
@@ -326,10 +449,21 @@ Correlates signal values to common risk factors (size, value, growth, leverage, 
 Logs runs for reproducibility and comparison.
 
 **Logged data:**
-- **Tags:** signal_name, snapshot_id, git_sha, author
+- **Tags:** signal_name, snapshot_id, data_fingerprint, git_sha, author
 - **Params:** lag, residualize, tc_model, weight
 - **Metrics:** sharpe, ann_ret, max_dd, turnover (per config + baselines)
 - **Artifacts:** tearsheet.html, summary.csv, daily.parquet
+
+**Reproducibility via Fingerprint:**
+```python
+# When logging a run, include the data fingerprint
+mlflow.set_tag('data_fingerprint', catalog.get('fingerprint', 'unknown'))
+
+# Later, verify reproducibility
+logged_fingerprint = run.data.tags.get('data_fingerprint')
+current_fingerprint = catalog.get('fingerprint')
+assert logged_fingerprint == current_fingerprint, "Data has changed!"
+```
 
 **Key functions:**
 ```python
@@ -452,8 +586,11 @@ python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# 2. Create data snapshot
+# 2. Create data snapshot (date-based ID)
 python -c "from poc.catalog import create_snapshot; create_snapshot()"
+
+# Or with content-based ID (for reproducibility/deduplication)
+python -c "from poc.catalog import create_snapshot; create_snapshot(use_content_hash=True)"
 
 # 3. Run demo
 python run_demo.py

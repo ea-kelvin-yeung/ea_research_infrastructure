@@ -82,6 +82,7 @@ def log_run(
         mlflow.set_tags({
             'signal_name': signal_name,
             'snapshot_id': catalog.get('snapshot_id', 'unknown'),
+            'data_fingerprint': catalog.get('fingerprint', 'unknown'),  # Content hash for reproducibility
             'git_sha': get_git_sha(),
             'signal_hash': signal_hash,
             'author': author or 'unknown',
