@@ -251,6 +251,7 @@ def main():
                         'start_date': start_date,
                         'end_date': end_date,
                         'universe_filter': universe_filter,
+                        'signal_path': uploaded.name,  # Store original filename for rerun
                     }
                     run_id = log_run(result, signal_name, catalog, tearsheet_path, signal_df=signal_df, suite_options=suite_options)
                     st.session_state['run_id'] = run_id
@@ -434,6 +435,141 @@ def main():
     with tab3:
         st.header("Past Experiments")
         
+        # Handle rerun execution if triggered
+        if st.session_state.get('trigger_rerun', False):
+            st.session_state['trigger_rerun'] = False
+            rerun_cfg = st.session_state.get('rerun_config', {})
+            
+            if rerun_cfg:
+                import time
+                total_start = time.time()
+                step_times = []
+                
+                st.subheader("Rerunning Suite...")
+                progress_bar = st.progress(0)
+                log_container = st.empty()
+                
+                def log_step(step_name: str, step_time: float, progress: float):
+                    step_times.append((step_name, step_time))
+                    progress_bar.progress(progress)
+                    log_text = "\n".join([f"✓ {name}: {t:.2f}s" for name, t in step_times])
+                    log_container.code(log_text, language=None)
+                
+                try:
+                    # Extract config
+                    uploaded = rerun_cfg['uploaded']
+                    signal_name = rerun_cfg['signal_name']
+                    lags = rerun_cfg['lags']
+                    resid_opts = rerun_cfg['resid_opts']
+                    include_baselines = rerun_cfg['include_baselines']
+                    start_date = rerun_cfg['start_date']
+                    end_date = rerun_cfg['end_date']
+                    universe_filter = rerun_cfg['universe_filter']
+                    log_to_mlflow = rerun_cfg['log_to_mlflow']
+                    
+                    # Step 1: Load signal
+                    step_start = time.time()
+                    if uploaded.name.endswith('.parquet'):
+                        signal_df = pd.read_parquet(uploaded)
+                    elif uploaded.name.endswith('.pkl') or uploaded.name.endswith('.pickle'):
+                        import pickle
+                        signal_df = pickle.load(uploaded)
+                    else:
+                        signal_df = pd.read_csv(uploaded, parse_dates=['date_sig', 'date_avail'])
+                    log_step(f"Load signal ({len(signal_df):,} rows)", time.time() - step_start, 0.1)
+                    
+                    # Step 2: Filter signal to date range
+                    step_start = time.time()
+                    start_str = str(start_date)
+                    end_str = str(end_date)
+                    signal_df['date_sig'] = pd.to_datetime(signal_df['date_sig'])
+                    original_len = len(signal_df)
+                    signal_df = signal_df[
+                        (signal_df['date_sig'] >= start_str) & 
+                        (signal_df['date_sig'] <= end_str)
+                    ]
+                    log_step(f"Filter signal ({original_len:,} → {len(signal_df):,})", time.time() - step_start, 0.15)
+                    
+                    # Step 3: Load catalog
+                    step_start = time.time()
+                    snapshot_id = rerun_cfg.get('snapshot') or selected_snapshot
+                    catalog = get_cached_catalog(f"snapshots/{snapshot_id}")
+                    catalog = filter_catalog(catalog, start_str, end_str)
+                    log_step(f"Load catalog ({len(catalog['ret']):,} ret rows)", time.time() - step_start, 0.25)
+                    
+                    # Step 4: Apply universe filter if requested
+                    if universe_filter != "All Securities":
+                        step_start = time.time()
+                        desc_path = Path('data/descriptor.parquet')
+                        if desc_path.exists():
+                            desc = pd.read_parquet(desc_path, columns=['security_id', 'as_of_date', 'universe_flag'])
+                            desc['as_of_date'] = pd.to_datetime(desc['as_of_date'])
+                            desc = desc[(desc['as_of_date'] >= start_str) & (desc['as_of_date'] <= end_str)]
+                            
+                            target_flag = 1 if universe_filter == "Investable Universe" else 0
+                            universe_secs = desc[desc['universe_flag'] == target_flag][['security_id', 'as_of_date']].drop_duplicates()
+                            
+                            original_len = len(signal_df)
+                            signal_df = signal_df.merge(
+                                universe_secs.rename(columns={'as_of_date': 'date_sig'}),
+                                on=['security_id', 'date_sig'],
+                                how='inner'
+                            )
+                            log_step(f"Universe filter ({original_len:,} → {len(signal_df):,})", time.time() - step_start, 0.30)
+                        else:
+                            st.warning("descriptor.parquet not found, skipping universe filter")
+                    
+                    # Step 5: Run suite
+                    step_start = time.time()
+                    grid = {'lag': lags, 'residualize': resid_opts}
+                    num_configs = len(lags) * len(resid_opts)
+                    result = run_suite(
+                        signal_df, catalog, grid=grid,
+                        include_baselines=include_baselines,
+                        baseline_start_date=start_str,
+                        baseline_end_date=end_str,
+                    )
+                    baselines_note = f" + {len(result.baselines)} baselines" if include_baselines else ""
+                    log_step(f"Run suite ({num_configs} configs{baselines_note})", time.time() - step_start, 0.75)
+                    
+                    # Step 6: Generate tearsheet
+                    step_start = time.time()
+                    tearsheet_path = generate_tearsheet(result, signal_name, catalog, f"artifacts/{signal_name}_tearsheet.html")
+                    log_step("Generate tearsheet", time.time() - step_start, 0.90)
+                    
+                    # Step 7: Log to MLflow
+                    if log_to_mlflow:
+                        step_start = time.time()
+                        suite_options = {
+                            'lags': lags,
+                            'residualize_opts': resid_opts,
+                            'include_baselines': include_baselines,
+                            'start_date': start_date,
+                            'end_date': end_date,
+                            'universe_filter': universe_filter,
+                            'signal_path': uploaded.name,
+                        }
+                        run_id = log_run(result, signal_name, catalog, tearsheet_path, signal_df=signal_df, suite_options=suite_options)
+                        log_step("Log to MLflow", time.time() - step_start, 1.0)
+                    else:
+                        progress_bar.progress(1.0)
+                    
+                    # Final summary
+                    total_time = time.time() - total_start
+                    st.success(f"Rerun completed in {total_time:.1f}s! Refresh to see the new run.")
+                    
+                    # Clear run history cache so new run shows up
+                    get_cached_run_history.clear()
+                    
+                    # Clear rerun config
+                    st.session_state.pop('rerun_config', None)
+                    
+                except Exception as e:
+                    st.error(f"Rerun error: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
+                    st.session_state.pop('rerun_config', None)
+        
         col1, col2, col3 = st.columns([1, 1, 3])
         with col1:
             if st.button("Refresh", key="history_refresh"):
@@ -615,6 +751,102 @@ def main():
                             st.markdown(f"Min COS: {mincos}")
                 else:
                     st.caption("Suite options not logged (older run)")
+                
+                # ============================================================
+                # RERUN WITH MODIFIED CONFIG
+                # ============================================================
+                signal_path = selected_run.get('params.suite_signal_path', None)
+                signal_name_from_run = selected_run.get('tags.signal_name', 'signal')
+                
+                with st.expander("Rerun with Modified Config", expanded=False):
+                    st.caption("Edit configuration and rerun the backtest with the same or different signal file.")
+                    
+                    # Helper function to parse stored list strings back to Python lists
+                    def parse_list_param(param_str, default):
+                        if not param_str:
+                            return default
+                        try:
+                            # Handle string representation like "[0, 1, 2]" or "['off', 'all']"
+                            import ast
+                            return ast.literal_eval(param_str)
+                        except:
+                            return default
+                    
+                    # Parse stored values
+                    default_lags = parse_list_param(suite_lags, [0, 1])
+                    default_resid = parse_list_param(suite_resid, ['off'])
+                    default_start = pd.Timestamp(suite_start) if suite_start else pd.Timestamp('2018-01-01')
+                    default_end = pd.Timestamp(suite_end) if suite_end else pd.Timestamp('2018-06-30')
+                    default_universe_idx = ["All Securities", "Investable Universe", "Non-Investable Universe"].index(suite_universe) if suite_universe in ["All Securities", "Investable Universe", "Non-Investable Universe"] else 0
+                    default_baselines = suite_baselines == 'True' if suite_baselines else False
+                    
+                    # Editable form
+                    rerun_col1, rerun_col2 = st.columns(2)
+                    
+                    with rerun_col1:
+                        st.markdown("**Grid Search Options**")
+                        rerun_lags = st.multiselect(
+                            "Lags", [0, 1, 2, 3, 5], 
+                            default=[l for l in default_lags if l in [0, 1, 2, 3, 5]],
+                            key="rerun_lags"
+                        )
+                        rerun_resid = st.multiselect(
+                            "Residualize", ['off', 'industry', 'factor', 'all'],
+                            default=[r for r in default_resid if r in ['off', 'industry', 'factor', 'all']],
+                            key="rerun_resid"
+                        )
+                        rerun_baselines = st.checkbox("Include Baselines", value=default_baselines, key="rerun_baselines")
+                    
+                    with rerun_col2:
+                        st.markdown("**Filters**")
+                        rerun_start = st.date_input("Start Date", value=default_start, key="rerun_start")
+                        rerun_end = st.date_input("End Date", value=default_end, key="rerun_end")
+                        rerun_universe = st.radio(
+                            "Universe Filter",
+                            ["All Securities", "Investable Universe", "Non-Investable Universe"],
+                            index=default_universe_idx,
+                            key="rerun_universe"
+                        )
+                    
+                    # Signal file upload
+                    st.markdown("**Signal File**")
+                    if signal_path:
+                        st.caption(f"Original file: `{signal_path}`")
+                    
+                    rerun_uploaded = st.file_uploader(
+                        "Upload signal file (or re-upload original)", 
+                        type=['parquet', 'csv', 'pkl', 'pickle'],
+                        key="rerun_signal_upload",
+                        help=f"Expected: {signal_path}" if signal_path else "Upload signal file"
+                    )
+                    
+                    rerun_signal_name = st.text_input("Signal Name", value=signal_name_from_run, key="rerun_signal_name")
+                    rerun_log_mlflow = st.checkbox("Log to MLflow", value=True, key="rerun_log_mlflow")
+                    
+                    # Rerun button
+                    if st.button("Run Suite", type="primary", key="rerun_execute_btn"):
+                        if rerun_uploaded is None:
+                            st.error("Please upload a signal file to rerun.")
+                        elif not rerun_lags:
+                            st.error("Please select at least one lag value.")
+                        elif not rerun_resid:
+                            st.error("Please select at least one residualize option.")
+                        else:
+                            # Store config in session state and trigger rerun
+                            st.session_state['rerun_config'] = {
+                                'uploaded': rerun_uploaded,
+                                'signal_name': rerun_signal_name,
+                                'lags': rerun_lags,
+                                'resid_opts': rerun_resid,
+                                'include_baselines': rerun_baselines,
+                                'start_date': rerun_start,
+                                'end_date': rerun_end,
+                                'universe_filter': rerun_universe,
+                                'log_to_mlflow': rerun_log_mlflow,
+                                'snapshot': selected_run.get('tags.snapshot_id', selected_snapshot) if 'selected_snapshot' in dir() else None,
+                            }
+                            st.session_state['trigger_rerun'] = True
+                            st.rerun()
                 
                 st.divider()
                 
