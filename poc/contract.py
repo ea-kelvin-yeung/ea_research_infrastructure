@@ -81,7 +81,7 @@ def align_dates(
     df: pd.DataFrame,
     datefile: pd.DataFrame,
     lag: int = 0,
-    avail_hour: int = 16,
+    avail_hour: int = 8,
 ) -> pd.DataFrame:
     """
     Align signal dates to trading dates, adding date_ret column.
@@ -90,7 +90,7 @@ def align_dates(
         df: Signal DataFrame with date_sig, date_avail columns
         datefile: Trading calendar with 'date' and 'n' columns
         lag: Additional lag in trading days (0 = trade next available day)
-        avail_hour: Hour when signal is available (default 16 = after market close)
+        avail_hour: Hour when signal is available (default 8 = before market open)
     
     Returns:
         DataFrame with date_ret and date_openret columns added
