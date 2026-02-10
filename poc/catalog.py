@@ -229,23 +229,22 @@ def load_catalog(snapshot_path: str = "snapshots/default", use_master: bool = Tr
         master_path = path / 'master.parquet'
         if master_path.exists():
             master_df = pd.read_parquet(master_path)
-            # Restore MultiIndex (cheap operation)
+            # Restore MultiIndex (cheap operation - skip sort_index for speed)
             if 'security_id' in master_df.columns:
-                master_df = master_df.set_index(['security_id', 'date']).sort_index()
+                master_df = master_df.set_index(['security_id', 'date'])
             catalog['master'] = master_df
-        else:
-            # Create master on the fly if missing
-            print(f"Creating master.parquet...")
+        elif not is_v2:
+            # Fallback for v1: create master on the fly
             catalog['master'] = _create_master_data(ret_df, risk_df)
             catalog['master'].reset_index().to_parquet(master_path, index=False)
-            print(f"Created master.parquet: {len(catalog['master']):,} rows")
+            print(f"Created master.parquet: {len(catalog['master'])} rows")
         
         # Load factors (pre-indexed)
         factors_path = path / 'factors.parquet'
         if factors_path.exists():
             factors_df = pd.read_parquet(factors_path)
             if 'security_id' in factors_df.columns:
-                factors_df = factors_df.set_index(['security_id', 'date']).sort_index()
+                factors_df = factors_df.set_index(['security_id', 'date'])
             catalog['factors'] = factors_df
         elif not is_v2:
             catalog['factors'] = _create_factor_data(risk_df)
