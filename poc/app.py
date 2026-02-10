@@ -681,20 +681,24 @@ def main():
                         
                         if 'type' in filtered_df.columns and len(filtered_df) > 0:
                             filtered_df = filtered_df.copy()
+                            # Create label combining config and type for legend
                             filtered_df['label'] = filtered_df.apply(
-                                lambda r: f"📊 {r['config']}" if r['type'] == 'signal' else f"📈 {r['config']}", 
+                                lambda r: f"{r['config']}, {r['type']}", 
                                 axis=1
                             )
+                            # Use dash pattern to distinguish signal vs baseline
                             fig = px.line(filtered_df, x='date', y='cumret', color='label',
-                                         title='Cumulative Return',
                                          line_dash='type')
                         else:
-                            fig = px.line(filtered_df, x='date', y='cumret', color='config',
-                                         title='Cumulative Return')
+                            fig = px.line(filtered_df, x='date', y='cumret', color='config')
                     else:
-                        fig = px.line(daily_df, x='date', y='cumret', title='Cumulative Return')
+                        fig = px.line(daily_df, x='date', y='cumret')
                     
-                    fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02))
+                    fig.update_layout(
+                        title=dict(text='Cumulative Return', x=0.5, xanchor='center'),
+                        legend=dict(orientation="h", yanchor="top", y=-0.15, title_text=''),
+                        margin=dict(b=100)
+                    )
                     st.plotly_chart(fig, use_container_width=True, key="history_cumret")
                 else:
                     st.info("No daily returns data found.")
