@@ -611,6 +611,20 @@ def main():
                         breakdown_df = pd.DataFrame(breakdown_rows)
                         st.dataframe(breakdown_df, hide_index=True, use_container_width=True)
                 
+                # Suite Summary
+                if summary_df is not None:
+                    st.markdown("**Suite Summary**")
+                    signal_summary = summary_df[summary_df['type'] == 'signal'] if 'type' in summary_df.columns else summary_df
+                    st.dataframe(
+                        signal_summary.style.format({
+                            'sharpe': '{:.2f}',
+                            'ann_ret': '{:.2%}',
+                            'max_dd': '{:.2%}',
+                            'turnover': '{:.2%}',
+                        }, na_rep='N/A'),
+                        use_container_width=True
+                    )
+                
                 # ============================================================
                 # 2) PERFORMANCE & RISK (What happened)
                 # ============================================================
@@ -690,11 +704,25 @@ def main():
                 with rel_col2:
                     st.markdown("**Performance by Year**")
                     if year_breakdown is not None and len(year_breakdown) > 0:
-                        st.dataframe(year_breakdown.style.format({
-                            'Sharpe': '{:.2f}',
-                            'Ann Return': '{:.2%}',
-                            'Max DD': '{:.2%}',
-                        }, na_rep='N/A'), hide_index=True, use_container_width=True)
+                        # Bar chart of Sharpe by Year
+                        year_fig = go.Figure()
+                        colors = ['#28a745' if s >= 0 else '#dc3545' for s in year_breakdown['Sharpe']]
+                        year_fig.add_trace(go.Bar(
+                            x=year_breakdown['Year'].astype(str),
+                            y=year_breakdown['Sharpe'],
+                            marker_color=colors,
+                            text=[f"{s:.2f}" for s in year_breakdown['Sharpe']],
+                            textposition='outside'
+                        ))
+                        year_fig.update_layout(
+                            title='Sharpe Ratio by Year',
+                            xaxis_title='Year',
+                            yaxis_title='Sharpe',
+                            showlegend=False,
+                            height=300
+                        )
+                        year_fig.add_hline(y=0, line_dash="solid", line_color="gray", line_width=1)
+                        st.plotly_chart(year_fig, use_container_width=True, key="history_year_sharpe")
                     else:
                         st.caption("Re-run to generate year breakdown")
                 
@@ -793,20 +821,6 @@ def main():
                     
                     st.markdown("**Run ID:**")
                     st.code(run_id, language=None)
-                    
-                    # Suite Summary table
-                    if summary_df is not None:
-                        st.markdown("**Suite Summary**")
-                        signal_summary = summary_df[summary_df['type'] == 'signal'] if 'type' in summary_df.columns else summary_df
-                        st.dataframe(
-                            signal_summary.style.format({
-                                'sharpe': '{:.2f}',
-                                'ann_ret': '{:.2%}',
-                                'max_dd': '{:.2%}',
-                                'turnover': '{:.2%}',
-                            }, na_rep='N/A'),
-                            use_container_width=True
-                        )
                     
             except Exception as e:
                 st.warning(f"Could not load artifacts: {e}")
