@@ -790,10 +790,10 @@ def main():
                     st.plotly_chart(lag_fig, use_container_width=True, key="history_lag_sensitivity")
                 
                 # ============================================================
-                # 3) RELIABILITY (Will it hold up?)
+                # 3) CONSISTENCY (Will it hold up?)
                 # ============================================================
                 st.divider()
-                st.subheader("3. Reliability")
+                st.subheader("3. Consistency")
                 
                 rel_col1, rel_col2 = st.columns(2)
                 
@@ -835,10 +835,36 @@ def main():
                         st.caption("Re-run to generate year breakdown")
                 
                 # ============================================================
-                # 4) SIGNAL HEALTH (Why it should work)
+                # 4) UNIQUENESS (Is the alpha differentiated?)
                 # ============================================================
                 st.divider()
-                st.subheader("4. Signal Health")
+                st.subheader("4. Uniqueness")
+                
+                factor_col, corr_col = st.columns(2)
+                
+                with factor_col:
+                    st.markdown("**Factor Exposures**")
+                    if factor_exposures is not None and len(factor_exposures) > 0:
+                        factor_fig = plot_factor_exposure_bars(factor_exposures)
+                        st.plotly_chart(factor_fig, use_container_width=True, key="uniqueness_factor_exposure")
+                    else:
+                        st.caption("No factor exposure data")
+                
+                with corr_col:
+                    st.markdown("**Baseline Correlations**")
+                    if correlations is not None and len(correlations) > 0:
+                        st.dataframe(correlations.style.format({
+                            'signal_corr': '{:.3f}',
+                            'pnl_corr': '{:.3f}',
+                        }, na_rep='N/A'), hide_index=True, use_container_width=True)
+                    else:
+                        st.caption("No baseline correlations available")
+                
+                # ============================================================
+                # 5) SIGNAL HEALTH (Why it should work)
+                # ============================================================
+                st.divider()
+                st.subheader("5. Signal Health")
                 
                 # Load coverage time series
                 coverage_series = load_artifact('coverage_series', 'parquet')
@@ -890,32 +916,11 @@ def main():
                 else:
                     st.caption("No coverage data available")
                 
-                # --- Factor Exposures & Correlations side by side ---
-                factor_col, corr_col = st.columns(2)
-                
-                with factor_col:
-                    st.markdown("**Factor Exposures**")
-                    if factor_exposures is not None and len(factor_exposures) > 0:
-                        factor_fig = plot_factor_exposure_bars(factor_exposures)
-                        st.plotly_chart(factor_fig, use_container_width=True, key="history_factor_exposure")
-                    else:
-                        st.caption("No factor exposure data")
-                
-                with corr_col:
-                    st.markdown("**Baseline Correlations**")
-                    if correlations is not None and len(correlations) > 0:
-                        st.dataframe(correlations.style.format({
-                            'signal_corr': '{:.3f}',
-                            'pnl_corr': '{:.3f}',
-                        }, na_rep='N/A'), hide_index=True, use_container_width=True)
-                    else:
-                        st.caption("No baseline correlations available")
-                
                 # ============================================================
-                # 5) RUN DETAILS (Audit trail)
+                # 6) RUN DETAILS (Audit trail)
                 # ============================================================
                 st.divider()
-                with st.expander("5. Run Details (Audit Trail)", expanded=False):
+                with st.expander("6. Run Details (Audit Trail)", expanded=False):
                     # Experiment metadata
                     col1, col2, col3, col4 = st.columns(4)
                     with col1:
