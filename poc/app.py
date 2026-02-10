@@ -844,6 +844,56 @@ def main():
                 st.divider()
                 st.subheader("4. Uniqueness")
                 
+                # --- Residualization Impact ---
+                if summary_df is not None and 'config' in summary_df.columns:
+                    signal_summary = summary_df[summary_df['type'] == 'signal'] if 'type' in summary_df.columns else summary_df
+                    
+                    # Find raw and residualized configs at lag 0
+                    raw_row = signal_summary[signal_summary['config'] == 'lag0_residoff']
+                    resid_configs = signal_summary[
+                        signal_summary['config'].str.contains('lag0_resid') & 
+                        ~signal_summary['config'].str.contains('residoff')
+                    ]['config'].unique().tolist()
+                    
+                    if len(raw_row) > 0 and len(resid_configs) > 0:
+                        raw_sharpe = raw_row['sharpe'].iloc[0]
+                        
+                        # Create display names for resid options
+                        resid_display = {
+                            'lag0_residindustry': 'Industry',
+                            'lag0_residfactor': 'Factor', 
+                            'lag0_residall': 'All Factors',
+                        }
+                        resid_options = {resid_display.get(c, c): c for c in resid_configs}
+                        
+                        st.markdown("**Residualization Impact**")
+                        
+                        # Selector and metrics in one row
+                        sel_col, metric_col1, metric_col2, metric_col3 = st.columns([1.5, 1, 1, 1])
+                        
+                        with sel_col:
+                            selected_resid_label = st.selectbox(
+                                "Residualization",
+                                list(resid_options.keys()),
+                                index=0,
+                                key="resid_impact_selector",
+                                label_visibility="collapsed"
+                            )
+                        
+                        selected_resid_config = resid_options[selected_resid_label]
+                        resid_sharpe = signal_summary[signal_summary['config'] == selected_resid_config]['sharpe'].iloc[0]
+                        sharpe_delta = resid_sharpe - raw_sharpe
+                        pct_retained = (resid_sharpe / raw_sharpe * 100) if raw_sharpe != 0 else 0
+                        
+                        with metric_col1:
+                            st.metric("Raw Sharpe", f"{raw_sharpe:.2f}")
+                        with metric_col2:
+                            st.metric(f"Resid Sharpe", f"{resid_sharpe:.2f}", 
+                                     delta=f"{sharpe_delta:+.2f}")
+                        with metric_col3:
+                            st.metric("Alpha Retained", f"{pct_retained:.0f}%",
+                                     help="% of Sharpe retained after residualization. >70% = unique alpha")
+                
                 factor_col, corr_col = st.columns(2)
                 
                 with factor_col:
