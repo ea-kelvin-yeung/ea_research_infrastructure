@@ -991,10 +991,23 @@ def main():
                     with col1:
                         st.metric("Signal", selected_run.get('tags.signal_name', 'N/A'))
                     with col2:
-                        st.metric("Data Snapshot", selected_run.get('tags.snapshot_id', 'N/A'))
+                        snapshot_id = selected_run.get('tags.snapshot_id', 'N/A')
+                        st.metric("Data Snapshot", snapshot_id)
                     with col3:
-                        fingerprint = selected_run.get('tags.data_fingerprint', 'N/A')
-                        st.metric("Data Fingerprint", fingerprint if fingerprint != 'unknown' else 'N/A')
+                        # Try run tag first, then look up from manifest
+                        fingerprint = selected_run.get('tags.data_fingerprint')
+                        if not fingerprint or fingerprint == 'unknown':
+                            # Look up from snapshot manifest
+                            try:
+                                import json
+                                manifest_path = Path(f"snapshots/{snapshot_id}/manifest.json")
+                                if manifest_path.exists():
+                                    with open(manifest_path) as f:
+                                        manifest = json.load(f)
+                                    fingerprint = manifest.get('fingerprint', 'N/A')
+                            except:
+                                fingerprint = 'N/A'
+                        st.metric("Data Fingerprint", fingerprint if fingerprint else 'N/A')
                     with col4:
                         st.metric("Git SHA", selected_run.get('tags.git_sha', 'N/A'))
                     with col5:
