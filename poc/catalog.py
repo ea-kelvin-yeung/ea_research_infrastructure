@@ -212,6 +212,173 @@ def get_object_stats(base_dir: str = "snapshots") -> Dict:
     }
 
 
+# =============================================================================
+# Partitioned Storage (Incremental Updates)
+# =============================================================================
+
+def _partition_by_year(df: pd.DataFrame, date_col: str = 'date') -> Dict[str, pd.DataFrame]:
+    """Split DataFrame into yearly partitions."""
+    if date_col not in df.columns:
+        return {'all': df}
+    
+    df = df.copy()
+    df['_year'] = pd.to_datetime(df[date_col]).dt.year
+    
+    partitions = {}
+    for year, group in df.groupby('_year'):
+        partitions[str(year)] = group.drop(columns=['_year'])
+    
+    return partitions
+
+
+def _store_partitions(
+    df: pd.DataFrame,
+    base_dir: Path,
+    table_name: str,
+    date_col: str = 'date',
+) -> Dict[str, Dict]:
+    """
+    Store DataFrame as yearly partitions with deduplication.
+    
+    Returns:
+        Dict mapping year -> {hash, rows, path, is_new}
+    """
+    partitions = _partition_by_year(df, date_col)
+    result = {}
+    
+    for year, part_df in partitions.items():
+        part_name = f"{table_name}_{year}"
+        part_hash, obj_path, is_new = _store_object(part_df, base_dir, part_name)
+        result[year] = {
+            'hash': part_hash,
+            'rows': len(part_df),
+            'path': str(obj_path.relative_to(base_dir)),
+            'is_new': is_new,
+        }
+    
+    return result
+
+
+def _load_partitions(
+    base_dir: Path,
+    table_name: str,
+    partitions: Dict[str, Dict],
+) -> pd.DataFrame:
+    """Load and concatenate yearly partitions."""
+    dfs = []
+    for year, part_info in sorted(partitions.items()):
+        part_path = base_dir / part_info['path']
+        if part_path.exists():
+            dfs.append(pd.read_parquet(part_path))
+        else:
+            # Fallback to object store lookup
+            part_name = f"{table_name}_{year}"
+            part_df = _load_object(base_dir, part_info['hash'], part_name)
+            if part_df is not None:
+                dfs.append(part_df)
+    
+    if not dfs:
+        return pd.DataFrame()
+    return pd.concat(dfs, ignore_index=True)
+
+
+def update_snapshot_incremental(
+    snapshot_path: str,
+    new_data: Dict[str, pd.DataFrame],
+    output_dir: str = 'snapshots',
+) -> Path:
+    """
+    Update a snapshot incrementally by only replacing changed partitions.
+    
+    Args:
+        snapshot_path: Path to existing snapshot
+        new_data: Dict of {table_name: DataFrame} with new/updated data
+        output_dir: Where to store objects
+        
+    Returns:
+        Path to updated snapshot
+    """
+    import time
+    from datetime import datetime
+    
+    path = Path(snapshot_path)
+    base_dir = Path(output_dir)
+    
+    # Load existing manifest
+    with open(path / 'manifest.json') as f:
+        manifest = json.load(f)
+    
+    print(f"Updating snapshot: {manifest['snapshot_id']}")
+    print("=" * 60)
+    
+    updated_components = []
+    
+    for table_name, new_df in new_data.items():
+        if table_name not in manifest['components']:
+            print(f"  Skipping unknown component: {table_name}")
+            continue
+        
+        comp = manifest['components'][table_name]
+        old_partitions = comp.get('partitions', {})
+        
+        # Partition new data
+        new_partitions = _store_partitions(new_df, base_dir, table_name)
+        
+        # Merge: keep old partitions, update/add new ones
+        merged_partitions = dict(old_partitions)
+        reused = 0
+        updated = 0
+        
+        for year, part_info in new_partitions.items():
+            if year in old_partitions and old_partitions[year]['hash'] == part_info['hash']:
+                reused += 1
+            else:
+                merged_partitions[year] = {
+                    'hash': part_info['hash'],
+                    'rows': part_info['rows'],
+                    'path': part_info['path'],
+                    'updated': datetime.now().isoformat()[:10],
+                }
+                updated += 1
+        
+        # Update component
+        total_rows = sum(p['rows'] for p in merged_partitions.values())
+        comp_hash = compute_snapshot_fingerprint({y: p['hash'] for y, p in merged_partitions.items()})
+        
+        manifest['components'][table_name] = {
+            'source': comp.get('source', f'data/{table_name}.parquet'),
+            'hash': comp_hash,
+            'rows': total_rows,
+            'partitions': merged_partitions,
+        }
+        
+        if 'securities' in comp:
+            manifest['components'][table_name]['securities'] = int(new_df['security_id'].nunique())
+        if 'date_range' in comp:
+            manifest['components'][table_name]['date_range'] = [
+                str(new_df['date'].min().date()),
+                str(new_df['date'].max().date()),
+            ]
+        
+        print(f"  {table_name}: {reused} partitions reused, {updated} updated")
+        if updated > 0:
+            updated_components.append(table_name)
+    
+    # Recompute fingerprint
+    comp_hashes = {k: v['hash'] for k, v in manifest['components'].items() if 'hash' in v}
+    manifest['fingerprint'] = compute_snapshot_fingerprint(comp_hashes)
+    manifest['updated_at'] = datetime.now().isoformat()
+    
+    # Save updated manifest
+    with open(path / 'manifest.json', 'w') as f:
+        json.dump(manifest, f, indent=2)
+    
+    print(f"\n✓ Updated components: {updated_components}")
+    print(f"  New fingerprint: {manifest['fingerprint']}")
+    
+    return path
+
+
 def _normalize_dataframe(df: pd.DataFrame, name: str = "") -> pd.DataFrame:
     """
     Normalize DataFrame for optimal merge performance.
@@ -398,31 +565,36 @@ def load_catalog(
     is_v2 = manifest.get('version', 1) >= 2
     is_v4 = manifest.get('version', 1) >= 4  # V4 = content-addressable with object references
     
-    # Helper to resolve object paths (for V4 snapshots with deduplicated storage)
-    def _resolve_table_path(table_name: str, default_filename: str) -> Path:
-        """Resolve path to table file, checking object store first for V4."""
-        default_path = path / default_filename
+    components = manifest.get('components', {})
+    
+    # Helper to load a table (supports partitions, object store, or direct files)
+    def _load_table(table_name: str, default_filename: str) -> pd.DataFrame:
+        """Load table from partitions, object store, or direct file."""
+        comp = components.get(table_name, {})
         
-        # If symlink or regular file exists, use it
-        if default_path.exists():
-            return default_path
+        # Check if partitioned
+        if 'partitions' in comp:
+            return _load_partitions(path.parent, table_name, comp['partitions'])
         
-        # For V4 snapshots, try loading from object store
+        # Check object store (V4+)
         if is_v4:
             objects = manifest.get('objects', {})
             if table_name in objects:
-                # Reconstruct path from snapshot parent dir + object path
                 obj_path = path.parent / objects[table_name]['object_path']
                 if obj_path.exists():
-                    return obj_path
+                    return pd.read_parquet(obj_path)
         
-        # Fallback to default
-        return default_path
+        # Direct file in snapshot dir
+        default_path = path / default_filename
+        if default_path.exists():
+            return pd.read_parquet(default_path)
+        
+        raise FileNotFoundError(f"Cannot find {table_name} in snapshot")
     
     # Load base data files (already normalized in v2 snapshots)
-    ret_df = pd.read_parquet(_resolve_table_path('ret', 'ret.parquet'))
-    risk_df = pd.read_parquet(_resolve_table_path('risk', 'risk.parquet'))
-    dates_df = pd.read_parquet(_resolve_table_path('dates', 'trading_date.parquet'))
+    ret_df = _load_table('ret', 'ret.parquet')
+    risk_df = _load_table('risk', 'risk.parquet')
+    dates_df = _load_table('dates', 'trading_date.parquet')
     
     # For v1 snapshots, normalize on load (backwards compatibility)
     if not is_v2:
@@ -431,8 +603,12 @@ def load_catalog(
         dates_df = _normalize_datefile(dates_df)
     
     # Extract fingerprint from manifest (v3+)
-    fingerprint = manifest.get('fingerprint', {})
-    meta_hash = fingerprint.get('meta_hash', None)
+    fingerprint = manifest.get('fingerprint', None)
+    # Handle both old format (dict with meta_hash) and new format (string)
+    if isinstance(fingerprint, dict):
+        meta_hash = fingerprint.get('meta_hash', None)
+    else:
+        meta_hash = fingerprint  # V5: fingerprint is directly the hash string
     
     catalog = {
         'ret': ret_df,
@@ -456,18 +632,19 @@ def load_catalog(
     
     if use_master:
         # Load master_data (pre-merged ret+risk)
-        master_path = _resolve_table_path('master', 'master.parquet')
-        if master_path.exists():
-            master_df = pd.read_parquet(master_path)
+        master_path = path / 'master.parquet'
+        try:
+            master_df = _load_table('master', 'master.parquet')
             # Restore MultiIndex (cheap operation - skip sort_index for speed)
             if 'security_id' in master_df.columns:
                 master_df = master_df.set_index(['security_id', 'date'])
             catalog['master'] = master_df
-        elif not is_v2:
-            # Fallback for v1: create master on the fly
-            catalog['master'] = _create_master_data(ret_df, risk_df)
-            catalog['master'].reset_index().to_parquet(master_path, index=False)
-            print(f"Created master.parquet: {len(catalog['master'])} rows")
+        except FileNotFoundError:
+            if not is_v2:
+                # Fallback for v1: create master on the fly
+                catalog['master'] = _create_master_data(ret_df, risk_df)
+                catalog['master'].reset_index().to_parquet(master_path, index=False)
+                print(f"Created master.parquet: {len(catalog['master'])} rows")
         
         # Load factors (pre-indexed)
         factors_path = path / 'factors.parquet'

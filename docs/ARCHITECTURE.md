@@ -213,6 +213,40 @@ create_snapshot('data/', 'snapshots/', sources=sources)
 create_snapshot('data/', 'snapshots/', deduplicate=True)
 ```
 
+**Partitioned Storage (Incremental Updates):**
+
+Large tables (like `ret`) can be partitioned by year for efficient incremental updates:
+
+```json
+"ret": {
+  "source": "data/ret.parquet",
+  "hash": "14386e85a964",
+  "rows": 30445515,
+  "partitions": {
+    "2023": {"hash": "b1b3e9ad06a3912b", "rows": 1464654, "path": "objects/b1/b1b3...parquet"},
+    "2024": {"hash": "66954d6b9eed3332", "rows": 1400834, "path": "objects/66/6695...parquet"},
+    "2025": {"hash": "7ce6c83a005243eb", "rows": 1028352, "path": "objects/7c/7ce6...parquet"}
+  }
+}
+```
+
+**How incremental updates work:**
+1. New data arrives for 2025
+2. Only the 2025 partition is recomputed → new hash
+3. New partition stored in object store
+4. Manifest updated: 2023/2024 keep same hash (reused), 2025 gets new hash
+5. Overall `ret.hash` and `fingerprint` change
+
+**Benefits:**
+- Only write ~1 year instead of all 25 years
+- Old partitions shared across snapshots
+- Can see exactly which year changed
+
+```python
+# Update only changed partitions
+update_snapshot_incremental('snapshots/full-history', {'ret': new_ret_df})
+```
+
 **Reproducibility Benefits:**
 
 | Feature | Benefit |
@@ -220,7 +254,8 @@ create_snapshot('data/', 'snapshots/', deduplicate=True)
 | **Fingerprint** | Single hash to verify entire snapshot |
 | **Source tracking** | Trace data back to original exports |
 | **Same data → Same hash** | Detect when data changes |
-| **Component deduplication** | Reuse unchanged tables across snapshots |
+| **Yearly partitions** | Only update changed years |
+| **Component deduplication** | Reuse unchanged partitions across snapshots |
 
 **V2 Snapshot Format (Legacy):**
 
