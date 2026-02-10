@@ -168,8 +168,32 @@ def _build_metrics_diff(run_a: Dict, run_b: Dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _get_default_config(df: pd.DataFrame) -> Optional[str]:
+    """
+    Get the default config to use for comparison.
+    Prefers 'lag0_residoff' (baseline), falls back to first available config.
+    """
+    if 'config' not in df.columns:
+        return None
+    
+    configs = df['config'].unique()
+    
+    # Prefer lag0_residoff (the baseline config)
+    if 'lag0_residoff' in configs:
+        return 'lag0_residoff'
+    
+    # Fallback to any lag0 config
+    for c in configs:
+        if c.startswith('lag0'):
+            return c
+    
+    # Last resort: first config
+    return configs[0] if len(configs) > 0 else None
+
+
 def get_overlay_data(daily_a: pd.DataFrame, daily_b: pd.DataFrame, 
-                     label_a: str = 'Run A', label_b: str = 'Run B') -> pd.DataFrame:
+                     label_a: str = 'Run A', label_b: str = 'Run B',
+                     config: Optional[str] = None) -> pd.DataFrame:
     """
     Combine daily data from two runs for overlay plotting.
     
@@ -178,6 +202,7 @@ def get_overlay_data(daily_a: pd.DataFrame, daily_b: pd.DataFrame,
         daily_b: Daily DataFrame from Run B
         label_a: Label for Run A
         label_b: Label for Run B
+        config: Specific config to use (default: 'lag0_residoff' or first available)
         
     Returns:
         Combined DataFrame with 'run' column for coloring
@@ -188,12 +213,15 @@ def get_overlay_data(daily_a: pd.DataFrame, daily_b: pd.DataFrame,
     dfs = []
     
     if daily_a is not None and 'cumret' in daily_a.columns:
-        # If there are multiple configs, use the first signal config
+        # If there are multiple configs, use specified or default config
         if 'config' in daily_a.columns and 'type' in daily_a.columns:
             signal_data = daily_a[daily_a['type'] == 'signal']
             if len(signal_data) > 0:
-                first_config = signal_data['config'].iloc[0]
-                subset = signal_data[signal_data['config'] == first_config][['date', 'cumret']].copy()
+                target_config = config or _get_default_config(signal_data)
+                subset = signal_data[signal_data['config'] == target_config][['date', 'cumret']].copy()
+                if len(subset) == 0:
+                    # Fallback if specified config not found
+                    subset = signal_data[['date', 'cumret']].drop_duplicates('date')
             else:
                 subset = daily_a[['date', 'cumret']].drop_duplicates('date')
         else:
@@ -206,8 +234,10 @@ def get_overlay_data(daily_a: pd.DataFrame, daily_b: pd.DataFrame,
         if 'config' in daily_b.columns and 'type' in daily_b.columns:
             signal_data = daily_b[daily_b['type'] == 'signal']
             if len(signal_data) > 0:
-                first_config = signal_data['config'].iloc[0]
-                subset = signal_data[signal_data['config'] == first_config][['date', 'cumret']].copy()
+                target_config = config or _get_default_config(signal_data)
+                subset = signal_data[signal_data['config'] == target_config][['date', 'cumret']].copy()
+                if len(subset) == 0:
+                    subset = signal_data[['date', 'cumret']].drop_duplicates('date')
             else:
                 subset = daily_b[['date', 'cumret']].drop_duplicates('date')
         else:
@@ -221,10 +251,16 @@ def get_overlay_data(daily_a: pd.DataFrame, daily_b: pd.DataFrame,
     return pd.DataFrame()
 
 
-def compute_cumret_diff(daily_a: pd.DataFrame, daily_b: pd.DataFrame) -> pd.DataFrame:
+def compute_cumret_diff(daily_a: pd.DataFrame, daily_b: pd.DataFrame,
+                        config: Optional[str] = None) -> pd.DataFrame:
     """
     Compute the difference in cumulative returns between two runs.
     Useful for seeing when one run outperformed the other.
+    
+    Args:
+        daily_a: Daily DataFrame from Run A
+        daily_b: Daily DataFrame from Run B
+        config: Specific config to use (default: 'lag0_residoff' or first available)
     
     Returns DataFrame with date and cumret_diff columns.
     """
@@ -234,17 +270,19 @@ def compute_cumret_diff(daily_a: pd.DataFrame, daily_b: pd.DataFrame) -> pd.Data
     if 'cumret' not in daily_a.columns or 'cumret' not in daily_b.columns:
         return pd.DataFrame()
     
-    # Get the first config from each
-    def get_first_config_cumret(df):
+    # Get the default config's cumret
+    def get_config_cumret(df, target_config=None):
         if 'config' in df.columns and 'type' in df.columns:
             signal_data = df[df['type'] == 'signal']
             if len(signal_data) > 0:
-                first_config = signal_data['config'].iloc[0]
-                return signal_data[signal_data['config'] == first_config][['date', 'cumret']]
+                cfg = target_config or _get_default_config(signal_data)
+                subset = signal_data[signal_data['config'] == cfg][['date', 'cumret']]
+                if len(subset) > 0:
+                    return subset
         return df[['date', 'cumret']].drop_duplicates('date')
     
-    a = get_first_config_cumret(daily_a)
-    b = get_first_config_cumret(daily_b)
+    a = get_config_cumret(daily_a, config)
+    b = get_config_cumret(daily_b, config)
     
     # Merge on date
     merged = a.merge(b, on='date', suffixes=('_a', '_b'), how='inner')

@@ -358,22 +358,45 @@ def main():
                     # Overlay plots
                     st.subheader("Cumulative Return Comparison")
                     if result.daily_a is not None or result.daily_b is not None:
+                        # Get available configs from both runs
+                        available_configs = set()
+                        if result.daily_a is not None and 'config' in result.daily_a.columns:
+                            available_configs.update(result.daily_a['config'].unique())
+                        if result.daily_b is not None and 'config' in result.daily_b.columns:
+                            available_configs.update(result.daily_b['config'].unique())
+                        
+                        # Config selector
+                        if available_configs:
+                            config_list = sorted(available_configs)
+                            # Default to lag0_residoff if available
+                            default_idx = config_list.index('lag0_residoff') if 'lag0_residoff' in config_list else 0
+                            selected_config = st.selectbox(
+                                "Configuration to compare",
+                                config_list,
+                                index=default_idx,
+                                key="compare_config",
+                                help="Select which lag/resid configuration to compare"
+                            )
+                        else:
+                            selected_config = None
+                        
                         overlay_data = get_overlay_data(
                             result.daily_a, result.daily_b,
                             label_a=result.run_a.get('signal_name', 'Run A'),
-                            label_b=result.run_b.get('signal_name', 'Run B')
+                            label_b=result.run_b.get('signal_name', 'Run B'),
+                            config=selected_config
                         )
                         
                         if len(overlay_data) > 0:
                             fig = px.line(
                                 overlay_data, x='date', y='cumret', color='run',
-                                title='Cumulative Return: Run A vs Run B'
+                                title=f'Cumulative Return: Run A vs Run B ({selected_config or "default"})'
                             )
                             fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02))
                             st.plotly_chart(fig, width='stretch', key="compare_cumret")
                             
                             # Difference plot
-                            diff_data = compute_cumret_diff(result.daily_a, result.daily_b)
+                            diff_data = compute_cumret_diff(result.daily_a, result.daily_b, config=selected_config)
                             if len(diff_data) > 0:
                                 st.subheader("Return Difference (Run B - Run A)")
                                 fig_diff = go.Figure()
