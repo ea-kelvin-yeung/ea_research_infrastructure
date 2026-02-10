@@ -113,7 +113,7 @@ def _create_master_data(ret_df: pd.DataFrame, risk_df: pd.DataFrame) -> pd.DataF
     
     # Select columns from risk
     risk_cols = ['security_id', 'date']
-    optional_risk_cols = ['mcap', 'cap', 'industry_id', 'sector_id', 
+    optional_risk_cols = ['mcap', 'adv', 'cap', 'industry_id', 'sector_id', 
                           'size', 'value', 'growth', 'leverage', 
                           'volatility', 'momentum', 'yield']
     for col in optional_risk_cols:
@@ -233,11 +233,12 @@ def load_catalog(snapshot_path: str = "snapshots/default", use_master: bool = Tr
             if 'security_id' in master_df.columns:
                 master_df = master_df.set_index(['security_id', 'date']).sort_index()
             catalog['master'] = master_df
-        elif not is_v2:
-            # Fallback for v1: create master on the fly
+        else:
+            # Create master on the fly if missing
+            print(f"Creating master.parquet...")
             catalog['master'] = _create_master_data(ret_df, risk_df)
             catalog['master'].reset_index().to_parquet(master_path, index=False)
-            print(f"Created master.parquet: {len(catalog['master'])} rows")
+            print(f"Created master.parquet: {len(catalog['master']):,} rows")
         
         # Load factors (pre-indexed)
         factors_path = path / 'factors.parquet'

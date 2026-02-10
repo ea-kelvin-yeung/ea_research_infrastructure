@@ -760,7 +760,7 @@ class BacktestFast:
             out[col + suffix] = taken
         return out
 
-    def _fast_join_master(self, df, cols, how='inner'):
+    def _fast_join_master(self, df, cols, how='inner', source='auto'):
         """
         Fast join using pre-indexed master_data with numpy get_indexer.
         
@@ -771,10 +771,26 @@ class BacktestFast:
             df: DataFrame with security_id and date columns
             cols: List of columns to retrieve from master_data
             how: Join type ('inner' or 'left')
+            source: Data source - 'auto' (default), 'ret', 'risk', or 'master'
+                   'auto' uses retfile for ret columns, otherwise master_data
             
         Returns:
             DataFrame with requested columns joined
         """
+        # For ret/resret columns, use retfile directly to match original behavior
+        # (avoids excluding rows that exist in ret but not in risk)
+        ret_cols = {'ret', 'resret', 'openret', 'resopenret'}
+        
+        if source == 'auto' and set(cols) <= ret_cols:
+            # These are return columns - use retfile directly
+            available = [c for c in cols if c in self.retfile.columns]
+            if available:
+                return df.merge(
+                    self.retfile[['security_id', 'date'] + available],
+                    on=['security_id', 'date'],
+                    how=how
+                )
+        
         if self.master_data is None:
             # Fall back to traditional merge
             return df.merge(

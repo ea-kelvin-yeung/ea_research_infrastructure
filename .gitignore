@@ -29,6 +29,7 @@ env/
 *.feather
 *.arrow
 *.db
+*archive
 
 # Snapshots and artifacts
 snapshots/

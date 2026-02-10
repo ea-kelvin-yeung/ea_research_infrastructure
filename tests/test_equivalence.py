@@ -42,7 +42,7 @@ def load_test_signal():
     return pd.read_parquet(signal_path)
 
 
-def load_test_catalog():
+def load_test_catalog(use_master=False):
     """Load catalog for testing."""
     snapshots = list_snapshots('snapshots')
     if not snapshots:
@@ -50,7 +50,7 @@ def load_test_catalog():
             pytest.skip("No snapshots found. Create one first.")
         else:
             raise RuntimeError("No snapshots found. Create one first.")
-    return load_catalog(f'snapshots/{snapshots[0]}')
+    return load_catalog(f'snapshots/{snapshots[0]}', use_master=use_master)
 
 
 def prepare_signal_for_backtest(signal_df, catalog):
@@ -96,7 +96,7 @@ def run_backtest_original(signal_df, catalog, **kwargs):
 
 def run_backtest_fast(signal_df, catalog, **kwargs):
     """Run the optimized BacktestFast engine."""
-    bt = BacktestFast(
+    bt_kwargs = dict(
         infile=signal_df,
         retfile=catalog['ret'],
         otherfile=catalog['risk'],
@@ -113,8 +113,14 @@ def run_backtest_fast(signal_df, catalog, **kwargs):
         resid=False,
         output='simple',
         verbose=False,
-        **kwargs,
     )
+    bt_kwargs.update(kwargs)
+    
+    # Use master_data if available in catalog
+    if 'master' in catalog and catalog['master'] is not None:
+        bt_kwargs['master_data'] = catalog['master']
+    
+    bt = BacktestFast(**bt_kwargs)
     return bt.gen_result()
 
 
@@ -236,10 +242,12 @@ if HAS_PYTEST:
                         assert rel_diff < 1e-3, f"{metric}: {val_orig} vs {val_fast} (rel_diff: {rel_diff:.2e})"
 
 
-def run_equivalence_check():
+def run_equivalence_check(use_master=False):
     """Run a quick equivalence check (for non-pytest use)."""
+    mode_str = "with master_data" if use_master else "without master_data"
     print("=" * 60)
-    print("Running Equivalence Check: Original vs Optimized Backtest")
+    print(f"Running Equivalence Check: Original vs Optimized Backtest")
+    print(f"Mode: {mode_str}")
     print("=" * 60)
     
     # Load data
@@ -247,9 +255,12 @@ def run_equivalence_check():
     signal = load_test_signal()
     print(f"  Loaded {len(signal):,} rows")
     
-    print("\nLoading catalog...")
-    catalog = load_test_catalog()
-    print("  Catalog loaded")
+    print(f"\nLoading catalog (use_master={use_master})...")
+    catalog = load_test_catalog(use_master=use_master)
+    if use_master and 'master' in catalog:
+        print(f"  Catalog loaded with master_data: {len(catalog['master']):,} rows")
+    else:
+        print("  Catalog loaded (no master_data)")
     
     # Prepare signal
     print("\nPreparing signal...")
@@ -265,7 +276,7 @@ def run_equivalence_check():
     print(f"  Completed in {time_orig:.2f}s")
     
     # Run fast
-    print("\nRunning FAST backtest...")
+    print(f"\nRunning FAST backtest {mode_str}...")
     t0 = time.time()
     result_fast = run_backtest_fast(prepared, catalog)
     time_fast = time.time() - t0
@@ -314,5 +325,29 @@ def run_equivalence_check():
 
 
 if __name__ == '__main__':
-    success = run_equivalence_check()
-    sys.exit(0 if success else 1)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--use-master', action='store_true', help='Test with master_data enabled')
+    parser.add_argument('--both', action='store_true', help='Test both with and without master_data')
+    args = parser.parse_args()
+    
+    if args.both:
+        print("\n" + "=" * 60)
+        print("TEST 1: Without master_data")
+        print("=" * 60)
+        success1 = run_equivalence_check(use_master=False)
+        
+        print("\n\n" + "=" * 60)
+        print("TEST 2: With master_data")
+        print("=" * 60)
+        success2 = run_equivalence_check(use_master=True)
+        
+        print("\n" + "=" * 60)
+        print("SUMMARY")
+        print("=" * 60)
+        print(f"  Without master_data: {'PASSED' if success1 else 'FAILED'}")
+        print(f"  With master_data:    {'PASSED' if success2 else 'FAILED'}")
+        sys.exit(0 if (success1 and success2) else 1)
+    else:
+        success = run_equivalence_check(use_master=args.use_master)
+        sys.exit(0 if success else 1)
