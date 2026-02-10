@@ -27,9 +27,9 @@ def get_cached_catalog(snapshot_path: str):
     return load_catalog(snapshot_path, use_master=True)
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=10, show_spinner=False)
 def get_cached_run_history():
-    """Get run history with 60-second cache to avoid repeated MLflow queries."""
+    """Get run history with 10-second cache to avoid repeated MLflow queries."""
     return get_run_history()
 from poc.tracking import log_run, get_run_history, get_git_sha, compute_signal_hash, delete_runs
 from poc.charts import (
@@ -253,6 +253,9 @@ def main():
                 # Final summary
                 total_time = time.time() - total_start
                 st.success(f"Suite completed in {total_time:.1f}s! Check the History tab to view results.")
+                
+                # Clear run history cache so new run shows up immediately
+                get_cached_run_history.clear()
                 
             except Exception as e:
                 st.error(f"Error: {e}")
