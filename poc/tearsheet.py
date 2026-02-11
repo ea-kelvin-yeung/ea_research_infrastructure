@@ -1,6 +1,5 @@
 """
 Tear Sheet Generator: Create HTML reports from suite results.
-~200 lines - includes verdict logic.
 """
 
 import pandas as pd

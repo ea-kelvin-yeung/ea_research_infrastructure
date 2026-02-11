@@ -1,6 +1,5 @@
 """
 Backtest Wrapper: Thin wrapper around Backtest/BacktestFast classes.
-~170 lines - stable API with clean result dataclass.
 """
 
 import pandas as pd

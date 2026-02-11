@@ -1,6 +1,5 @@
 """
 Signal Contract: Schema validation and date alignment.
-~100 lines - keep it simple.
 """
 
 import pandas as pd

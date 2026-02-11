@@ -1,6 +1,5 @@
 """
 Suite Runner: Run a grid of backtest configs in one call.
-~150 lines - the "one button" experience.
 """
 
 import pandas as pd

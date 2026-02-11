@@ -1,6 +1,5 @@
 """
 Streamlit UI: Simple launcher and viewer for backtest suite.
-~200 lines - single-page app.
 
 Run with: streamlit run poc/app.py
 """
