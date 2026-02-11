@@ -696,6 +696,41 @@ def load_catalog(
             'resid': resid_table,
             'byvars_cap': cap_table,
         }
+        
+        # Pre-compute Polars DataFrames to avoid expensive runtime conversions
+        # Load directly from parquet as Polars to avoid memory duplication
+        try:
+            import polars as pl
+            
+            # Master as Polars - load directly from parquet (avoids reset_index)
+            master_parquet = path / 'master.parquet'
+            if master_parquet.exists():
+                catalog['master_pl'] = pl.read_parquet(master_parquet)
+            elif 'master' in catalog and catalog['master'] is not None:
+                # Fallback: convert from Pandas
+                catalog['master_pl'] = pl.from_pandas(catalog['master'].reset_index())
+            
+            # Otherfile (risk) as Polars - load from parquet
+            risk_parquet = path / 'risk.parquet'
+            if risk_parquet.exists():
+                catalog['otherfile_pl'] = pl.read_parquet(risk_parquet)
+            else:
+                # Check partitioned
+                risk_partitions = path / 'partitions' / 'risk'
+                if risk_partitions.exists():
+                    catalog['otherfile_pl'] = pl.read_parquet(risk_partitions)
+                else:
+                    catalog['otherfile_pl'] = pl.from_pandas(risk_df)
+            
+            # Pre-sorted asof tables as Polars
+            catalog['asof_tables_pl'] = {
+                'resid': pl.from_pandas(resid_table).sort('date_sig'),
+                'byvars_cap': pl.from_pandas(cap_table).sort('date_sig'),
+            }
+            
+        except ImportError:
+            # Polars not installed, skip pre-computation
+            pass
     
     return catalog
 

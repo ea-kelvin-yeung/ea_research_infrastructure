@@ -131,6 +131,16 @@ def run_backtest_fast(signal_df, catalog, **kwargs):
         bt_kwargs['master_data'] = catalog['master']
     
     bt = BacktestFast(**bt_kwargs)
+    
+    # Set pre-computed indexes and Polars DataFrames for maximum performance
+    bt.set_precomputed_indexes(
+        dates_indexed=catalog.get('dates_indexed'),
+        asof_tables=catalog.get('asof_tables'),
+        master_pl=catalog.get('master_pl'),
+        otherfile_pl=catalog.get('otherfile_pl'),
+        asof_tables_pl=catalog.get('asof_tables_pl'),
+    )
+    
     return bt.gen_result()
 
 

@@ -641,6 +641,7 @@ class BacktestFast:
         # Cached Polars DataFrames (avoid repeated conversions)
         self._master_pl = None  # Polars version of master_data
         self._otherfile_pl = None  # Polars version of otherfile
+        self._asof_tables_pl = None  # Pre-sorted Polars DataFrames for merge_asof
 
     def set_precomputed_indexes(
         self,
@@ -648,6 +649,9 @@ class BacktestFast:
         ret_indexed=None,
         dates_indexed=None,
         asof_tables=None,
+        master_pl=None,
+        otherfile_pl=None,
+        asof_tables_pl=None,
     ):
         """
         Set pre-computed indexes from catalog for faster joins.
@@ -660,6 +664,9 @@ class BacktestFast:
             ret_indexed: DataFrame indexed by (security_id, date)
             dates_indexed: Dict with 'by_date' and 'by_n' indexed DataFrames
             asof_tables: Dict with 'resid' and 'byvars_cap' pre-sorted DataFrames
+            master_pl: Pre-computed Polars DataFrame of master_data (saves ~8s)
+            otherfile_pl: Pre-computed Polars DataFrame of otherfile
+            asof_tables_pl: Dict with pre-sorted Polars DataFrames for merge_asof
         """
         # Note: We don't use risk_indexed/ret_indexed directly anymore
         # because _fast_join_master uses master_data which is already indexed
@@ -672,6 +679,16 @@ class BacktestFast:
             self._other_asof_resid = asof_tables.get('resid')
             if 'byvars_cap' in asof_tables:
                 self._other_asof_byvars[('cap',)] = asof_tables['byvars_cap']
+        
+        # Pre-computed Polars DataFrames (avoids expensive reset_index + to_polars)
+        if master_pl is not None:
+            self._master_pl = master_pl
+        
+        if otherfile_pl is not None:
+            self._otherfile_pl = otherfile_pl
+        
+        if asof_tables_pl is not None:
+            self._asof_tables_pl = asof_tables_pl
 
     def _get_datefile_by_date(self):
         """Get datefile indexed by date for fast lookups."""
@@ -686,9 +703,14 @@ class BacktestFast:
         return self._datefile_by_n
     
     def _get_master_pl(self):
-        """Get master_data as Polars DataFrame (cached)."""
+        """Get master_data as Polars DataFrame (cached).
+        
+        If pre-computed via set_precomputed_indexes(), uses that directly.
+        Otherwise, does expensive reset_index() + to_polars() conversion.
+        """
         if self._master_pl is None and self.master_data is not None:
-            # Reset index to get security_id and date as columns
+            # Expensive fallback: reset index and convert
+            # This takes ~8 seconds for 30M rows - prefer pre-computation!
             master_reset = self.master_data.reset_index()
             self._master_pl = _to_polars(master_reset)
         return self._master_pl
@@ -819,10 +841,10 @@ class BacktestFast:
 
     def _fast_join_master(self, df, cols, how='inner', source='auto'):
         """
-        Fast join using pre-indexed master_data with numpy get_indexer.
+        Fast join using pre-computed Polars or indexed master_data.
         
-        Uses get_indexer + numpy take instead of merge/join/reindex to
-        completely bypass pandas is_unique checks and hash-based key matching.
+        For ret columns: Uses retfile directly (preserves rows that exist in ret but not risk)
+        For other columns: Uses pre-computed Polars master_pl (fastest)
         
         Args:
             df: DataFrame with security_id and date columns
@@ -834,19 +856,36 @@ class BacktestFast:
         Returns:
             DataFrame with requested columns joined
         """
-        # For ret/resret columns, use retfile directly to match original behavior
-        # (avoids excluding rows that exist in ret but not in risk)
         ret_cols = {'ret', 'resret', 'openret', 'resopenret'}
         
+        # For ret/resret columns, MUST use retfile directly to preserve row count
+        # (master_pl is ret∩risk which may exclude rows that exist only in ret)
         if source == 'auto' and set(cols) <= ret_cols:
-            # These are return columns - use retfile directly
             available = [c for c in cols if c in self.retfile.columns]
             if available:
-                return df.merge(
-                    self.retfile[['security_id', 'date'] + available],
-                    on=['security_id', 'date'],
-                    how=how
-                )
+                # Use Polars for the join if retfile is small enough
+                if self._otherfile_pl is not None and len(self.retfile) < 50_000_000:
+                    # Fast path: Polars join with retfile
+                    ret_pl = _to_polars(self.retfile[['security_id', 'date'] + available])
+                    df_pl = _to_polars(df)
+                    result_pl = df_pl.join(ret_pl, on=['security_id', 'date'], how=how)
+                    return _to_pandas(result_pl)
+                else:
+                    # Fallback: Pandas merge
+                    return df.merge(
+                        self.retfile[['security_id', 'date'] + available],
+                        on=['security_id', 'date'],
+                        how=how
+                    )
+        
+        # FAST PATH: Use pre-computed Polars DataFrame for non-ret columns
+        master_pl = self._get_master_pl()
+        if master_pl is not None:
+            available_cols = [c for c in cols if c in master_pl.columns]
+            if available_cols:
+                df_pl = _to_polars(df)
+                result_pl = _polars_join_master(df_pl, master_pl, available_cols, how=how)
+                return _to_pandas(result_pl)
         
         if self.master_data is None:
             # Fall back to traditional merge
