@@ -8,6 +8,7 @@ Created on Wed Dec  2 13:47:34 2020
 
 import numpy as np
 import pandas as pd
+import polars as pl
 import statsmodels.api as sm
 import math
 import yfinance as yf
@@ -15,6 +16,20 @@ import pandas_datareader as pdr
 from functools import reduce
 
 pd.options.mode.chained_assignment = None
+
+
+# =============================================================================
+# Polars Conversion Helpers
+# =============================================================================
+
+def _to_polars(df: pd.DataFrame) -> pl.DataFrame:
+    """Convert pandas DataFrame to Polars."""
+    return pl.from_pandas(df)
+
+
+def _to_pandas(df: pl.DataFrame) -> pd.DataFrame:
+    """Convert Polars DataFrame to pandas."""
+    return df.to_pandas()
 
 
 # %%
@@ -879,18 +894,20 @@ class BacktestFast:
                 raise RuntimeError(
                     "signal residualization only applies to numerical signal"
                 )
-            # Use cached pre-sorted table (optimization #1)
-            # Sort by date_sig (globally) - merge_asof requires this
-            temp = pd.merge_asof(
-                temp.sort_values(by=["date_sig"]),
-                self._get_other_asof_resid(),  # Pre-sorted, cached
+            # Use Polars join_asof for faster performance
+            temp_pl = _to_polars(temp).sort("date_sig")
+            other_pl = _to_polars(self._get_other_asof_resid()).sort("date_sig")
+            
+            temp_pl = temp_pl.join_asof(
+                other_pl,
                 by="security_id",
                 on="date_sig",
-                allow_exact_matches=True,
-                direction="backward",
-                tolerance=pd.Timedelta("5d"),
-            ).dropna()
-            temp = temp.sort_values(by=["date", "security_id"]).reset_index(drop=True)
+                strategy="backward",
+                tolerance="5d",
+            )
+            temp_pl = temp_pl.drop_nulls()
+            temp_pl = temp_pl.sort(["date", "security_id"])
+            temp = _to_pandas(temp_pl).reset_index(drop=True)
 
             # Prepare numpy arrays for vectorized residualization (20-50x faster)
             dates = temp["date"].values
@@ -977,6 +994,9 @@ class BacktestFast:
         #     primarily check for shape of factor exposure and monotonicity of fractile return
         # No need for this if input_type is position or weight
 
+        # Convert to Polars for faster ranking and groupby operations
+        port_pl = _to_polars(port)
+
         if self.input_type == "value":
             # double sorting
             if self.sort_method == "double":
@@ -984,66 +1004,81 @@ class BacktestFast:
                     self.double_file = self.otherfile[
                         ["security_id", "date", self.double_var]
                     ]
-                port = pd.merge_asof(
-                    port.sort_values(by=["date_sig"]),
-                    self._get_doublefile_sorted().rename(
-                        columns={"date": "date_doublevar"}
-                    ),
+                # Polars join_asof for double sort
+                double_pl = _to_polars(
+                    self._get_doublefile_sorted().rename(columns={"date": "date_doublevar"})
+                )
+                port_pl = port_pl.sort("date_sig").join_asof(
+                    double_pl.sort("date_doublevar"),
                     by="security_id",
                     left_on="date_sig",
                     right_on="date_doublevar",
-                    allow_exact_matches=True,
-                    direction="backward",
+                    strategy="backward",
                 )
+                port_pl = port_pl.drop_nulls()
 
-                port = port.dropna()
+                # Ranking with Polars over()
+                rank_method = "ordinal" if self.frac_stretch else "average"
+                port_pl = port_pl.with_columns([
+                    (pl.col(self.double_var).rank("average").over("date") *
+                     self.double_frac / pl.col(self.double_var).count().over("date")
+                    ).ceil().alias("fractile_double")
+                ])
 
-                grp_date = port.groupby("date", sort=False)[self.double_var]
-                rank = grp_date.rank(method="average")
-                group_size = grp_date.transform("count")
-                port["fractile_double"] = np.ceil(
-                    rank * self.double_frac / group_size
-                )
+                # Second-level ranking within fractile_double
+                sig_rank_method = "max" if self.frac_stretch else "average"
+                port_pl = port_pl.with_columns([
+                    (pl.col(self.sigvar).rank(sig_rank_method).over(["fractile_double", "date"]) * 100 /
+                     pl.col(self.sigvar).count().over(["fractile_double", "date"])
+                    ).ceil().alias("percentile")
+                ])
 
-                grp_fd = port.groupby(
-                    ["fractile_double", "date"], sort=False
-                )[self.sigvar]
-                group_size = grp_fd.transform("count")
-                rank = grp_fd.rank(method="max" if self.frac_stretch else "average")
-                percentile = np.ceil(rank * 100 / group_size)
                 if self.frac_stretch:
-                    pct_group = percentile.groupby(
-                        [port["fractile_double"], port["date"]], sort=False
-                    )
-                    min_pct = pct_group.transform("min")
-                    max_pct = pct_group.transform("max")
-                    percentile = (percentile - min_pct + 1) * 100 / (
-                        max_pct - min_pct + 1
-                    )
-                port["fractile"] = np.ceil(percentile * n_fractile / 100)
+                    port_pl = port_pl.with_columns([
+                        pl.col("percentile").min().over(["fractile_double", "date"]).alias("min_pct"),
+                        pl.col("percentile").max().over(["fractile_double", "date"]).alias("max_pct"),
+                    ])
+                    port_pl = port_pl.with_columns([
+                        ((pl.col("percentile") - pl.col("min_pct") + 1) * 100 /
+                         (pl.col("max_pct") - pl.col("min_pct") + 1)).alias("percentile")
+                    ]).drop(["min_pct", "max_pct"])
+
+                port_pl = port_pl.with_columns([
+                    (pl.col("percentile") * n_fractile / 100).ceil().alias("fractile")
+                ])
 
             # single sorting
             elif self.sort_method == "single":
+                sig_rank_method = "max" if self.frac_stretch else "average"
+                port_pl = port_pl.with_columns([
+                    (pl.col(self.sigvar).rank(sig_rank_method).over("date") * 100 /
+                     pl.col(self.sigvar).count().over("date")
+                    ).ceil().alias("percentile")
+                ])
 
-                grp_date = port.groupby("date", sort=False)[self.sigvar]
-                group_size = grp_date.transform("count")
-                rank = grp_date.rank(method="max" if self.frac_stretch else "average")
-                percentile = np.ceil(rank * 100 / group_size)
                 if self.frac_stretch:
-                    pct_group = percentile.groupby(port["date"], sort=False)
-                    min_pct = pct_group.transform("min")
-                    max_pct = pct_group.transform("max")
-                    percentile = (percentile - min_pct + 1) * 100 / (
-                        max_pct - min_pct + 1
-                    )
-                port["fractile"] = np.ceil(percentile * n_fractile / 100)
+                    port_pl = port_pl.with_columns([
+                        pl.col("percentile").min().over("date").alias("min_pct"),
+                        pl.col("percentile").max().over("date").alias("max_pct"),
+                    ])
+                    port_pl = port_pl.with_columns([
+                        ((pl.col("percentile") - pl.col("min_pct") + 1) * 100 /
+                         (pl.col("max_pct") - pl.col("min_pct") + 1)).alias("percentile")
+                    ]).drop(["min_pct", "max_pct"])
+
+                port_pl = port_pl.with_columns([
+                    (pl.col("percentile") * n_fractile / 100).ceil().alias("fractile")
+                ])
 
         elif self.input_type == "fractile":
-            port["fractile"] = port[self.sigvar]
+            port_pl = port_pl.with_columns([
+                pl.col(self.sigvar).alias("fractile")
+            ])
 
-        port = port[["security_id", "date", "fractile", "ret", "resret"]]
+        # Select columns and convert back to pandas for join with master_data
+        port = _to_pandas(port_pl.select(["security_id", "date", "fractile", "ret", "resret"]))
         
-        # Use fast join if master_data available
+        # Use fast join if master_data available (keep in pandas - already optimized)
         needed_cols = ["adv", "mcap"] + self.factor_list
         if self.master_data is not None:
             port = self._fast_join_master(port, needed_cols, how='inner')
@@ -1053,58 +1088,61 @@ class BacktestFast:
                 on=["security_id", "date"],
             )
 
-        if self.weight == "equal":
-            group_size = port.groupby(["date", "fractile"], sort=False)[
-                "security_id"
-            ].transform("count")
-            port["weight"] = 1 / group_size
-        elif self.weight == "value":
-            mcap_grp = port.groupby(["date", "fractile"], sort=False)["mcap"]
-            port["mcap_h"] = mcap_grp.transform(
-                "quantile", q=self.upper_pct / 100
-            )
-            port["mcap_l"] = mcap_grp.transform(
-                "quantile", q=1 - self.upper_pct / 100
-            )
-            port["mcap"] = np.select(
-                [port["mcap"] > port["mcap_h"], port["mcap"] < port["mcap_l"]],
-                [port["mcap_h"], port["mcap_l"]],
-                default=port["mcap"],
-            )
-            mcap_sum = port.groupby(["date", "fractile"], sort=False)[
-                "mcap"
-            ].transform("sum")
-            port["weight"] = port["mcap"] / mcap_sum
-        elif self.weight == "volume":
-            adv_grp = port.groupby(["date", "fractile"], sort=False)["adv"]
-            port["adv_h"] = adv_grp.transform("quantile", q=self.upper_pct / 100)
-            port["adv_l"] = adv_grp.transform("quantile", q=1 - self.upper_pct / 100)
-            port["adv"] = np.select(
-                [port["adv"] > port["adv_h"], port["adv"] < port["adv_l"]],
-                [port["adv_h"], port["adv_l"]],
-                default=port["adv"],
-            )
-            adv_sum = port.groupby(["date", "fractile"], sort=False)["adv"].transform(
-                "sum"
-            )
-            port["weight"] = port["adv"] / adv_sum
-        port2 = port[
-            ["security_id", "date", "ret", "resret", "fractile", "weight"]
-            + self.factor_list
-        ]
+        # Convert back to Polars for weight calculations
+        port_pl = _to_polars(port)
 
-        numcos = (
-            port2.groupby(["date", "fractile"], sort=False)["security_id"]
-            .count()
-            .reset_index()
+        if self.weight == "equal":
+            port_pl = port_pl.with_columns([
+                (1.0 / pl.count().over(["date", "fractile"])).alias("weight")
+            ])
+        elif self.weight == "value":
+            # Quantile capping with Polars over()
+            port_pl = port_pl.with_columns([
+                pl.col("mcap").quantile(self.upper_pct / 100).over(["date", "fractile"]).alias("mcap_h"),
+                pl.col("mcap").quantile(1 - self.upper_pct / 100).over(["date", "fractile"]).alias("mcap_l"),
+            ])
+            port_pl = port_pl.with_columns([
+                pl.when(pl.col("mcap") > pl.col("mcap_h")).then(pl.col("mcap_h"))
+                .when(pl.col("mcap") < pl.col("mcap_l")).then(pl.col("mcap_l"))
+                .otherwise(pl.col("mcap")).alias("mcap")
+            ])
+            port_pl = port_pl.with_columns([
+                (pl.col("mcap") / pl.col("mcap").sum().over(["date", "fractile"])).alias("weight")
+            ])
+        elif self.weight == "volume":
+            port_pl = port_pl.with_columns([
+                pl.col("adv").quantile(self.upper_pct / 100).over(["date", "fractile"]).alias("adv_h"),
+                pl.col("adv").quantile(1 - self.upper_pct / 100).over(["date", "fractile"]).alias("adv_l"),
+            ])
+            port_pl = port_pl.with_columns([
+                pl.when(pl.col("adv") > pl.col("adv_h")).then(pl.col("adv_h"))
+                .when(pl.col("adv") < pl.col("adv_l")).then(pl.col("adv_l"))
+                .otherwise(pl.col("adv")).alias("adv")
+            ])
+            port_pl = port_pl.with_columns([
+                (pl.col("adv") / pl.col("adv").sum().over(["date", "fractile"])).alias("weight")
+            ])
+
+        # Select required columns
+        select_cols = ["security_id", "date", "ret", "resret", "fractile", "weight"] + self.factor_list
+        port2_pl = port_pl.select([c for c in select_cols if c in port_pl.columns])
+
+        # Calculate numcos filter with Polars
+        numcos_pl = (
+            port2_pl.group_by(["date", "fractile"])
+            .agg(pl.col("security_id").count().alias("security_id"))
         )
-        numcos = numcos[numcos["fractile"].isin([1, n_fractile])]
-        numcos["numcos"] = numcos.groupby("date", sort=False)["security_id"].transform(
-            "min"
-        )
-        numcos = numcos[["date", "numcos"]].drop_duplicates()
-        port2 = port2.merge(numcos, on="date")
-        port2 = port2[port2["numcos"] >= self.mincos]
+        numcos_pl = numcos_pl.filter(pl.col("fractile").is_in([1, int(n_fractile)]))
+        numcos_pl = numcos_pl.with_columns([
+            pl.col("security_id").min().over("date").alias("numcos")
+        ])
+        numcos_pl = numcos_pl.select(["date", "numcos"]).unique()
+
+        port2_pl = port2_pl.join(numcos_pl, on="date", how="inner")
+        port2_pl = port2_pl.filter(pl.col("numcos") >= self.mincos)
+
+        # Convert back to pandas for numpy weight scaling (efficient)
+        port2 = _to_pandas(port2_pl)
 
         weight = port2["weight"].to_numpy(dtype="float64", copy=False)
         scale_cols = [
@@ -1118,30 +1156,41 @@ class BacktestFast:
             "momentum",
             "yield",
         ]
+        # Filter scale_cols to only those present
+        scale_cols = [c for c in scale_cols if c in port2.columns]
         port2[scale_cols] = port2[scale_cols].to_numpy(copy=False) * weight[:, None]
 
-        check = port2.groupby(["date", "fractile"], sort=False).sum().reset_index()
-        check2 = (
-            port2.groupby(["date", "fractile"], sort=False)["security_id"]
-            .count()
-            .reset_index()
-            .rename(columns={"security_id": "numcos"})
-            .groupby("fractile", sort=False)
-            .mean()
-            .reset_index()
-        )
-        check3 = check.groupby(["fractile"], sort=False)[["ret", "resret"]].mean() * 252
-        check = check.groupby("fractile", sort=False)[
-            ["size", "value", "growth", "leverage", "volatility", "momentum", "yield"]
-        ].mean()
-        check = check.merge(check2, on="fractile")
-        check = check.merge(check3.reset_index(), on="fractile")
+        # Final aggregations with Polars
+        port2_pl = _to_polars(port2)
 
-        return check
+        check_pl = port2_pl.group_by(["date", "fractile"]).sum()
+        check2_pl = (
+            port2_pl.group_by(["date", "fractile"])
+            .agg(pl.col("security_id").count().alias("numcos"))
+            .group_by("fractile")
+            .agg(pl.col("numcos").mean())
+        )
+
+        factor_cols = ["size", "value", "growth", "leverage", "volatility", "momentum", "yield"]
+        factor_cols = [c for c in factor_cols if c in check_pl.columns]
+        check3_pl = (
+            check_pl.group_by("fractile")
+            .agg([pl.col("ret").mean() * 252, pl.col("resret").mean() * 252])
+        )
+        check_pl = (
+            check_pl.group_by("fractile")
+            .agg([pl.col(c).mean() for c in factor_cols])
+        )
+        check_pl = check_pl.join(check2_pl, on="fractile", how="left")
+        check_pl = check_pl.join(check3_pl, on="fractile", how="left")
+
+        return _to_pandas(check_pl)
 
     def portfolio_ls(self, sig_file, byvar):
 
-        temp = sig_file.copy()
+        # Convert to Polars for faster ranking operations
+        temp_pl = _to_polars(sig_file)
+
         if self.input_type == "value":
             # double sorting
             if self.sort_method == "double":
@@ -1149,99 +1198,103 @@ class BacktestFast:
                     self.double_file = self.otherfile[
                         ["security_id", "date", self.double_var]
                     ]
-                temp = pd.merge_asof(
-                    temp.sort_values(by=["date_sig"]),
-                    self._get_doublefile_sorted().rename(
-                        columns={"date": "date_doublevar"}
-                    ),
+                # Polars join_asof for double sort
+                double_pl = _to_polars(
+                    self._get_doublefile_sorted().rename(columns={"date": "date_doublevar"})
+                )
+                temp_pl = temp_pl.sort("date_sig").join_asof(
+                    double_pl.sort("date_doublevar"),
                     by="security_id",
                     left_on="date_sig",
                     right_on="date_doublevar",
-                    allow_exact_matches=True,
-                    direction="backward",
+                    strategy="backward",
                 )
+                temp_pl = temp_pl.drop_nulls()
 
-                temp = temp.dropna()
+                # First level ranking: fractile_double
+                temp_pl = temp_pl.with_columns([
+                    (pl.col(self.double_var).rank("average").over([byvar, "date"]) *
+                     self.double_frac / pl.col(self.double_var).count().over([byvar, "date"])
+                    ).ceil().alias("fractile_double")
+                ])
 
-                grp_bd = temp.groupby([byvar, "date"], sort=False)[self.double_var]
-                rank = grp_bd.rank(method="average")
-                group_size = grp_bd.transform("count")
-                temp["fractile_double"] = np.ceil(
-                    rank * self.double_frac / group_size
-                )
+                # Second level ranking within fractile_double
+                sig_rank_method = "max" if self.frac_stretch else "average"
+                temp_pl = temp_pl.with_columns([
+                    (pl.col(self.sigvar).rank(sig_rank_method).over([byvar, "fractile_double", "date"]) * 100 /
+                     pl.col(self.sigvar).count().over([byvar, "fractile_double", "date"])
+                    ).ceil().alias("percentile")
+                ])
 
-                grp_fd = temp.groupby(
-                    [byvar, "fractile_double", "date"], sort=False
-                )[self.sigvar]
-                group_size = grp_fd.transform("count")
-                rank = grp_fd.rank(method="max" if self.frac_stretch else "average")
-                percentile = np.ceil(rank * 100 / group_size)
                 if self.frac_stretch:
-                    pct_group = percentile.groupby(
-                        [temp[byvar], temp["fractile_double"], temp["date"]],
-                        sort=False,
-                    )
-                    min_pct = pct_group.transform("min")
-                    max_pct = pct_group.transform("max")
-                    percentile = (percentile - min_pct + 1) * 100 / (
-                        max_pct - min_pct + 1
-                    )
-                temp["percentile"] = percentile
+                    temp_pl = temp_pl.with_columns([
+                        pl.col("percentile").min().over([byvar, "fractile_double", "date"]).alias("min_pct"),
+                        pl.col("percentile").max().over([byvar, "fractile_double", "date"]).alias("max_pct"),
+                    ])
+                    temp_pl = temp_pl.with_columns([
+                        ((pl.col("percentile") - pl.col("min_pct") + 1) * 100 /
+                         (pl.col("max_pct") - pl.col("min_pct") + 1)).alias("percentile")
+                    ]).drop(["min_pct", "max_pct"])
 
-                temp["position"] = np.select(
-                    [
-                        temp["percentile"] <= self.fractile[0],
-                        temp["percentile"] > self.fractile[1],
-                    ],
-                    [-1, 1],
-                    default=0,
-                )
-                temp = temp.drop(columns=["date_doublevar", self.double_var])
+                # Assign position based on percentile thresholds
+                temp_pl = temp_pl.with_columns([
+                    pl.when(pl.col("percentile") <= self.fractile[0]).then(pl.lit(-1))
+                    .when(pl.col("percentile") > self.fractile[1]).then(pl.lit(1))
+                    .otherwise(pl.lit(0)).alias("position")
+                ])
+
+                # Drop intermediate columns
+                drop_cols = ["date_doublevar", self.double_var, "percentile", "fractile_double"]
+                temp_pl = temp_pl.drop([c for c in drop_cols if c in temp_pl.columns])
 
             # single sorting
             elif self.sort_method == "single":
-                grp_bd = temp.groupby([byvar, "date"], sort=False)[self.sigvar]
-                group_size = grp_bd.transform("count")
-                rank = grp_bd.rank(method="max" if self.frac_stretch else "average")
-                percentile = np.ceil(rank * 100 / group_size)
+                sig_rank_method = "max" if self.frac_stretch else "average"
+                temp_pl = temp_pl.with_columns([
+                    (pl.col(self.sigvar).rank(sig_rank_method).over([byvar, "date"]) * 100 /
+                     pl.col(self.sigvar).count().over([byvar, "date"])
+                    ).ceil().alias("percentile")
+                ])
+
                 if self.frac_stretch:
-                    pct_group = percentile.groupby(
-                        [temp[byvar], temp["date"]], sort=False
-                    )
-                    min_pct = pct_group.transform("min")
-                    max_pct = pct_group.transform("max")
-                    percentile = (percentile - min_pct + 1) * 100 / (
-                        max_pct - min_pct + 1
-                    )
-                temp["percentile"] = percentile
+                    temp_pl = temp_pl.with_columns([
+                        pl.col("percentile").min().over([byvar, "date"]).alias("min_pct"),
+                        pl.col("percentile").max().over([byvar, "date"]).alias("max_pct"),
+                    ])
+                    temp_pl = temp_pl.with_columns([
+                        ((pl.col("percentile") - pl.col("min_pct") + 1) * 100 /
+                         (pl.col("max_pct") - pl.col("min_pct") + 1)).alias("percentile")
+                    ]).drop(["min_pct", "max_pct"])
 
-                temp["position"] = np.select(
-                    [
-                        temp["percentile"] <= self.fractile[0],
-                        temp["percentile"] > self.fractile[1],
-                    ],
-                    [-1, 1],
-                    default=0,
-                )
-
-            temp = temp.drop(columns=["percentile"])
+                # Assign position based on percentile thresholds
+                temp_pl = temp_pl.with_columns([
+                    pl.when(pl.col("percentile") <= self.fractile[0]).then(pl.lit(-1))
+                    .when(pl.col("percentile") > self.fractile[1]).then(pl.lit(1))
+                    .otherwise(pl.lit(0)).alias("position")
+                ])
+                temp_pl = temp_pl.drop("percentile")
 
         # The byvar is meaningless if the input_type is not value
         elif self.input_type == "fractile":
-            temp["position"] = np.select(
-                [
-                    temp[self.sigvar] == temp[self.sigvar].min(),
-                    temp[self.sigvar] == temp[self.sigvar].max(),
-                ],
-                [-1, 1],
-                default=0,
-            )
+            sig_min = temp_pl.select(pl.col(self.sigvar).min()).item()
+            sig_max = temp_pl.select(pl.col(self.sigvar).max()).item()
+            temp_pl = temp_pl.with_columns([
+                pl.when(pl.col(self.sigvar) == sig_min).then(pl.lit(-1))
+                .when(pl.col(self.sigvar) == sig_max).then(pl.lit(1))
+                .otherwise(pl.lit(0)).alias("position")
+            ])
 
         elif self.input_type == "position":
-            temp["position"] = temp[self.sigvar]
+            temp_pl = temp_pl.with_columns([
+                pl.col(self.sigvar).alias("position")
+            ])
 
-        temp = temp[temp["position"].isin([-1, 1])]
-        
+        # Filter to only long/short positions
+        temp_pl = temp_pl.filter(pl.col("position").is_in([-1, 1]))
+
+        # Convert back to pandas for fast_join_master (already optimized with get_indexer)
+        temp = _to_pandas(temp_pl)
+
         # Use fast join if master_data available
         if self.master_data is not None:
             temp = self._fast_join_master(temp, ["adv", "mcap"], how='inner')
@@ -1255,63 +1308,63 @@ class BacktestFast:
 
     def gen_weight_ls(self, port, byvar):
 
+        # Convert to Polars for faster groupby operations
+        port_pl = _to_polars(port)
+        group_cols = [byvar, "date", "position"]
+
         if self.input_type != "weight":
             # generate weight
             if self.weight == "equal":
-                group_size = port.groupby(
-                    [byvar, "date", "position"], sort=False
-                )["security_id"].transform("count")
-                port["weight"] = (1 / group_size) * port["position"]
+                port_pl = port_pl.with_columns([
+                    (pl.col("position").cast(pl.Float64) / pl.count().over(group_cols)).alias("weight")
+                ])
             elif self.weight == "value":
-                mcap_grp = port.groupby([byvar, "date", "position"], sort=False)["mcap"]
-                port["mcap_h"] = mcap_grp.transform(
-                    "quantile", q=self.upper_pct / 100
-                )
-                port["mcap_l"] = mcap_grp.transform(
-                    "quantile", q=1 - self.upper_pct / 100
-                )
-                port["mcap"] = np.select(
-                    [port["mcap"] > port["mcap_h"], port["mcap"] < port["mcap_l"]],
-                    [port["mcap_h"], port["mcap_l"]],
-                    default=port["mcap"],
-                )
-                mcap_sum = port.groupby([byvar, "date", "position"], sort=False)[
-                    "mcap"
-                ].transform("sum")
-                port["weight"] = (port["mcap"] / mcap_sum) * port["position"]
+                # Quantile capping with Polars over()
+                port_pl = port_pl.with_columns([
+                    pl.col("mcap").quantile(self.upper_pct / 100).over(group_cols).alias("mcap_h"),
+                    pl.col("mcap").quantile(1 - self.upper_pct / 100).over(group_cols).alias("mcap_l"),
+                ])
+                port_pl = port_pl.with_columns([
+                    pl.when(pl.col("mcap") > pl.col("mcap_h")).then(pl.col("mcap_h"))
+                    .when(pl.col("mcap") < pl.col("mcap_l")).then(pl.col("mcap_l"))
+                    .otherwise(pl.col("mcap")).alias("mcap")
+                ])
+                port_pl = port_pl.with_columns([
+                    (pl.col("mcap") / pl.col("mcap").sum().over(group_cols) * pl.col("position").cast(pl.Float64)).alias("weight")
+                ])
             elif self.weight == "volume":
-                adv_grp = port.groupby([byvar, "date", "position"], sort=False)["adv"]
-                port["adv_h"] = adv_grp.transform(
-                    "quantile", q=self.upper_pct / 100
-                )
-                port["adv_l"] = adv_grp.transform(
-                    "quantile", q=1 - self.upper_pct / 100
-                )
-                port["adv"] = np.select(
-                    [port["adv"] > port["adv_h"], port["adv"] < port["adv_l"]],
-                    [port["adv_h"], port["adv_l"]],
-                    default=port["adv"],
-                )
-                adv_sum = port.groupby([byvar, "date", "position"], sort=False)[
-                    "adv"
-                ].transform("sum")
-                port["weight"] = (port["adv"] / adv_sum) * port["position"]
+                port_pl = port_pl.with_columns([
+                    pl.col("adv").quantile(self.upper_pct / 100).over(group_cols).alias("adv_h"),
+                    pl.col("adv").quantile(1 - self.upper_pct / 100).over(group_cols).alias("adv_l"),
+                ])
+                port_pl = port_pl.with_columns([
+                    pl.when(pl.col("adv") > pl.col("adv_h")).then(pl.col("adv_h"))
+                    .when(pl.col("adv") < pl.col("adv_l")).then(pl.col("adv_l"))
+                    .otherwise(pl.col("adv")).alias("adv")
+                ])
+                port_pl = port_pl.with_columns([
+                    (pl.col("adv") / pl.col("adv").sum().over(group_cols) * pl.col("position").cast(pl.Float64)).alias("weight")
+                ])
 
         elif self.input_type == "weight":
-            port["weight"] = port[self.sigvar]
-            if "position" not in port.columns.to_list():
-                port["position"] = np.where(port["weight"] > 0, 1, -1)
-            if self.weight_adj == True:
-                weight_sum = port.groupby([byvar, "date", "position"], sort=False)[
-                    "weight"
-                ].transform("sum")
-                port["weight"] = (port["weight"] / weight_sum) * port["position"]
-            port["weight"]
-        port2 = port[
-            ["security_id", "date", byvar, "ret", "resret", "position", "weight"]
-        ]
+            port_pl = port_pl.with_columns([
+                pl.col(self.sigvar).alias("weight")
+            ])
+            if "position" not in port_pl.columns:
+                port_pl = port_pl.with_columns([
+                    pl.when(pl.col("weight") > 0).then(pl.lit(1))
+                    .otherwise(pl.lit(-1)).alias("position")
+                ])
+            if self.weight_adj:
+                port_pl = port_pl.with_columns([
+                    (pl.col("weight") / pl.col("weight").sum().over(group_cols) * pl.col("position").cast(pl.Float64)).alias("weight")
+                ])
 
-        return port2
+        # Select required columns and convert back to pandas
+        select_cols = ["security_id", "date", byvar, "ret", "resret", "position", "weight"]
+        port2_pl = port_pl.select([c for c in select_cols if c in port_pl.columns])
+
+        return _to_pandas(port2_pl)
 
     def backtest(self, sigfile, byvar):
 
@@ -1337,20 +1390,31 @@ class BacktestFast:
         turnover = weight_file[["security_id", "date", byvar, "weight"]].copy()
         # Fast date lookup instead of merge
         turnover = self._fast_date_lookup(turnover, 'date', ['n'])
-        # number of stocks with non-zero position
-        turnover["numcos_l"] = np.where(turnover["weight"] > 0, 1, 0)
-        turnover["numcos_s"] = np.where(turnover["weight"] < 0, 1, 0)
-        turnover["numcos_l"] = turnover.groupby(
-            [byvar, "date"], sort=False
-        )["numcos_l"].transform("sum")
-        turnover["numcos_s"] = turnover.groupby(
-            [byvar, "date"], sort=False
-        )["numcos_s"].transform("sum")
-        turnover["numcos"] = turnover[["numcos_l", "numcos_s"]].min(axis=1)
+        
+        # Convert to Polars for faster groupby operations
+        turnover_pl = _to_polars(turnover)
+        
+        # number of stocks with non-zero position (Polars over())
+        turnover_pl = turnover_pl.with_columns([
+            pl.when(pl.col("weight") > 0).then(pl.lit(1)).otherwise(pl.lit(0)).alias("numcos_l_flag"),
+            pl.when(pl.col("weight") < 0).then(pl.lit(1)).otherwise(pl.lit(0)).alias("numcos_s_flag"),
+        ])
+        turnover_pl = turnover_pl.with_columns([
+            pl.col("numcos_l_flag").sum().over([byvar, "date"]).alias("numcos_l"),
+            pl.col("numcos_s_flag").sum().over([byvar, "date"]).alias("numcos_s"),
+        ]).drop(["numcos_l_flag", "numcos_s_flag"])
+        
+        turnover_pl = turnover_pl.with_columns([
+            pl.min_horizontal(["numcos_l", "numcos_s"]).alias("numcos")
+        ])
+        
         if self.method == "long_short":
-            turnover = turnover[turnover["numcos"] >= self.mincos]
+            turnover_pl = turnover_pl.filter(pl.col("numcos") >= self.mincos)
         elif self.method == "long_only":
-            turnover = turnover[turnover["numcos_l"] >= self.mincos]
+            turnover_pl = turnover_pl.filter(pl.col("numcos_l") >= self.mincos)
+        
+        # Convert back to pandas for fast numpy lookup (already optimized)
+        turnover = _to_pandas(turnover_pl)
 
         # calculate turnover from previous trading day
         # Optimization #3: Use fast numpy lookup instead of merge
@@ -1381,10 +1445,17 @@ class BacktestFast:
         turnover = pd.concat([turnover, exits], ignore_index=True, sort=False)
         # Fast n lookup instead of merge
         turnover = self._fast_n_lookup(turnover, 'n', ['date'])
-        turnover["n_min"] = turnover.groupby(byvar, sort=False)["n"].transform("min")
-        turnover["weight_diff"] = np.where(
-            turnover["n"] == turnover["n_min"], 0, turnover["weight_diff"]
-        )
+        
+        # Convert to Polars for n_min calculation
+        turnover_pl = _to_polars(turnover)
+        turnover_pl = turnover_pl.with_columns([
+            pl.col("n").min().over(byvar).alias("n_min")
+        ])
+        turnover_pl = turnover_pl.with_columns([
+            pl.when(pl.col("n") == pl.col("n_min")).then(pl.lit(0.0))
+            .otherwise(pl.col("weight_diff")).alias("weight_diff")
+        ])
+        turnover = _to_pandas(turnover_pl)
 
         if "cap" not in turnover.columns:
             # Use otherfile for cap lookup (same as original)
@@ -1422,30 +1493,35 @@ class BacktestFast:
             ) / (turnover["close_adj"])
 
         turnover["tc"] = turnover["tc"] * turnover["weight_diff"]
-        tc = turnover.groupby([byvar, "date"], sort=False)["tc"].sum().reset_index()
-        # calculate turnover and transaction cost for each day
-        turnover["turnover"] = turnover.groupby([byvar, "n"], sort=False)[
-            "weight_diff"
-        ].transform("sum")
-        turnover = (
-            turnover[["date", byvar, "numcos_l", "numcos_s", "turnover", "numcos"]]
-            .drop_duplicates()
-            .dropna()
-        )
+        
+        # Convert to Polars for aggregations
+        turnover_pl = _to_polars(turnover)
+        
+        # tc sum by group
+        tc_pl = turnover_pl.group_by([byvar, "date"]).agg(pl.col("tc").sum())
+        tc = _to_pandas(tc_pl)
+        
+        # calculate turnover with Polars over()
+        turnover_pl = turnover_pl.with_columns([
+            pl.col("weight_diff").sum().over([byvar, "n"]).alias("turnover")
+        ])
+        
+        # Select and deduplicate
+        turnover_pl = turnover_pl.select(["date", byvar, "numcos_l", "numcos_s", "turnover", "numcos"])
+        turnover_pl = turnover_pl.unique().drop_nulls()
+        
+        # date_minmax calculation
         if self.method == "long_short":
-            date_minmax = (
-                turnover[turnover["numcos"] >= self.mincos]
-                .groupby(byvar, sort=False)["date"]
-                .agg(["min", "max"])
-                .reset_index()
-            )
+            filtered_pl = turnover_pl.filter(pl.col("numcos") >= self.mincos)
         elif self.method == "long_only":
-            date_minmax = (
-                turnover[turnover["numcos_l"] >= self.mincos]
-                .groupby(byvar, sort=False)["date"]
-                .agg(["min", "max"])
-                .reset_index()
-            )
+            filtered_pl = turnover_pl.filter(pl.col("numcos_l") >= self.mincos)
+        
+        date_minmax_pl = filtered_pl.group_by(byvar).agg([
+            pl.col("date").min().alias("min"),
+            pl.col("date").max().alias("max"),
+        ])
+        date_minmax = _to_pandas(date_minmax_pl)
+        turnover = _to_pandas(turnover_pl)
 
         panel = (
             self.datefile[["date"]]
@@ -1468,12 +1544,14 @@ class BacktestFast:
             turnover = self._fast_date_lookup(turnover, 'date', ['insample2'])
             turnover = turnover[turnover["insample2"] == 1]
 
-        turnover = (
-            turnover.groupby(byvar, sort=False)
-            .mean()
-            .reset_index()
-            .rename(columns={byvar: "group"})
-        )
+        # Convert to Polars for mean aggregation
+        turnover_pl = _to_polars(turnover)
+        # Get numeric columns only for mean
+        numeric_cols = [c for c in turnover_pl.columns if c != byvar and c != "date" and turnover_pl[c].dtype in [pl.Float64, pl.Float32, pl.Int64, pl.Int32]]
+        turnover_pl = turnover_pl.group_by(byvar).agg([pl.col(c).mean() for c in numeric_cols])
+        turnover_pl = turnover_pl.rename({byvar: "group"})
+        turnover = _to_pandas(turnover_pl)
+        
         if byvar == "overall":
             turnover["group"] = "overall"
 
@@ -1482,15 +1560,21 @@ class BacktestFast:
 
         # calculate portfolio metrics: return, drawdown, factor exposure, industry exposure
         port = weight_file[["security_id", byvar, "date", "ret", "resret", "weight"]]
-        port["numcos_l"] = np.where(port["weight"] > 0, 1, 0)
-        port["numcos_s"] = np.where(port["weight"] < 0, 1, 0)
-        port["numcos_l"] = port.groupby([byvar, "date"], sort=False)[
-            "numcos_l"
-        ].transform("sum")
-        port["numcos_s"] = port.groupby([byvar, "date"], sort=False)[
-            "numcos_s"
-        ].transform("sum")
-        port["numcos"] = port[["numcos_l", "numcos_s"]].min(axis=1)
+        
+        # Convert to Polars for numcos calculations
+        port_pl = _to_polars(port)
+        port_pl = port_pl.with_columns([
+            pl.when(pl.col("weight") > 0).then(pl.lit(1)).otherwise(pl.lit(0)).alias("numcos_l_flag"),
+            pl.when(pl.col("weight") < 0).then(pl.lit(1)).otherwise(pl.lit(0)).alias("numcos_s_flag"),
+        ])
+        port_pl = port_pl.with_columns([
+            pl.col("numcos_l_flag").sum().over([byvar, "date"]).alias("numcos_l"),
+            pl.col("numcos_s_flag").sum().over([byvar, "date"]).alias("numcos_s"),
+        ]).drop(["numcos_l_flag", "numcos_s_flag"])
+        port_pl = port_pl.with_columns([
+            pl.min_horizontal(["numcos_l", "numcos_s"]).alias("numcos")
+        ])
+        port = _to_pandas(port_pl)
 
         # Use fast join if master_data available
         factor_cols = ["size", "value", "growth", "leverage", "volatility", "momentum", "yield"]
@@ -1526,17 +1610,24 @@ class BacktestFast:
         weight = port["weight"].to_numpy(dtype="float64", copy=False)
         port[var_list] = port[var_list].to_numpy(copy=False) * weight[:, None]
 
-        port2 = (
-            port.groupby([byvar, "date"], sort=False)[var_list]
-            .sum()
-            .reset_index()
-        )
-        port2 = port2.merge(tc, how="left", on=[byvar, "date"])
-        port2["tc"] = port2["tc"].fillna(0)
-        port2["ret_net"] = port2["ret"] - port2["tc"]
-        port2["resret_net"] = port2["resret"] - port2["tc"]
-        port2 = panel.merge(port2, how="left", on=[byvar, "date"])
-        port2 = port2.fillna(0)
+        # Convert to Polars for aggregation
+        port_pl = _to_polars(port)
+        port2_pl = port_pl.group_by([byvar, "date"]).agg([pl.col(c).sum() for c in var_list])
+        
+        # Join with tc
+        tc_pl = _to_polars(tc)
+        port2_pl = port2_pl.join(tc_pl, on=[byvar, "date"], how="left")
+        port2_pl = port2_pl.with_columns([
+            pl.col("tc").fill_null(0.0),
+            (pl.col("ret") - pl.col("tc").fill_null(0.0)).alias("ret_net"),
+            (pl.col("resret") - pl.col("tc").fill_null(0.0)).alias("resret_net"),
+        ])
+        
+        # Join with panel
+        panel_pl = _to_polars(panel)
+        port2_pl = panel_pl.join(port2_pl, on=[byvar, "date"], how="left")
+        port2_pl = port2_pl.fill_null(0.0)
+        port2 = _to_pandas(port2_pl)
 
         if self.insample == "i1":
             port2 = self._fast_date_lookup(port2, 'date', ['insample'])
@@ -1545,13 +1636,17 @@ class BacktestFast:
             port2 = self._fast_date_lookup(port2, 'date', ['insample2'])
             port2 = port2[port2["insample2"] == 1]
 
-        port2["cumret"] = port2.groupby(byvar, sort=False)["ret"].transform("cumsum")
-        port2["cumretnet"] = port2.groupby(byvar, sort=False)["ret_net"].transform(
-            "cumsum"
-        )
-        port2["drawdown"] = port2["cumret"] - port2.groupby(
-            byvar, sort=False
-        )["cumret"].transform("cummax")
+        # Convert to Polars for cumulative calculations
+        port2_pl = _to_polars(port2)
+        port2_pl = port2_pl.sort([byvar, "date"])  # Ensure sorted for cumsum
+        port2_pl = port2_pl.with_columns([
+            pl.col("ret").cum_sum().over(byvar).alias("cumret"),
+            pl.col("ret_net").cum_sum().over(byvar).alias("cumretnet"),
+        ])
+        port2_pl = port2_pl.with_columns([
+            (pl.col("cumret") - pl.col("cumret").cum_max().over(byvar)).alias("drawdown")
+        ])
+        port2 = _to_pandas(port2_pl)
 
         if self.method == "long_only":
             if self.long_index == "sp500":
@@ -1619,14 +1714,12 @@ class BacktestFast:
             daily_stats.columns = daily_stats.columns.droplevel()
             daily_stats.reset_index(inplace=True)
 
-        # calculate factor exposure
-        exposure = (
-            port2[[byvar] + factor_list]
-            .groupby(byvar, sort=False)
-            .mean()
-            .reset_index()
-            .rename(columns={byvar: "group"})
-        )
+        # calculate factor exposure with Polars
+        port2_pl = _to_polars(port2)
+        available_factors = [f for f in factor_list if f in port2_pl.columns]
+        exposure_pl = port2_pl.group_by(byvar).agg([pl.col(f).mean() for f in available_factors])
+        exposure_pl = exposure_pl.rename({byvar: "group"})
+        exposure = _to_pandas(exposure_pl)
         if byvar == "overall":
             exposure["group"] = "overall"
 
@@ -1635,179 +1728,96 @@ class BacktestFast:
 
         # calculate return, sharpe and maximum drawdown
         if self.method == "long_only":
-            port2 = port2[
-                [
-                    byvar,
-                    "ret",
-                    "resret",
-                    "ret_net",
-                    "resret_net",
-                    "drawdown",
-                    self.long_index,
-                ]
-            ]
+            select_cols = [byvar, "ret", "resret", "ret_net", "resret_net", "drawdown", self.long_index]
+            port2_pl = port2_pl.select([c for c in select_cols if c in port2_pl.columns])
         else:
-            port2 = port2[[byvar, "ret", "resret", "ret_net", "resret_net", "drawdown"]]
+            port2_pl = port2_pl.select([byvar, "ret", "resret", "ret_net", "resret_net", "drawdown"])
 
-        if "year" in byvar or "yr" in byvar:
-            # Use 252-day annualization for consistency with other slices
-            # (previously used actual day count, which made partial years look worse)
+        # Calculate statistics with Polars over()
+        port2_pl = port2_pl.with_columns([
+            pl.when(pl.col("ret") == 0).then(pl.lit(0)).otherwise(pl.lit(1)).alias("trade")
+        ])
+        
+        sqrt_252 = np.sqrt(252)
+        port2_pl = port2_pl.with_columns([
+            pl.col("trade").sum().over(byvar).alias("num_date"),
+            (pl.col("ret").mean().over(byvar) * 252).alias("ret_ann"),
+            (pl.col("ret").std().over(byvar) * sqrt_252).alias("ret_std"),
+            (pl.col("resret").mean().over(byvar) * 252).alias("resret_ann"),
+            (pl.col("resret").std().over(byvar) * sqrt_252).alias("resret_std"),
+            (pl.col("ret_net").mean().over(byvar) * 252).alias("ret_net_ann"),
+            (pl.col("ret_net").std().over(byvar) * sqrt_252).alias("ret_net_std"),
+            pl.col("drawdown").min().over(byvar).alias("maxdraw"),
+        ])
+        
+        port2_pl = port2_pl.with_columns([
+            (pl.col("ret_ann") / pl.col("ret_std")).alias("sharpe_ret"),
+            (pl.col("resret_ann") / pl.col("resret_std")).alias("sharpe_resret"),
+            (pl.col("ret_net_ann") / pl.col("ret_net_std")).alias("sharpe_retnet"),
+        ])
+        
+        # Calculate pct positive
+        port2_pl = port2_pl.with_columns([
+            ((pl.col("ret").sign() + 1) / 2).alias("ret_pct"),
+            ((pl.col("resret").sign() + 1) / 2).alias("resret_pct"),
+            ((pl.col("ret_net").sign() + 1) / 2).alias("retnet_pct"),
+        ])
+        port2_pl = port2_pl.with_columns([
+            pl.col("ret_pct").mean().over(byvar).alias("retPctPos"),
+            pl.col("resret_pct").mean().over(byvar).alias("resretPctPos"),
+            pl.col("retnet_pct").mean().over(byvar).alias("retnetPctPos"),
+        ])
+        
+        stats_list_f = [
+            "ret_ann",
+            "ret_std",
+            "sharpe_ret",
+            "retPctPos",
+            "resret_ann",
+            "resret_std",
+            "sharpe_resret",
+            "resretPctPos",
+            "ret_net_ann",
+            "ret_net_std",
+            "sharpe_retnet",
+            "retnetPctPos",
+            "maxdraw",
+        ]
+        stats_list_s = [
+            "ret_ann",
+            "ret_std",
+            "sharpe_ret",
+            "ret_net_ann",
+            "ret_net_std",
+            "sharpe_retnet",
+            "maxdraw",
+        ]
 
-            port2["trade"] = np.where(port2["ret"] == 0, 0, 1)
-            group = port2.groupby(byvar, sort=False)
-            port2["num_date"] = group["trade"].transform("sum")
-            ret_mean = group["ret"].transform("mean")
-            ret_std = group["ret"].transform("std")
-            port2["ret_ann"] = ret_mean * 252
-            port2["ret_std"] = ret_std * np.sqrt(252)
-            port2["sharpe_ret"] = port2["ret_ann"] / port2["ret_std"]
-            resret_mean = group["resret"].transform("mean")
-            resret_std = group["resret"].transform("std")
-            port2["resret_ann"] = resret_mean * 252
-            port2["resret_std"] = resret_std * np.sqrt(252)
-            port2["sharpe_resret"] = port2["resret_ann"] / port2["resret_std"]
-            ret_net_mean = group["ret_net"].transform("mean")
-            ret_net_std = group["ret_net"].transform("std")
-            port2["ret_net_ann"] = ret_net_mean * 252
-            port2["ret_net_std"] = ret_net_std * np.sqrt(252)
-            port2["sharpe_retnet"] = port2["ret_net_ann"] / port2["ret_net_std"]
-            port2["maxdraw"] = group["drawdown"].transform("min")
-            ret_pct = (np.sign(port2["ret"]) + 1) / 2
-            resret_pct = (np.sign(port2["resret"]) + 1) / 2
-            retnet_pct = (np.sign(port2["ret_net"]) + 1) / 2
-            port2["retPctPos"] = ret_pct.groupby(port2[byvar], sort=False).transform(
-                "mean"
-            )
-            port2["resretPctPos"] = resret_pct.groupby(
-                port2[byvar], sort=False
-            ).transform("mean")
-            port2["retnetPctPos"] = retnet_pct.groupby(
-                port2[byvar], sort=False
-            ).transform("mean")
-            stats_list_f = [
-                "ret_ann",
-                "ret_std",
-                "sharpe_ret",
-                "retPctPos",
-                "resret_ann",
-                "resret_std",
-                "sharpe_resret",
-                "resretPctPos",
-                "ret_net_ann",
-                "ret_net_std",
-                "sharpe_retnet",
-                "retnetPctPos",
-                "maxdraw",
+        if self.method == "long_only" and self.long_index in port2_pl.columns:
+            port2_pl = port2_pl.with_columns([
+                pl.col(self.long_index).count().over(byvar).alias("long_count"),
+                pl.col(self.long_index).mean().over(byvar).alias("long_mean"),
+                pl.col(self.long_index).std().over(byvar).alias("long_std"),
+            ])
+            port2_pl = port2_pl.with_columns([
+                (pl.col("long_mean") * 252).alias(f"{self.long_index}_ann"),
+                (pl.col("long_std") * sqrt_252).alias(f"{self.long_index}_std"),
+            ])
+            port2_pl = port2_pl.with_columns([
+                (pl.col(f"{self.long_index}_ann") / pl.col(f"{self.long_index}_std")).alias(f"sharpe_{self.long_index}")
+            ])
+            stats_list_f = stats_list_f + [
+                f"{self.long_index}_ann",
+                f"{self.long_index}_std",
+                f"sharpe_{self.long_index}",
             ]
-            stats_list_s = [
-                "ret_ann",
-                "ret_std",
-                "sharpe_ret",
-                "ret_net_ann",
-                "ret_net_std",
-                "sharpe_retnet",
-                "maxdraw",
-            ]
-
-            if self.method == "long_only":
-
-                long_count = group[self.long_index].transform("count")
-                long_mean = group[self.long_index].transform("mean")
-                long_std = group[self.long_index].transform("std")
-                port2[f"{self.long_index}_ann"] = long_mean * long_count
-                port2[f"{self.long_index}_std"] = long_std * np.sqrt(long_count)
-                port2[f"sharpe_{self.long_index}"] = (
-                    port2[f"{self.long_index}_ann"] / port2[f"{self.long_index}_std"]
-                )
-                stats_list_f = stats_list_f + [
-                    f"{self.long_index}_ann",
-                    f"{self.long_index}_std",
-                    f"sharpe_{self.long_index}",
-                ]
-                stats_list_s = stats_list_s + [
-                    f"{self.long_index}_ann",
-                    f"{self.long_index}_std",
-                    f"sharpe_{self.long_index}",
-                ]
-
-        else:
-
-            port2["trade"] = np.where(port2["ret"] == 0, 0, 1)
-            group = port2.groupby(byvar, sort=False)
-            port2["num_date"] = group["trade"].transform("sum")
-            # port2 = port2[port2['trade']==1]
-            ret_mean = group["ret"].transform("mean")
-            ret_std = group["ret"].transform("std")
-            port2["ret_ann"] = ret_mean * 252
-            port2["ret_std"] = ret_std * math.sqrt(252)
-            port2["sharpe_ret"] = port2["ret_ann"] / port2["ret_std"]
-            resret_mean = group["resret"].transform("mean")
-            resret_std = group["resret"].transform("std")
-            port2["resret_ann"] = resret_mean * 252
-            port2["resret_std"] = resret_std * math.sqrt(252)
-            port2["sharpe_resret"] = port2["resret_ann"] / port2["resret_std"]
-            ret_net_mean = group["ret_net"].transform("mean")
-            ret_net_std = group["ret_net"].transform("std")
-            port2["ret_net_ann"] = ret_net_mean * 252
-            port2["ret_net_std"] = ret_net_std * math.sqrt(252)
-            port2["sharpe_retnet"] = port2["ret_net_ann"] / port2["ret_net_std"]
-            port2["maxdraw"] = group["drawdown"].transform("min")
-            ret_pct = (np.sign(port2["ret"]) + 1) / 2
-            resret_pct = (np.sign(port2["resret"]) + 1) / 2
-            retnet_pct = (np.sign(port2["ret_net"]) + 1) / 2
-            port2["retPctPos"] = ret_pct.groupby(port2[byvar], sort=False).transform(
-                "mean"
-            )
-            port2["resretPctPos"] = resret_pct.groupby(
-                port2[byvar], sort=False
-            ).transform("mean")
-            port2["retnetPctPos"] = retnet_pct.groupby(
-                port2[byvar], sort=False
-            ).transform("mean")
-            stats_list_f = [
-                "ret_ann",
-                "ret_std",
-                "sharpe_ret",
-                "retPctPos",
-                "resret_ann",
-                "resret_std",
-                "sharpe_resret",
-                "resretPctPos",
-                "ret_net_ann",
-                "ret_net_std",
-                "sharpe_retnet",
-                "retnetPctPos",
-                "maxdraw",
-            ]
-            stats_list_s = [
-                "ret_ann",
-                "ret_std",
-                "sharpe_ret",
-                "ret_net_ann",
-                "ret_net_std",
-                "sharpe_retnet",
-                "maxdraw",
+            stats_list_s = stats_list_s + [
+                f"{self.long_index}_ann",
+                f"{self.long_index}_std",
+                f"sharpe_{self.long_index}",
             ]
 
-            if self.method == "long_only":
-
-                long_mean = group[self.long_index].transform("mean")
-                long_std = group[self.long_index].transform("std")
-                port2[f"{self.long_index}_ann"] = long_mean * 252
-                port2[f"{self.long_index}_std"] = long_std * math.sqrt(252)
-                port2[f"sharpe_{self.long_index}"] = (
-                    port2[f"{self.long_index}_ann"] / port2[f"{self.long_index}_std"]
-                )
-                stats_list_f = stats_list_f + [
-                    f"{self.long_index}_ann",
-                    f"{self.long_index}_std",
-                    f"sharpe_{self.long_index}",
-                ]
-                stats_list_s = stats_list_s + [
-                    f"{self.long_index}_ann",
-                    f"{self.long_index}_std",
-                    f"sharpe_{self.long_index}",
-                ]
+        port2 = _to_pandas(port2_pl)
 
         annret = (
             port2.loc[:, [byvar, "num_date"] + stats_list_f]

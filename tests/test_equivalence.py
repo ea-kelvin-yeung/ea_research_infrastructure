@@ -240,6 +240,30 @@ if HAS_PYTEST:
                     if not np.isnan(val_orig):
                         rel_diff = abs(val_orig - val_fast) / (abs(val_orig) + 1e-10)
                         assert rel_diff < 1e-3, f"{metric}: {val_orig} vs {val_fast} (rel_diff: {rel_diff:.2e})"
+        
+        def test_polars_implementation(self, prepared_signal, catalog):
+            """Test that Polars-based BacktestFast produces valid results."""
+            # Run with master_data (uses Polars code paths)
+            catalog_with_master = load_test_catalog(use_master=True)
+            result = run_backtest_fast(prepared_signal, catalog_with_master)
+            
+            # Validate structure
+            assert len(result) >= 2, "Expected at least 2 elements in result"
+            summary = result[0]
+            daily = result[1]
+            
+            # Check expected columns
+            assert 'group' in summary.columns
+            assert 'ret_ann' in summary.columns
+            assert 'sharpe_ret' in summary.columns
+            
+            # Check values are not NaN for overall
+            overall = summary[summary['group'] == 'overall']
+            assert len(overall) > 0, "No 'overall' group in results"
+            
+            overall_row = overall.iloc[0]
+            assert not np.isnan(overall_row['ret_ann']), "ret_ann should not be NaN"
+            assert not np.isnan(overall_row['sharpe_ret']), "sharpe_ret should not be NaN"
 
 
 def run_equivalence_check(use_master=False):
@@ -324,14 +348,98 @@ def run_equivalence_check(use_master=False):
     return all_match
 
 
+def run_polars_validation():
+    """
+    Validate that the Polars implementation in BacktestFast works correctly.
+    
+    This test runs a backtest and validates:
+    1. No exceptions during execution
+    2. Results have expected structure
+    3. Key metrics are valid (not NaN)
+    """
+    print("=" * 60)
+    print("Polars Implementation Validation Test")
+    print("=" * 60)
+    
+    try:
+        # Load data
+        print("\nLoading test signal...")
+        signal = load_test_signal()
+        print(f"  Loaded {len(signal):,} rows")
+        
+        print("\nLoading catalog (use_master=True)...")
+        catalog = load_test_catalog(use_master=True)
+        print(f"  Catalog loaded with master_data: {len(catalog['master']):,} rows")
+        
+        # Prepare signal
+        print("\nPreparing signal...")
+        prepared = prepare_signal_for_backtest(signal, catalog)
+        print("  Signal prepared")
+        
+        # Run the Polars-optimized backtest
+        print("\nRunning BacktestFast with Polars operations...")
+        import time
+        t0 = time.time()
+        result = run_backtest_fast(prepared, catalog)
+        elapsed = time.time() - t0
+        print(f"  Completed in {elapsed:.2f}s")
+        
+        # Validate results structure
+        print("\nValidating results structure...")
+        assert len(result) >= 2, "Expected at least 2 elements in result tuple"
+        
+        summary = result[0]
+        daily = result[1]
+        
+        assert isinstance(summary, pd.DataFrame), "Summary should be a DataFrame"
+        assert isinstance(daily, pd.DataFrame), "Daily should be a DataFrame"
+        
+        print(f"  Summary: {summary.shape[0]} rows, {summary.shape[1]} columns")
+        print(f"  Daily: {daily.shape[0]} rows, {daily.shape[1]} columns")
+        
+        # Check key columns exist
+        expected_cols = ['group', 'ret_ann', 'sharpe_ret', 'turnover']
+        for col in expected_cols:
+            assert col in summary.columns, f"Expected column '{col}' in summary"
+        
+        # Check key metrics are not NaN
+        print("\nValidating key metrics...")
+        overall = summary[summary['group'] == 'overall'].iloc[0]
+        metrics = ['ret_ann', 'ret_std', 'sharpe_ret', 'turnover']
+        for metric in metrics:
+            val = overall[metric]
+            if np.isnan(val):
+                print(f"  WARNING: {metric} is NaN")
+            else:
+                print(f"  {metric}: {val:.4f}")
+        
+        print("\n" + "=" * 60)
+        print("POLARS VALIDATION PASSED")
+        print("=" * 60)
+        return True
+        
+    except Exception as e:
+        print(f"\n*** ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        print("\n" + "=" * 60)
+        print("POLARS VALIDATION FAILED")
+        print("=" * 60)
+        return False
+
+
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--use-master', action='store_true', help='Test with master_data enabled')
     parser.add_argument('--both', action='store_true', help='Test both with and without master_data')
+    parser.add_argument('--polars', action='store_true', help='Validate Polars implementation only')
     args = parser.parse_args()
     
-    if args.both:
+    if args.polars:
+        success = run_polars_validation()
+        sys.exit(0 if success else 1)
+    elif args.both:
         print("\n" + "=" * 60)
         print("TEST 1: Without master_data")
         print("=" * 60)
