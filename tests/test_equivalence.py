@@ -50,6 +50,16 @@ def load_test_catalog(use_master=False):
             pytest.skip("No snapshots found. Create one first.")
         else:
             raise RuntimeError("No snapshots found. Create one first.")
+    
+    # Try snapshots in order, prefer those with all required files
+    from pathlib import Path
+    for snapshot in snapshots:
+        snapshot_path = Path('snapshots') / snapshot
+        # Check if essential files exist
+        if (snapshot_path / 'risk.parquet').exists() or (snapshot_path / 'partitions' / 'risk').exists():
+            return load_catalog(str(snapshot_path), use_master=use_master)
+    
+    # Fallback to first snapshot if none found with complete files
     return load_catalog(f'snapshots/{snapshots[0]}', use_master=use_master)
 
 
