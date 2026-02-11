@@ -22,8 +22,47 @@ pd.options.mode.chained_assignment = None
 # Polars Conversion Helpers
 # =============================================================================
 
-def _to_polars(df: pd.DataFrame) -> pl.DataFrame:
-    """Convert pandas DataFrame to Polars."""
+def _optimize_dtypes_for_polars(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Optimize pandas DataFrame dtypes before Polars conversion.
+    
+    Polars performs better with proper integer types rather than object dtypes.
+    This reduces memory and speeds up conversions/joins.
+    """
+    result = df.copy()
+    
+    # Optimize ID columns to int64 if possible
+    id_cols = ['security_id', 'industry_id', 'sector_id']
+    for col in id_cols:
+        if col in result.columns:
+            if result[col].dtype == 'object':
+                try:
+                    result[col] = pd.to_numeric(result[col], errors='coerce').astype('Int64')
+                except (ValueError, TypeError):
+                    pass
+    
+    # Optimize low-cardinality integer columns to smaller types
+    small_int_cols = ['cap', 'position', 'fractile']
+    for col in small_int_cols:
+        if col in result.columns:
+            if result[col].dtype in ['int64', 'float64']:
+                try:
+                    result[col] = result[col].astype('Int8')
+                except (ValueError, TypeError):
+                    pass
+    
+    return result
+
+
+def _to_polars(df: pd.DataFrame, optimize_dtypes: bool = False) -> pl.DataFrame:
+    """Convert pandas DataFrame to Polars.
+    
+    Args:
+        df: pandas DataFrame to convert
+        optimize_dtypes: If True, optimize dtypes before conversion (slower but better for large DataFrames)
+    """
+    if optimize_dtypes:
+        df = _optimize_dtypes_for_polars(df)
     return pl.from_pandas(df)
 
 
@@ -54,6 +93,21 @@ def _polars_join_master(df_pl: pl.DataFrame, master_pl: pl.DataFrame,
     master_subset = master_pl.select(["security_id", "date"] + available_cols)
     
     return df_pl.join(master_subset, on=["security_id", "date"], how=how)
+
+
+def _polars_join_retfile(df_pl: pl.DataFrame, retfile_pl: pl.DataFrame,
+                         cols: list, how: str = 'inner') -> pl.DataFrame:
+    """
+    Join with retfile data in pure Polars.
+    
+    Use this for ret/resret columns to preserve rows that exist in ret but not risk.
+    """
+    available_cols = [c for c in cols if c in retfile_pl.columns]
+    if not available_cols:
+        return df_pl
+    
+    ret_subset = retfile_pl.select(["security_id", "date"] + available_cols)
+    return df_pl.join(ret_subset, on=["security_id", "date"], how=how)
 
 
 # %%
@@ -641,6 +695,9 @@ class BacktestFast:
         # Cached Polars DataFrames (avoid repeated conversions)
         self._master_pl = None  # Polars version of master_data
         self._otherfile_pl = None  # Polars version of otherfile
+        self._retfile_pl = None  # Polars version of retfile (for ret column joins)
+        self._double_pl_sorted = None  # Polars version of double_file, pre-sorted
+        self._datefile_pl = None  # Polars version of datefile
         self._asof_tables_pl = None  # Pre-sorted Polars DataFrames for merge_asof
 
     def set_precomputed_indexes(
@@ -651,6 +708,8 @@ class BacktestFast:
         asof_tables=None,
         master_pl=None,
         otherfile_pl=None,
+        retfile_pl=None,
+        datefile_pl=None,
         asof_tables_pl=None,
     ):
         """
@@ -666,6 +725,8 @@ class BacktestFast:
             asof_tables: Dict with 'resid' and 'byvars_cap' pre-sorted DataFrames
             master_pl: Pre-computed Polars DataFrame of master_data (saves ~8s)
             otherfile_pl: Pre-computed Polars DataFrame of otherfile
+            retfile_pl: Pre-computed Polars DataFrame of retfile (for ret column joins)
+            datefile_pl: Pre-computed Polars DataFrame of datefile
             asof_tables_pl: Dict with pre-sorted Polars DataFrames for merge_asof
         """
         # Note: We don't use risk_indexed/ret_indexed directly anymore
@@ -686,6 +747,12 @@ class BacktestFast:
         
         if otherfile_pl is not None:
             self._otherfile_pl = otherfile_pl
+        
+        if retfile_pl is not None:
+            self._retfile_pl = retfile_pl
+        
+        if datefile_pl is not None:
+            self._datefile_pl = datefile_pl
         
         if asof_tables_pl is not None:
             self._asof_tables_pl = asof_tables_pl
@@ -718,8 +785,43 @@ class BacktestFast:
     def _get_otherfile_pl(self):
         """Get otherfile as Polars DataFrame (cached)."""
         if self._otherfile_pl is None:
-            self._otherfile_pl = _to_polars(self.otherfile)
+            self._otherfile_pl = _to_polars(self.otherfile, optimize_dtypes=True)
         return self._otherfile_pl
+    
+    def _get_retfile_pl(self):
+        """Get retfile as Polars DataFrame (cached).
+        
+        Used for ret column joins where we need retfile rows (not ret∩risk).
+        """
+        if self._retfile_pl is None:
+            # Only cache the columns we actually need for joins
+            ret_cols = ['security_id', 'date', 'ret', 'resret']
+            optional_cols = ['openret', 'resopenret', 'vol', 'adv', 'close_adj']
+            cols_to_cache = ret_cols + [c for c in optional_cols if c in self.retfile.columns]
+            self._retfile_pl = _to_polars(self.retfile[cols_to_cache], optimize_dtypes=True)
+        return self._retfile_pl
+    
+    def _get_datefile_pl(self):
+        """Get datefile as Polars DataFrame (cached)."""
+        if self._datefile_pl is None:
+            self._datefile_pl = _to_polars(self.datefile)
+        return self._datefile_pl
+    
+    def _get_double_pl_sorted(self):
+        """Get double_file as pre-sorted Polars DataFrame (cached).
+        
+        Sorted by date for join_asof. Caches both the sort and the Polars conversion.
+        """
+        if self._double_pl_sorted is None:
+            if self.double_file is None:
+                if self.double_var is None:
+                    raise RuntimeError("double_var must be set for double sorting")
+                df = self.otherfile[["security_id", "date", self.double_var]]
+            else:
+                df = self.double_file
+            # Convert to Polars and sort once
+            self._double_pl_sorted = _to_polars(df, optimize_dtypes=True).sort("date")
+        return self._double_pl_sorted
     
     def _fast_date_lookup(self, df, date_col, cols_to_add):
         """
@@ -841,14 +943,16 @@ class BacktestFast:
 
     def _fast_join_master(self, df, cols, how='inner', source='auto'):
         """
-        Fast join using pre-computed Polars or indexed master_data.
+        Fast join using pre-computed Polars DataFrames.
         
-        For ret columns: Uses retfile directly (preserves rows that exist in ret but not risk)
-        For other columns: Uses pre-computed Polars master_pl (fastest)
+        Column family semantics:
+        - ret columns (ret, resret, openret, resopenret): Use cached retfile_pl
+          (preserves rows that exist in ret but not risk)
+        - Other columns (factors, mcap, etc.): Use cached master_pl (ret∩risk)
         
         Args:
             df: DataFrame with security_id and date columns
-            cols: List of columns to retrieve from master_data
+            cols: List of columns to retrieve
             how: Join type ('inner' or 'left')
             source: Data source - 'auto' (default), 'ret', 'risk', or 'master'
                    'auto' uses retfile for ret columns, otherwise master_data
@@ -856,29 +960,20 @@ class BacktestFast:
         Returns:
             DataFrame with requested columns joined
         """
-        ret_cols = {'ret', 'resret', 'openret', 'resopenret'}
+        ret_cols = {'ret', 'resret', 'openret', 'resopenret', 'vol', 'adv', 'close_adj'}
         
-        # For ret/resret columns, MUST use retfile directly to preserve row count
+        # For ret/resret columns, use cached retfile_pl to preserve row count
         # (master_pl is ret∩risk which may exclude rows that exist only in ret)
         if source == 'auto' and set(cols) <= ret_cols:
-            available = [c for c in cols if c in self.retfile.columns]
+            retfile_pl = self._get_retfile_pl()
+            available = [c for c in cols if c in retfile_pl.columns]
             if available:
-                # Use Polars for the join if retfile is small enough
-                if self._otherfile_pl is not None and len(self.retfile) < 50_000_000:
-                    # Fast path: Polars join with retfile
-                    ret_pl = _to_polars(self.retfile[['security_id', 'date'] + available])
-                    df_pl = _to_polars(df)
-                    result_pl = df_pl.join(ret_pl, on=['security_id', 'date'], how=how)
-                    return _to_pandas(result_pl)
-                else:
-                    # Fallback: Pandas merge
-                    return df.merge(
-                        self.retfile[['security_id', 'date'] + available],
-                        on=['security_id', 'date'],
-                        how=how
-                    )
+                df_pl = _to_polars(df)
+                ret_subset = retfile_pl.select(['security_id', 'date'] + available)
+                result_pl = df_pl.join(ret_subset, on=['security_id', 'date'], how=how)
+                return _to_pandas(result_pl)
         
-        # FAST PATH: Use pre-computed Polars DataFrame for non-ret columns
+        # For non-ret columns, use pre-computed master_pl
         master_pl = self._get_master_pl()
         if master_pl is not None:
             available_cols = [c for c in cols if c in master_pl.columns]
@@ -887,43 +982,58 @@ class BacktestFast:
                 result_pl = _polars_join_master(df_pl, master_pl, available_cols, how=how)
                 return _to_pandas(result_pl)
         
-        if self.master_data is None:
-            # Fall back to traditional merge
-            return df.merge(
-                self.retfile[['security_id', 'date'] + [c for c in cols if c in self.retfile.columns]],
-                on=['security_id', 'date'],
-                how=how
-            )
+        # Final fallback: use otherfile_pl
+        otherfile_pl = self._get_otherfile_pl()
+        available_cols = [c for c in cols if c in otherfile_pl.columns]
+        if available_cols:
+            df_pl = _to_polars(df)
+            other_subset = otherfile_pl.select(['security_id', 'date'] + available_cols)
+            result_pl = df_pl.join(other_subset, on=['security_id', 'date'], how=how)
+            return _to_pandas(result_pl)
         
-        # Filter columns that exist in master
-        available_cols = [c for c in cols if c in self.master_data.columns]
-        if not available_cols:
-            return df
+        return df
+
+    def _fast_join_master_pl(self, df_pl: pl.DataFrame, cols: list, 
+                              how: str = 'inner', source: str = 'auto') -> pl.DataFrame:
+        """
+        Fast join using pre-computed Polars DataFrames - stays in Polars.
         
-        # Create MultiIndex from df's keys (vectorized)
-        idx = pd.MultiIndex.from_arrays(
-            [df['security_id'].values, df['date'].values],
-            names=['security_id', 'date']
-        )
+        Same semantics as _fast_join_master but input/output are Polars DataFrames.
+        Use this to avoid Pandas roundtrips in Polars-native sections.
         
-        # Get indexer positions (numpy array of positions, -1 for missing)
-        positions = self.master_data.index.get_indexer(idx)
+        Args:
+            df_pl: Polars DataFrame with security_id and date columns
+            cols: List of columns to retrieve
+            how: Join type ('inner' or 'left')
+            source: Data source - 'auto', 'ret', 'risk', or 'master'
+            
+        Returns:
+            Polars DataFrame with requested columns joined
+        """
+        ret_cols = {'ret', 'resret', 'openret', 'resopenret', 'vol', 'adv', 'close_adj'}
         
-        # Add columns using numpy take (much faster than reindex)
-        result = df.copy()
-        for col in available_cols:
-            col_values = self.master_data[col].values
-            # Use take with mode='clip' for safety, then set -1 positions to NaN
-            taken = np.take(col_values, np.clip(positions, 0, len(col_values) - 1))
-            taken = taken.astype(float)  # Ensure float for NaN support
-            taken[positions == -1] = np.nan
-            result[col] = taken
+        # For ret columns, use cached retfile_pl
+        if source == 'auto' and set(cols) <= ret_cols:
+            retfile_pl = self._get_retfile_pl()
+            available = [c for c in cols if c in retfile_pl.columns]
+            if available:
+                return _polars_join_retfile(df_pl, retfile_pl, available, how)
         
-        # For inner join, drop rows where joined columns are NaN
-        if how == 'inner':
-            result = result.dropna(subset=available_cols)
+        # For non-ret columns, use master_pl
+        master_pl = self._get_master_pl()
+        if master_pl is not None:
+            available_cols = [c for c in cols if c in master_pl.columns]
+            if available_cols:
+                return _polars_join_master(df_pl, master_pl, available_cols, how)
         
-        return result
+        # Final fallback: otherfile_pl
+        otherfile_pl = self._get_otherfile_pl()
+        available_cols = [c for c in cols if c in otherfile_pl.columns]
+        if available_cols:
+            other_subset = otherfile_pl.select(['security_id', 'date'] + available_cols)
+            return df_pl.join(other_subset, on=['security_id', 'date'], how=how)
+        
+        return df_pl
 
     def _get_otherfile_cols(self, cols):
         """Direct column access without sorting (faster than sorting)."""
@@ -1084,16 +1194,10 @@ class BacktestFast:
         if self.input_type == "value":
             # double sorting
             if self.sort_method == "double":
-                if self.double_file is None:
-                    self.double_file = self.otherfile[
-                        ["security_id", "date", self.double_var]
-                    ]
-                # Polars join_asof for double sort
-                double_pl = _to_polars(
-                    self._get_doublefile_sorted().rename(columns={"date": "date_doublevar"})
-                )
+                # Use cached Polars double_file (already sorted)
+                double_pl = self._get_double_pl_sorted().rename({"date": "date_doublevar"})
                 port_pl = port_pl.sort("date_sig").join_asof(
-                    double_pl.sort("date_doublevar"),
+                    double_pl,  # Already sorted by date
                     by="security_id",
                     left_on="date_sig",
                     right_on="date_doublevar",
@@ -1161,20 +1265,14 @@ class BacktestFast:
         # Select columns for join
         port_pl = port_pl.select(["security_id", "date", "fractile", "ret", "resret"])
         
-        # Join with master/other data - stay in Polars if possible
+        # Join with master/other data - stay in Polars
         needed_cols = ["adv", "mcap"] + self.factor_list
-        master_pl = self._get_master_pl()
-        if master_pl is not None:
-            port_pl = _polars_join_master(port_pl, master_pl, needed_cols, how='inner')
-        else:
-            other_pl = self._get_otherfile_pl()
-            other_subset = other_pl.select(["security_id", "date"] + [c for c in needed_cols if c in other_pl.columns])
-            port_pl = port_pl.join(other_subset, on=["security_id", "date"], how="inner")
+        port_pl = self._fast_join_master_pl(port_pl, needed_cols, how='inner')
 
         # Weight calculations in Polars
         if self.weight == "equal":
             port_pl = port_pl.with_columns([
-                (1.0 / pl.count().over(["date", "fractile"])).alias("weight")
+                (1.0 / pl.len().over(["date", "fractile"])).alias("weight")
             ])
         elif self.weight == "value":
             port_pl = port_pl.with_columns([
@@ -1228,17 +1326,20 @@ class BacktestFast:
             (pl.col(c) * pl.col("weight")).alias(c) for c in scale_cols
         ])
 
-        # Final aggregations
-        check_pl = port2_pl.group_by(["date", "fractile"]).sum()
+        # Final aggregations - explicit columns for performance
+        factor_cols = ["size", "value", "growth", "leverage", "volatility", "momentum", "yield"]
+        factor_cols = [c for c in factor_cols if c in port2_pl.columns]
+        agg_cols = ["ret", "resret"] + factor_cols
+        
+        check_pl = port2_pl.group_by(["date", "fractile"]).agg([
+            pl.col(c).sum() for c in agg_cols if c in port2_pl.columns
+        ])
         check2_pl = (
             port2_pl.group_by(["date", "fractile"])
-            .agg(pl.col("security_id").count().alias("numcos"))
+            .agg([pl.col("security_id").count().alias("numcos")])
             .group_by("fractile")
-            .agg(pl.col("numcos").mean())
+            .agg([pl.col("numcos").mean()])
         )
-
-        factor_cols = ["size", "value", "growth", "leverage", "volatility", "momentum", "yield"]
-        factor_cols = [c for c in factor_cols if c in check_pl.columns]
         check3_pl = (
             check_pl.group_by("fractile")
             .agg([pl.col("ret").mean() * 252, pl.col("resret").mean() * 252])
@@ -1261,16 +1362,10 @@ class BacktestFast:
         if self.input_type == "value":
             # double sorting
             if self.sort_method == "double":
-                if self.double_file is None:
-                    self.double_file = self.otherfile[
-                        ["security_id", "date", self.double_var]
-                    ]
-                # Polars join_asof for double sort
-                double_pl = _to_polars(
-                    self._get_doublefile_sorted().rename(columns={"date": "date_doublevar"})
-                )
+                # Use cached Polars double_file (already sorted)
+                double_pl = self._get_double_pl_sorted().rename({"date": "date_doublevar"})
                 temp_pl = temp_pl.sort("date_sig").join_asof(
-                    double_pl.sort("date_doublevar"),
+                    double_pl,  # Already sorted by date
                     by="security_id",
                     left_on="date_sig",
                     right_on="date_doublevar",
@@ -1360,13 +1455,7 @@ class BacktestFast:
         temp_pl = temp_pl.filter(pl.col("position").is_in([-1, 1]))
 
         # Join with master/other data - stay in Polars
-        master_pl = self._get_master_pl()
-        if master_pl is not None:
-            temp_pl = _polars_join_master(temp_pl, master_pl, ["adv", "mcap"], how='inner')
-        else:
-            other_pl = self._get_otherfile_pl()
-            other_subset = other_pl.select(["security_id", "date", "adv", "mcap"])
-            temp_pl = temp_pl.join(other_subset, on=["security_id", "date"], how="inner")
+        temp_pl = self._fast_join_master_pl(temp_pl, ["adv", "mcap"], how='inner')
 
         # Single conversion at exit
         return _to_pandas(temp_pl)
@@ -1381,7 +1470,7 @@ class BacktestFast:
             # generate weight
             if self.weight == "equal":
                 port_pl = port_pl.with_columns([
-                    (pl.col("position").cast(pl.Float64) / pl.count().over(group_cols)).alias("weight")
+                    (pl.col("position").cast(pl.Float64) / pl.len().over(group_cols)).alias("weight")
                 ])
             elif self.weight == "value":
                 # Quantile capping with Polars over()
@@ -1452,14 +1541,22 @@ class BacktestFast:
         if self.method == "long_only":
             weight_file.loc[weight_file["weight"] < 0, "weight"] = 0
 
-        turnover = weight_file[["security_id", "date", byvar, "weight"]].copy()
-        # Fast date lookup instead of merge
-        turnover = self._fast_date_lookup(turnover, 'date', ['n'])
+        # =============================================================================
+        # TURNOVER CALCULATION - 100% Polars (no pandas roundtrips)
+        # =============================================================================
         
-        # Convert to Polars for faster groupby operations
-        turnover_pl = _to_polars(turnover)
+        # Convert weight_file to Polars once at start
+        weight_file_pl = _to_polars(weight_file[["security_id", "date", byvar, "weight"]])
         
-        # number of stocks with non-zero position (Polars over())
+        # Join with datefile to get 'n' (trading day number) - stay in Polars
+        datefile_pl = self._get_datefile_pl()
+        turnover_pl = weight_file_pl.join(
+            datefile_pl.select(["date", "n"]),
+            on="date",
+            how="left"
+        )
+        
+        # Calculate numcos (number of stocks with non-zero position) using Polars over()
         turnover_pl = turnover_pl.with_columns([
             pl.when(pl.col("weight") > 0).then(pl.lit(1)).otherwise(pl.lit(0)).alias("numcos_l_flag"),
             pl.when(pl.col("weight") < 0).then(pl.lit(1)).otherwise(pl.lit(0)).alias("numcos_s_flag"),
@@ -1473,46 +1570,68 @@ class BacktestFast:
             pl.min_horizontal(["numcos_l", "numcos_s"]).alias("numcos")
         ])
         
+        # Filter by mincos
         if self.method == "long_short":
             turnover_pl = turnover_pl.filter(pl.col("numcos") >= self.mincos)
         elif self.method == "long_only":
             turnover_pl = turnover_pl.filter(pl.col("numcos_l") >= self.mincos)
         
-        # Convert back to pandas for fast numpy lookup (already optimized)
-        turnover = _to_pandas(turnover_pl)
-
-        # calculate turnover from previous trading day
-        # Optimization #3: Use fast numpy lookup instead of merge
-        prev = turnover[["security_id", byvar, "n", "weight"]].copy()
-        prev["n"] = prev["n"] + 1
-        # Ensure unique keys for fast lookup (keep last if duplicates)
-        prev = prev.drop_duplicates(subset=["security_id", byvar, "n"], keep="last")
+        # =============================================================================
+        # PREV DAY WEIGHT LOOKUP - Pure Polars self-join with shifted n
+        # This avoids the expensive Pandas roundtrip that was killing performance
+        # =============================================================================
         
-        # Use fast numpy lookup instead of merge (bypasses hash-based key matching)
-        turnover = turnover.drop(columns=["date"])
-        keys = ["security_id", byvar, "n"]
-        turnover = self._fast_lookup_multi(turnover, prev, keys, ["weight"], suffix="_prev")
-        turnover["weight_prev"] = turnover["weight_prev"].fillna(0)
-        turnover["weight_diff"] = (turnover["weight"] - turnover["weight_prev"]).abs()
-
-        current_keys = turnover[["security_id", byvar, "n"]].drop_duplicates()
-        exits = prev.merge(
-            current_keys, on=["security_id", byvar, "n"], how="left", indicator=True
+        # Create prev: shift n+1 to match with "tomorrow's" weights
+        # (i.e., today's weight becomes weight_prev for tomorrow)
+        prev_pl = (
+            turnover_pl
+            .select(["security_id", byvar, "n", "weight"])
+            .with_columns((pl.col("n") + 1).alias("n"))
+            .rename({"weight": "weight_prev"})
+            .unique(subset=["security_id", byvar, "n"], keep="last")
         )
-        exits = exits[exits["_merge"] == "left_only"].drop(columns=["_merge"])
-        exits = exits.rename(columns={"weight": "weight_prev"})
-        exits["weight"] = 0.0
-        exits["weight_diff"] = exits["weight_prev"].abs()
-        exits["numcos_l"] = np.nan
-        exits["numcos_s"] = np.nan
-        exits["numcos"] = np.nan
-
-        turnover = pd.concat([turnover, exits], ignore_index=True, sort=False)
-        # Fast n lookup instead of merge
-        turnover = self._fast_n_lookup(turnover, 'n', ['date'])
         
-        # Convert to Polars for n_min calculation and stay in Polars
-        turnover_pl = _to_polars(turnover)
+        # Self-join to get previous day's weight
+        turnover_pl = turnover_pl.join(
+            prev_pl,
+            on=["security_id", byvar, "n"],
+            how="left"
+        )
+        turnover_pl = turnover_pl.with_columns([
+            pl.col("weight_prev").fill_null(0.0),
+            (pl.col("weight") - pl.col("weight_prev").fill_null(0.0)).abs().alias("weight_diff")
+        ])
+        
+        # Handle exits: positions that existed yesterday but not today
+        # These are rows in prev_pl that don't match any current row
+        current_keys_pl = turnover_pl.select(["security_id", byvar, "n"]).unique()
+        
+        # Get the actual dtypes from turnover_pl for schema compatibility
+        numcos_dtype = turnover_pl.schema.get("numcos_l", pl.Int64)
+        
+        exits_pl = (
+            prev_pl
+            .join(current_keys_pl, on=["security_id", byvar, "n"], how="anti")
+            .with_columns([
+                pl.lit(0.0).alias("weight"),
+                pl.col("weight_prev").abs().alias("weight_diff"),
+                pl.lit(None).cast(numcos_dtype).alias("numcos_l"),
+                pl.lit(None).cast(numcos_dtype).alias("numcos_s"),
+                pl.lit(None).cast(numcos_dtype).alias("numcos"),
+            ])
+        )
+        
+        # Add date column to exits via datefile lookup
+        exits_pl = exits_pl.join(
+            datefile_pl.select(["date", "n"]),
+            on="n",
+            how="left"
+        )
+        
+        # Concat current turnover with exits - use align schemas
+        turnover_pl = pl.concat([turnover_pl, exits_pl], how="diagonal_relaxed")
+        
+        # Zero out weight_diff for the first day (n == n_min)
         turnover_pl = turnover_pl.with_columns([
             pl.col("n").min().over(byvar).alias("n_min")
         ])
@@ -1520,14 +1639,17 @@ class BacktestFast:
             pl.when(pl.col("n") == pl.col("n_min")).then(pl.lit(0.0))
             .otherwise(pl.col("weight_diff")).alias("weight_diff")
         ])
-
-        # Cap lookup - stay in Polars
+        
+        # =============================================================================
+        # TRANSACTION COST CALCULATION - Stay in Polars
+        # =============================================================================
+        
+        # Cap lookup for tc_model='naive'
         if "cap" not in turnover_pl.columns:
             other_pl = self._get_otherfile_pl()
             cap_subset = other_pl.select(["security_id", "date", "cap"])
             turnover_pl = turnover_pl.join(cap_subset, on=["security_id", "date"], how="left")
 
-        # Transaction cost calculation in Polars
         if self.tc_model == "naive":
             tc_big = self.tc_level["big"] / 10000
             tc_median = self.tc_level["median"] / 10000
@@ -1538,14 +1660,10 @@ class BacktestFast:
                 .otherwise(pl.lit(tc_small)).alias("tc")
             ])
         elif self.tc_model == "power_law":
-            # Need to join with vol/adv/close_adj
-            master_pl = self._get_master_pl()
-            if master_pl is not None:
-                turnover_pl = _polars_join_master(turnover_pl, master_pl, ["vol", "adv", "close_adj"], how='inner')
-            else:
-                ret_pl = _to_polars(self.retfile[["security_id", "date", "vol", "adv", "close_adj"]])
-                turnover_pl = turnover_pl.join(ret_pl, on=["security_id", "date"], how="inner")
-
+            # Join with vol/adv/close_adj from retfile
+            turnover_pl = self._fast_join_master_pl(
+                turnover_pl, ["vol", "adv", "close_adj"], how='inner'
+            )
             tc_beta, tc_alpha = self.tc_value
             turnover_pl = turnover_pl.with_columns([
                 (tc_beta * pl.col("vol") * 
@@ -1557,31 +1675,37 @@ class BacktestFast:
             (pl.col("tc") * pl.col("weight_diff")).alias("tc")
         ])
         
-        # tc sum by group
-        tc_pl = turnover_pl.group_by([byvar, "date"]).agg(pl.col("tc").sum())
-        tc = _to_pandas(tc_pl)
+        # TC sum by group (explicit column aggregation)
+        tc_pl = turnover_pl.group_by([byvar, "date"]).agg([pl.col("tc").sum()])
         
-        # calculate turnover with Polars over()
+        # Calculate turnover with Polars over()
         turnover_pl = turnover_pl.with_columns([
             pl.col("weight_diff").sum().over([byvar, "n"]).alias("turnover")
         ])
         
-        # Select and deduplicate
-        turnover_pl = turnover_pl.select(["date", byvar, "numcos_l", "numcos_s", "turnover", "numcos"])
-        turnover_pl = turnover_pl.unique().drop_nulls()
+        # Select and deduplicate for turnover stats
+        turnover_stats_pl = (
+            turnover_pl
+            .select(["date", byvar, "numcos_l", "numcos_s", "turnover", "numcos"])
+            .unique()
+            .drop_nulls()
+        )
         
         # date_minmax calculation
         if self.method == "long_short":
-            filtered_pl = turnover_pl.filter(pl.col("numcos") >= self.mincos)
+            filtered_pl = turnover_stats_pl.filter(pl.col("numcos") >= self.mincos)
         elif self.method == "long_only":
-            filtered_pl = turnover_pl.filter(pl.col("numcos_l") >= self.mincos)
+            filtered_pl = turnover_stats_pl.filter(pl.col("numcos_l") >= self.mincos)
         
         date_minmax_pl = filtered_pl.group_by(byvar).agg([
             pl.col("date").min().alias("min"),
             pl.col("date").max().alias("max"),
         ])
+        
+        # Convert only at the very end when we need pandas
         date_minmax = _to_pandas(date_minmax_pl)
-        turnover = _to_pandas(turnover_pl)
+        turnover = _to_pandas(turnover_stats_pl)
+        tc = _to_pandas(tc_pl)
 
         panel = (
             self.datefile[["date"]]
@@ -1637,13 +1761,7 @@ class BacktestFast:
 
         # Join with factor data - stay in Polars
         factor_cols = ["size", "value", "growth", "leverage", "volatility", "momentum", "yield"]
-        master_pl = self._get_master_pl()
-        if master_pl is not None:
-            port_pl = _polars_join_master(port_pl, master_pl, factor_cols, how='inner')
-        else:
-            other_pl = self._get_otherfile_pl()
-            other_subset = other_pl.select(["security_id", "date"] + [c for c in factor_cols if c in other_pl.columns])
-            port_pl = port_pl.join(other_subset, on=["security_id", "date"], how="inner")
+        port_pl = self._fast_join_master_pl(port_pl, factor_cols, how='inner')
 
         factor_list = [
             "size",
@@ -1679,11 +1797,12 @@ class BacktestFast:
                     (pl.col(stat) * pl.col("weight")).alias(stat)
                 ])
 
-        # Aggregation
-        port2_pl = port_pl.group_by([byvar, "date"]).agg([pl.col(c).sum() for c in var_list if c in port_pl.columns])
+        # Aggregation - explicit columns for performance
+        port2_pl = port_pl.group_by([byvar, "date"]).agg([
+            pl.col(c).sum() for c in var_list if c in port_pl.columns
+        ])
         
-        # Join with tc (already Polars from earlier)
-        tc_pl = _to_polars(tc)
+        # Join with tc (use tc_pl from turnover section - already in Polars)
         port2_pl = port2_pl.join(tc_pl, on=[byvar, "date"], how="left")
         port2_pl = port2_pl.with_columns([
             pl.col("tc").fill_null(0.0),
@@ -1696,14 +1815,18 @@ class BacktestFast:
         port2_pl = panel_pl.join(port2_pl, on=[byvar, "date"], how="left")
         port2_pl = port2_pl.fill_null(0.0)
         
-        # Apply insample filter in Polars (avoid pandas conversion)
+        # Apply insample filter in Polars (use cached datefile_pl)
         if self.insample == "i1":
-            datefile_pl = _to_polars(self.datefile[["date", "insample"]])
-            port2_pl = port2_pl.join(datefile_pl, on="date", how="left")
+            datefile_pl = self._get_datefile_pl()
+            port2_pl = port2_pl.join(
+                datefile_pl.select(["date", "insample"]), on="date", how="left"
+            )
             port2_pl = port2_pl.filter(pl.col("insample") == 1).drop("insample")
         elif self.insample == "i2":
-            datefile_pl = _to_polars(self.datefile[["date", "insample2"]])
-            port2_pl = port2_pl.join(datefile_pl, on="date", how="left")
+            datefile_pl = self._get_datefile_pl()
+            port2_pl = port2_pl.join(
+                datefile_pl.select(["date", "insample2"]), on="date", how="left"
+            )
             port2_pl = port2_pl.filter(pl.col("insample2") == 1).drop("insample2")
 
         # Cumulative calculations - stay in Polars

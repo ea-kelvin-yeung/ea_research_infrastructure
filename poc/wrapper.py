@@ -156,11 +156,16 @@ def run_backtest(
     
     bt = BacktestClass(**bt_kwargs)
     
-    # Inject pre-computed indexes if available (avoids repeated indexing)
+    # Inject pre-computed indexes and Polars DataFrames for maximum performance
     if use_fast and hasattr(bt, 'set_precomputed_indexes'):
         bt.set_precomputed_indexes(
             dates_indexed=catalog.get('dates_indexed'),
             asof_tables=catalog.get('asof_tables'),
+            master_pl=catalog.get('master_pl'),
+            otherfile_pl=catalog.get('otherfile_pl'),
+            retfile_pl=catalog.get('retfile_pl'),
+            datefile_pl=catalog.get('datefile_pl'),
+            asof_tables_pl=catalog.get('asof_tables_pl'),
         )
     
     # Run and extract results

@@ -722,6 +722,20 @@ def load_catalog(
                 else:
                     catalog['otherfile_pl'] = pl.from_pandas(risk_df)
             
+            # Retfile as Polars - for ret column joins that need retfile rows
+            ret_parquet = path / 'ret.parquet'
+            if ret_parquet.exists():
+                catalog['retfile_pl'] = pl.read_parquet(ret_parquet)
+            else:
+                ret_partitions = path / 'partitions' / 'ret'
+                if ret_partitions.exists():
+                    catalog['retfile_pl'] = pl.read_parquet(ret_partitions)
+                else:
+                    catalog['retfile_pl'] = pl.from_pandas(ret_df)
+            
+            # Datefile as Polars - for date/n lookups in turnover
+            catalog['datefile_pl'] = pl.from_pandas(dates_df)
+            
             # Pre-sorted asof tables as Polars
             catalog['asof_tables_pl'] = {
                 'resid': pl.from_pandas(resid_table).sort('date_sig'),
