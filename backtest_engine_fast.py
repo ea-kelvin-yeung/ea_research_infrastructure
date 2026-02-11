@@ -500,7 +500,8 @@ def gen_date_trading(
                     Input is a string of 'equal', 'value', 'volume'; default is 'equal'
     
     upper_pct:      The upper cap of weight, determined by the x percentile of value or volume
-                    default is 0.95
+                    Value should be in range [0, 100] (e.g., 95 means 95th percentile)
+                    default is 95
                     
     @###   Transaction cost assumption   ###
     
@@ -607,7 +608,7 @@ class BacktestFast:
         fractile=[10, 90],
         frac_stretch=False,
         weight="equal",
-        upper_pct=0.95,
+        upper_pct=95,
         tc_model="naive",
         tc_level={"big": 2, "median": 5, "small": 10},
         tc_value=[0.35, 0.4],
@@ -1051,42 +1052,50 @@ class BacktestFast:
         return self._double_file_sorted
 
     def pre_process(self):
-        # merge with return data
+        """
+        Pre-process signal data: merge with returns and optionally residualize.
+        Optimized to stay in Polars as much as possible.
+        """
+        # Validate byvar names
         for x in self.byvar_list:
             if x in ["mcap", "adv"] + self.factor_list:
                 raise RuntimeError(f"byvar {x} need to be renamed")
 
+        # =============================================================================
+        # START IN POLARS - avoid pandas until the end
+        # =============================================================================
         if self.from_open:
-            temp = (
+            temp_pl = _to_polars(
                 self.infile[["security_id", "date_sig", "date_openret", self.sigvar]]
                 .rename(columns={"date_openret": "date"})
-                .drop_duplicates(subset=["security_id", "date"], keep="last")
-                .dropna()
             )
-
-            # Use fast index-based join via master_data (bypasses is_unique checks)
-            # Master contains openret/resopenret from retfile
-            temp = self._fast_join_master(temp, ["openret", "resopenret"], how='inner')
-            temp = temp.rename(columns={"openret": "ret", "resopenret": "resret"})
-            temp = temp[temp["ret"] > -0.95]
+            temp_pl = temp_pl.unique(subset=["security_id", "date"], keep="last").drop_nulls()
+            
+            # Use Polars-native join
+            temp_pl = self._fast_join_master_pl(temp_pl, ["openret", "resopenret"], how='inner')
+            temp_pl = temp_pl.rename({"openret": "ret", "resopenret": "resret"})
+            temp_pl = temp_pl.filter(pl.col("ret") > -0.95)
         else:
-            temp = (
+            temp_pl = _to_polars(
                 self.infile[["security_id", "date_sig", "date_ret", self.sigvar]]
                 .rename(columns={"date_ret": "date"})
-                .drop_duplicates(subset=["security_id", "date"], keep="last")
-                .dropna()
             )
+            temp_pl = temp_pl.unique(subset=["security_id", "date"], keep="last").drop_nulls()
+            
+            # Use Polars-native join
+            temp_pl = self._fast_join_master_pl(temp_pl, ["ret", "resret"], how='inner')
 
-            # Use fast index-based join via master_data (bypasses is_unique checks)
-            temp = self._fast_join_master(temp, ["ret", "resret"], how='inner')
-
+        # =============================================================================
+        # RESIDUALIZATION - Stay in Polars, extract numpy directly
+        # =============================================================================
         if self.resid:
             if self.input_type != "value":
                 raise RuntimeError(
                     "signal residualization only applies to numerical signal"
                 )
-            # Use Polars join_asof for faster performance
-            temp_pl = _to_polars(temp).sort("date_sig")
+            
+            # Join with other data for industry/factor info
+            temp_pl = temp_pl.sort("date_sig")
             other_pl = _to_polars(self._get_other_asof_resid()).sort("date_sig")
             
             temp_pl = temp_pl.join_asof(
@@ -1098,38 +1107,39 @@ class BacktestFast:
             )
             temp_pl = temp_pl.drop_nulls()
             temp_pl = temp_pl.sort(["date", "security_id"])
-            temp = _to_pandas(temp_pl).reset_index(drop=True)
 
-            # Prepare numpy arrays for vectorized residualization (20-50x faster)
-            dates = temp["date"].values
-            y = temp[self.sigvar].to_numpy(dtype="float64")
-            industry_codes, _ = pd.factorize(temp["industry_id"], sort=False)
+            # Extract numpy arrays directly from Polars (no pandas intermediate)
+            dates = temp_pl["date"].to_numpy()
+            y = temp_pl[self.sigvar].to_numpy()
+            industry = temp_pl["industry_id"].to_numpy()
+            _, industry_codes = np.unique(industry, return_inverse=True)
 
             if self.resid_style == "industry":
-                # Pure industry demeaning (fastest)
                 resid_values = _vectorized_resid_industry_numpy(dates, y, industry_codes)
             elif self.resid_style == "factor":
-                # Factor regression without industry grouping
-                X = temp[list(self.resid_varlist)].to_numpy(dtype="float64")
-                # For factor-only, we don't demean by industry, just regress
-                # Use a simple all-same-industry code to skip industry demeaning
+                X = temp_pl.select(list(self.resid_varlist)).to_numpy()
                 dummy_codes = np.zeros(len(y), dtype=int)
                 resid_values = _vectorized_resid_all_numpy(dates, y, X, dummy_codes)
             elif self.resid_style == "all":
-                # Full: factors within industry (most comprehensive)
-                X = temp[list(self.resid_varlist)].to_numpy(dtype="float64")
+                X = temp_pl.select(list(self.resid_varlist)).to_numpy()
                 resid_values = _vectorized_resid_all_numpy(dates, y, X, industry_codes)
             else:
                 raise RuntimeError(f"Unknown resid_style: {self.resid_style}")
             
-            temp[self.sigvar] = resid_values
-            temp = temp[
-                ["security_id", "date_sig", "date", "ret", "resret", self.sigvar]
-            ]
+            # Update signal column with residualized values
+            temp_pl = temp_pl.with_columns([
+                pl.Series(name=self.sigvar, values=resid_values)
+            ])
+            temp_pl = temp_pl.select(["security_id", "date_sig", "date", "ret", "resret", self.sigvar])
 
-        temp["overall"] = 1
-        temp["year"] = temp["date"].dt.year
-        return temp
+        # Add standard columns
+        temp_pl = temp_pl.with_columns([
+            pl.lit(1).alias("overall"),
+            pl.col("date").dt.year().alias("year"),
+        ])
+        
+        # Convert to pandas only at the end (needed for gen_result merge_asof compatibility)
+        return _to_pandas(temp_pl)
 
     def cal_corr(self, infile, byvar):
 
@@ -1354,11 +1364,17 @@ class BacktestFast:
         # Single conversion at exit
         return _to_pandas(check_pl)
 
-    def portfolio_ls(self, sig_file, byvar):
-
-        # Convert to Polars for faster ranking operations
-        temp_pl = _to_polars(sig_file)
-
+    def _portfolio_ls_pl(self, temp_pl: pl.DataFrame, byvar: str) -> pl.DataFrame:
+        """
+        Polars-native portfolio construction. Stays entirely in Polars.
+        
+        Args:
+            temp_pl: Polars DataFrame with signal data
+            byvar: Group variable for ranking
+            
+        Returns:
+            Polars DataFrame with positions assigned
+        """
         if self.input_type == "value":
             # double sorting
             if self.sort_method == "double":
@@ -1376,7 +1392,7 @@ class BacktestFast:
                 # First level ranking: fractile_double
                 temp_pl = temp_pl.with_columns([
                     (pl.col(self.double_var).rank("average").over([byvar, "date"]) *
-                     self.double_frac / pl.col(self.double_var).count().over([byvar, "date"])
+                     self.double_frac / pl.col(self.double_var).len().over([byvar, "date"])
                     ).ceil().alias("fractile_double")
                 ])
 
@@ -1384,7 +1400,7 @@ class BacktestFast:
                 sig_rank_method = "max" if self.frac_stretch else "average"
                 temp_pl = temp_pl.with_columns([
                     (pl.col(self.sigvar).rank(sig_rank_method).over([byvar, "fractile_double", "date"]) * 100 /
-                     pl.col(self.sigvar).count().over([byvar, "fractile_double", "date"])
+                     pl.col(self.sigvar).len().over([byvar, "fractile_double", "date"])
                     ).ceil().alias("percentile")
                 ])
 
@@ -1414,7 +1430,7 @@ class BacktestFast:
                 sig_rank_method = "max" if self.frac_stretch else "average"
                 temp_pl = temp_pl.with_columns([
                     (pl.col(self.sigvar).rank(sig_rank_method).over([byvar, "date"]) * 100 /
-                     pl.col(self.sigvar).count().over([byvar, "date"])
+                     pl.col(self.sigvar).len().over([byvar, "date"])
                     ).ceil().alias("percentile")
                 ])
 
@@ -1436,7 +1452,6 @@ class BacktestFast:
                 ])
                 temp_pl = temp_pl.drop("percentile")
 
-        # The byvar is meaningless if the input_type is not value
         elif self.input_type == "fractile":
             sig_min = temp_pl.select(pl.col(self.sigvar).min()).item()
             sig_max = temp_pl.select(pl.col(self.sigvar).max()).item()
@@ -1457,13 +1472,25 @@ class BacktestFast:
         # Join with master/other data - stay in Polars
         temp_pl = self._fast_join_master_pl(temp_pl, ["adv", "mcap"], how='inner')
 
-        # Single conversion at exit
-        return _to_pandas(temp_pl)
+        return temp_pl
 
-    def gen_weight_ls(self, port, byvar):
+    def portfolio_ls(self, sig_file, byvar):
+        """Legacy wrapper that accepts Pandas and returns Pandas."""
+        temp_pl = _to_polars(sig_file)
+        result_pl = self._portfolio_ls_pl(temp_pl, byvar)
+        return _to_pandas(result_pl)
 
-        # Convert to Polars for faster groupby operations
-        port_pl = _to_polars(port)
+    def _gen_weight_ls_pl(self, port_pl: pl.DataFrame, byvar: str) -> pl.DataFrame:
+        """
+        Polars-native weight generation. Stays entirely in Polars.
+        
+        Args:
+            port_pl: Polars DataFrame with portfolio positions
+            byvar: Group variable for weighting
+            
+        Returns:
+            Polars DataFrame with weights assigned
+        """
         group_cols = [byvar, "date", "position"]
 
         if self.input_type != "weight":
@@ -1514,43 +1541,63 @@ class BacktestFast:
                     (pl.col("weight") / pl.col("weight").sum().over(group_cols) * pl.col("position").cast(pl.Float64)).alias("weight")
                 ])
 
-        # Select required columns and convert back to pandas
+        # Select required columns (stay in Polars)
         select_cols = ["security_id", "date", byvar, "ret", "resret", "position", "weight"]
         port2_pl = port_pl.select([c for c in select_cols if c in port_pl.columns])
 
-        return _to_pandas(port2_pl)
+        return port2_pl
+
+    def gen_weight_ls(self, port, byvar):
+        """Legacy wrapper that accepts Pandas and returns Pandas."""
+        port_pl = _to_polars(port)
+        result_pl = self._gen_weight_ls_pl(port_pl, byvar)
+        return _to_pandas(result_pl)
 
     def backtest(self, sigfile, byvar):
+        """
+        Optimized backtest method.
+        Accepts Pandas or Polars input, runs entirely in Polars, returns Pandas results.
+        """
+        # =============================================================================
+        # CONVERT TO POLARS ONCE AT START (no more ping-ponging)
+        # =============================================================================
+        if isinstance(sigfile, pd.DataFrame):
+            sigfile_pl = _to_polars(sigfile)
+        else:
+            sigfile_pl = sigfile  # Already Polars
 
+        # =============================================================================
+        # PIPELINE: Portfolio -> Weighting (All Polars - no conversions)
+        # =============================================================================
         if self.input_type != "weight":
-            port = self.portfolio_ls(sigfile, byvar)
+            port_pl = self._portfolio_ls_pl(sigfile_pl, byvar)
             if self.verbose:
                 print("finish generating portfolio")
-            weight_file = self.gen_weight_ls(port, byvar)
-
-        elif self.input_type == "weight":
+            weight_file_pl = self._gen_weight_ls_pl(port_pl, byvar)
+        else:
             if self.verbose:
                 print("finish generating portfolio")
-            weight_file = self.gen_weight_ls(sigfile, byvar)
+            weight_file_pl = self._gen_weight_ls_pl(sigfile_pl, byvar)
 
         if self.verbose:
             print("finish calculating weight")
 
-        # cor = self.cal_corr(sigfile, byvar)
-
+        # Long-only filter (in Polars)
         if self.method == "long_only":
-            weight_file.loc[weight_file["weight"] < 0, "weight"] = 0
+            weight_file_pl = weight_file_pl.with_columns([
+                pl.when(pl.col("weight") < 0).then(0.0).otherwise(pl.col("weight")).alias("weight")
+            ])
 
         # =============================================================================
         # TURNOVER CALCULATION - 100% Polars (no pandas roundtrips)
         # =============================================================================
         
-        # Convert weight_file to Polars once at start
-        weight_file_pl = _to_polars(weight_file[["security_id", "date", byvar, "weight"]])
+        # Use weight_file_pl directly - already in Polars, no conversion needed
+        turnover_prep_pl = weight_file_pl.select(["security_id", "date", byvar, "weight"])
         
         # Join with datefile to get 'n' (trading day number) - stay in Polars
         datefile_pl = self._get_datefile_pl()
-        turnover_pl = weight_file_pl.join(
+        turnover_pl = turnover_prep_pl.join(
             datefile_pl.select(["date", "n"]),
             on="date",
             how="left"
@@ -1567,7 +1614,7 @@ class BacktestFast:
         ]).drop(["numcos_l_flag", "numcos_s_flag"])
         
         turnover_pl = turnover_pl.with_columns([
-            pl.min_horizontal(["numcos_l", "numcos_s"]).alias("numcos")
+            pl.min_horizontal(pl.col("numcos_l"), pl.col("numcos_s")).alias("numcos")
         ])
         
         # Filter by mincos
@@ -1607,7 +1654,10 @@ class BacktestFast:
         current_keys_pl = turnover_pl.select(["security_id", byvar, "n"]).unique()
         
         # Get the actual dtypes from turnover_pl for schema compatibility
-        numcos_dtype = turnover_pl.schema.get("numcos_l", pl.Int64)
+        # Get exact dtypes for each numcos column to ensure schema compatibility
+        dtype_numcos_l = turnover_pl.schema.get("numcos_l", pl.Int64)
+        dtype_numcos_s = turnover_pl.schema.get("numcos_s", pl.Int64)
+        dtype_numcos = turnover_pl.schema.get("numcos", pl.Int64)
         
         exits_pl = (
             prev_pl
@@ -1615,9 +1665,9 @@ class BacktestFast:
             .with_columns([
                 pl.lit(0.0).alias("weight"),
                 pl.col("weight_prev").abs().alias("weight_diff"),
-                pl.lit(None).cast(numcos_dtype).alias("numcos_l"),
-                pl.lit(None).cast(numcos_dtype).alias("numcos_s"),
-                pl.lit(None).cast(numcos_dtype).alias("numcos"),
+                pl.lit(None).cast(dtype_numcos_l).alias("numcos_l"),
+                pl.lit(None).cast(dtype_numcos_s).alias("numcos_s"),
+                pl.lit(None).cast(dtype_numcos).alias("numcos"),
             ])
         )
         
@@ -1684,11 +1734,13 @@ class BacktestFast:
         ])
         
         # Select and deduplicate for turnover stats
+        # Exits have null numcos values - exclude them from stats but keep their turnover contribution
+        # The turnover column already includes exit contributions from the over() aggregation
         turnover_stats_pl = (
             turnover_pl
             .select(["date", byvar, "numcos_l", "numcos_s", "turnover", "numcos"])
             .unique()
-            .drop_nulls()
+            .drop_nulls()  # Remove exit rows (null numcos) from stats
         )
         
         # date_minmax calculation
@@ -1702,40 +1754,54 @@ class BacktestFast:
             pl.col("date").max().alias("max"),
         ])
         
-        # Convert only at the very end when we need pandas
-        date_minmax = _to_pandas(date_minmax_pl)
-        turnover = _to_pandas(turnover_stats_pl)
-        tc = _to_pandas(tc_pl)
-
-        panel = (
-            self.datefile[["date"]]
-            .assign(temp=1)
-            .merge(date_minmax.assign(temp=1), on="temp")
-        )
-        panel = panel.loc[
-            (panel["date"] >= panel["min"]) & (panel["date"] <= panel["max"]),
-            [byvar, "date"],
-        ]
-        turnover2 = panel.merge(turnover, how="left", on=[byvar, "date"])
-        turnover = turnover2.fillna(0).drop(columns=["numcos"])
-        if byvar == "overall":
-            turnover_raw = turnover[["date", "turnover"]]
-
-        if self.insample == "i1":
-            turnover = self._fast_date_lookup(turnover, 'date', ['insample'])
-            turnover = turnover[turnover["insample"] == 1]
-        elif self.insample == "i2":
-            turnover = self._fast_date_lookup(turnover, 'date', ['insample2'])
-            turnover = turnover[turnover["insample2"] == 1]
-
-        # Convert to Polars for mean aggregation
-        turnover_pl = _to_polars(turnover)
-        # Get numeric columns only for mean
-        numeric_cols = [c for c in turnover_pl.columns if c != byvar and c != "date" and turnover_pl[c].dtype in [pl.Float64, pl.Float32, pl.Int64, pl.Int32]]
-        turnover_pl = turnover_pl.group_by(byvar).agg([pl.col(c).mean() for c in numeric_cols])
-        turnover_pl = turnover_pl.rename({byvar: "group"})
-        turnover = _to_pandas(turnover_pl)
+        # =============================================================================
+        # BUILD PANEL DIRECTLY IN POLARS (no pandas roundtrip)
+        # =============================================================================
+        datefile_pl = self._get_datefile_pl()
         
+        # Cross-join datefile with date_minmax to create panel
+        # This replaces the pandas assign(temp=1).merge pattern
+        panel_pl = datefile_pl.select(["date"]).join(
+            date_minmax_pl, how="cross"
+        ).filter(
+            (pl.col("date") >= pl.col("min")) & (pl.col("date") <= pl.col("max"))
+        ).select(["date", byvar])
+        
+        # Join turnover stats with panel
+        turnover2_pl = panel_pl.join(turnover_stats_pl, on=[byvar, "date"], how="left")
+        # Fill null only for numeric columns that should be 0 when no data (turnover)
+        # Keep numcos columns as-is (they represent actual counts)
+        turnover2_pl = turnover2_pl.with_columns([
+            pl.col("turnover").fill_null(0.0),
+            pl.col("numcos_l").fill_null(0),
+            pl.col("numcos_s").fill_null(0),
+        ])
+        if "numcos" in turnover2_pl.columns:
+            turnover2_pl = turnover2_pl.drop("numcos")
+        
+        # Store turnover_raw before filtering (for overall byvar)
+        if byvar == "overall":
+            turnover_raw = _to_pandas(turnover2_pl.select(["date", "turnover"]))
+        
+        # Apply insample filter in Polars
+        if self.insample == "i1":
+            turnover2_pl = turnover2_pl.join(
+                datefile_pl.select(["date", "insample"]), on="date", how="left"
+            ).filter(pl.col("insample") == 1).drop("insample")
+        elif self.insample == "i2":
+            turnover2_pl = turnover2_pl.join(
+                datefile_pl.select(["date", "insample2"]), on="date", how="left"
+            ).filter(pl.col("insample2") == 1).drop("insample2")
+        
+        # Mean aggregation in Polars
+        numeric_cols = [c for c in turnover2_pl.columns 
+                        if c not in [byvar, "date"] 
+                        and turnover2_pl[c].dtype in [pl.Float64, pl.Float32, pl.Int64, pl.Int32, pl.UInt32, pl.UInt64]]
+        turnover_agg_pl = turnover2_pl.group_by(byvar).agg([pl.col(c).mean() for c in numeric_cols])
+        turnover_agg_pl = turnover_agg_pl.rename({byvar: "group"})
+        
+        # Convert to pandas only at final output
+        turnover = _to_pandas(turnover_agg_pl)
         if byvar == "overall":
             turnover["group"] = "overall"
 
@@ -1743,8 +1809,8 @@ class BacktestFast:
             print("cal turnover")
 
         # calculate portfolio metrics: return, drawdown, factor exposure, industry exposure
-        # Stay in Polars for the entire metrics calculation
-        port_pl = _to_polars(weight_file[["security_id", byvar, "date", "ret", "resret", "weight"]])
+        # Use weight_file_pl directly - already in Polars, no conversion needed
+        port_pl = weight_file_pl.select([c for c in ["security_id", byvar, "date", "ret", "resret", "weight"] if c in weight_file_pl.columns])
         
         # Calculate numcos
         port_pl = port_pl.with_columns([
@@ -1756,7 +1822,7 @@ class BacktestFast:
             pl.col("numcos_s_flag").sum().over([byvar, "date"]).alias("numcos_s"),
         ]).drop(["numcos_l_flag", "numcos_s_flag"])
         port_pl = port_pl.with_columns([
-            pl.min_horizontal(["numcos_l", "numcos_s"]).alias("numcos")
+            pl.min_horizontal(pl.col("numcos_l"), pl.col("numcos_s")).alias("numcos")
         ])
 
         # Join with factor data - stay in Polars
@@ -1810,8 +1876,7 @@ class BacktestFast:
             (pl.col("resret") - pl.col("tc").fill_null(0.0)).alias("resret_net"),
         ])
         
-        # Join with panel
-        panel_pl = _to_polars(panel)
+        # Join with panel (panel_pl already created above)
         port2_pl = panel_pl.join(port2_pl, on=[byvar, "date"], how="left")
         port2_pl = port2_pl.fill_null(0.0)
         
@@ -1850,9 +1915,9 @@ class BacktestFast:
         if self.verbose:
             print("cal exposure")
 
-        # Now convert to pandas for long_only merge and daily_stats (requires pandas ops)
-        port2 = _to_pandas(port2_pl)
-
+        # =============================================================================
+        # LONG_ONLY BENCHMARK MERGE - Stay in Polars (no pandas roundtrip)
+        # =============================================================================
         if self.method == "long_only":
             if self.long_index == "sp500":
                 long = yf.Ticker("^GSPC")
@@ -1872,68 +1937,56 @@ class BacktestFast:
             long["date"] = long["date"].dt.tz_localize(None)
             long[self.long_index] = long["close"].pct_change()
             long = long[["date", self.long_index]].dropna()
-            port2 = port2.merge(long, how="left", on="date")
+            # Convert benchmark to Polars and join (no pandas roundtrip)
+            long_pl = _to_polars(long)
+            port2_pl = port2_pl.join(long_pl, on="date", how="left")
 
+        # =============================================================================
+        # DAILY_STATS - Create from Polars at the end (no intermediate pandas)
+        # =============================================================================
         if byvar == "overall":
             if self.method == "long_only":
-                daily_stats = port2[
-                    [
-                        "date",
-                        "ret",
-                        "ret_net",
-                        "resret",
-                        "cumret",
-                        "cumretnet",
-                        "drawdown",
-                        self.long_index,
-                    ]
-                    + factor_list
-                ]
-                daily_stats[f"cum_{self.long_index}"] = daily_stats[
-                    self.long_index
-                ].cumsum()
+                daily_cols = ["date", "ret", "ret_net", "resret", "cumret", "cumretnet", "drawdown", self.long_index] + factor_list
+                daily_stats_pl = port2_pl.select([c for c in daily_cols if c in port2_pl.columns])
+                daily_stats_pl = daily_stats_pl.with_columns([
+                    pl.col(self.long_index).cum_sum().alias(f"cum_{self.long_index}")
+                ])
+                daily_stats = _to_pandas(daily_stats_pl)
             else:
-                daily_stats = port2[
-                    [
-                        "date",
-                        "ret",
-                        "ret_net",
-                        "resret",
-                        "cumret",
-                        "cumretnet",
-                        "drawdown",
-                    ]
-                    + factor_list
-                ]
+                daily_cols = ["date", "ret", "ret_net", "resret", "cumret", "cumretnet", "drawdown"] + factor_list
+                daily_stats_pl = port2_pl.select([c for c in daily_cols if c in port2_pl.columns])
+                daily_stats = _to_pandas(daily_stats_pl)
 
         elif byvar == "cap":
-            daily_stats = port2[[byvar, "date", "cumret"]]
-            daily_stats["cap"] = np.select(
-                [daily_stats["cap"] == 1, daily_stats["cap"] == 2],
+            # Cap pivot requires pandas (pivot/unstack is complex in Polars)
+            cap_stats = _to_pandas(port2_pl.select([byvar, "date", "cumret"]))
+            cap_stats["cap"] = np.select(
+                [cap_stats["cap"] == 1, cap_stats["cap"] == 2],
                 ["LargeCap", "MediumCap"],
                 default="SmallCap",
             )
-
-            daily_stats = daily_stats.set_index(["date", byvar])
+            daily_stats = cap_stats.set_index(["date", byvar])
             daily_stats = daily_stats.unstack().add_prefix("cumret_")
             daily_stats.columns = daily_stats.columns.droplevel()
             daily_stats.reset_index(inplace=True)
 
-        # calculate return, sharpe and maximum drawdown - convert back to Polars for stats
-        port2_pl = _to_polars(port2)
+        # =============================================================================
+        # STATS CALCULATION - Pure Polars (no roundtrip)
+        # =============================================================================
+        # Select only columns needed for stats
         if self.method == "long_only":
-            select_cols = [byvar, "ret", "resret", "ret_net", "resret_net", "drawdown", self.long_index]
-            port2_pl = port2_pl.select([c for c in select_cols if c in port2_pl.columns])
+            stats_cols = [byvar, "ret", "resret", "ret_net", "resret_net", "drawdown", self.long_index]
         else:
-            port2_pl = port2_pl.select([byvar, "ret", "resret", "ret_net", "resret_net", "drawdown"])
+            stats_cols = [byvar, "ret", "resret", "ret_net", "resret_net", "drawdown"]
+        stats_pl = port2_pl.select([c for c in stats_cols if c in port2_pl.columns])
 
         # Calculate statistics with Polars over()
-        port2_pl = port2_pl.with_columns([
+        stats_pl = stats_pl.with_columns([
             pl.when(pl.col("ret") == 0).then(pl.lit(0)).otherwise(pl.lit(1)).alias("trade")
         ])
         
         sqrt_252 = np.sqrt(252)
-        port2_pl = port2_pl.with_columns([
+        stats_pl = stats_pl.with_columns([
             pl.col("trade").sum().over(byvar).alias("num_date"),
             (pl.col("ret").mean().over(byvar) * 252).alias("ret_ann"),
             (pl.col("ret").std().over(byvar) * sqrt_252).alias("ret_std"),
@@ -1944,19 +1997,19 @@ class BacktestFast:
             pl.col("drawdown").min().over(byvar).alias("maxdraw"),
         ])
         
-        port2_pl = port2_pl.with_columns([
+        stats_pl = stats_pl.with_columns([
             (pl.col("ret_ann") / pl.col("ret_std")).alias("sharpe_ret"),
             (pl.col("resret_ann") / pl.col("resret_std")).alias("sharpe_resret"),
             (pl.col("ret_net_ann") / pl.col("ret_net_std")).alias("sharpe_retnet"),
         ])
         
         # Calculate pct positive
-        port2_pl = port2_pl.with_columns([
+        stats_pl = stats_pl.with_columns([
             ((pl.col("ret").sign() + 1) / 2).alias("ret_pct"),
             ((pl.col("resret").sign() + 1) / 2).alias("resret_pct"),
             ((pl.col("ret_net").sign() + 1) / 2).alias("retnet_pct"),
         ])
-        port2_pl = port2_pl.with_columns([
+        stats_pl = stats_pl.with_columns([
             pl.col("ret_pct").mean().over(byvar).alias("retPctPos"),
             pl.col("resret_pct").mean().over(byvar).alias("resretPctPos"),
             pl.col("retnet_pct").mean().over(byvar).alias("retnetPctPos"),
@@ -1987,17 +2040,17 @@ class BacktestFast:
             "maxdraw",
         ]
 
-        if self.method == "long_only" and self.long_index in port2_pl.columns:
-            port2_pl = port2_pl.with_columns([
-                pl.col(self.long_index).count().over(byvar).alias("long_count"),
+        if self.method == "long_only" and self.long_index in stats_pl.columns:
+            stats_pl = stats_pl.with_columns([
+                pl.col(self.long_index).len().over(byvar).alias("long_count"),
                 pl.col(self.long_index).mean().over(byvar).alias("long_mean"),
                 pl.col(self.long_index).std().over(byvar).alias("long_std"),
             ])
-            port2_pl = port2_pl.with_columns([
+            stats_pl = stats_pl.with_columns([
                 (pl.col("long_mean") * 252).alias(f"{self.long_index}_ann"),
                 (pl.col("long_std") * sqrt_252).alias(f"{self.long_index}_std"),
             ])
-            port2_pl = port2_pl.with_columns([
+            stats_pl = stats_pl.with_columns([
                 (pl.col(f"{self.long_index}_ann") / pl.col(f"{self.long_index}_std")).alias(f"sharpe_{self.long_index}")
             ])
             stats_list_f = stats_list_f + [
@@ -2011,10 +2064,11 @@ class BacktestFast:
                 f"sharpe_{self.long_index}",
             ]
 
-        port2 = _to_pandas(port2_pl)
+        # Final conversion to pandas for output
+        stats_df = _to_pandas(stats_pl)
 
         annret = (
-            port2.loc[:, [byvar, "num_date"] + stats_list_f]
+            stats_df.loc[:, [byvar, "num_date"] + stats_list_f]
             .drop_duplicates()
             .rename(columns={byvar: "group"})
         )
@@ -2092,57 +2146,76 @@ class BacktestFast:
             byvar_cols.append("cap")
         byvar_cols = list(dict.fromkeys(byvar_cols))
 
+        # =============================================================================
+        # MERGE ASOF IN POLARS (faster than pandas merge_asof)
+        # =============================================================================
         if byvar_cols:
-            # Use cached pre-sorted table (optimization #1)
-            # Sort by date_sig (globally) - merge_asof requires this
-            temp_with_byvars = pd.merge_asof(
-                temp_base.sort_values(by=["date_sig"]),
-                self._get_other_asof_byvars(byvar_cols),  # Pre-sorted, cached
+            # Convert to Polars and sort
+            temp_base_pl = _to_polars(temp_base).sort("date_sig")
+            
+            # Get byvar columns from otherfile - cached and sorted
+            other_byvars = self._get_other_asof_byvars(byvar_cols)
+            other_byvars_pl = _to_polars(other_byvars).sort("date_sig")
+            
+            # Polars join_asof (faster than pandas merge_asof)
+            temp_with_byvars_pl = temp_base_pl.join_asof(
+                other_byvars_pl,
                 by="security_id",
                 on="date_sig",
-                allow_exact_matches=True,
-                direction="backward",
-                tolerance=pd.Timedelta("20d"),
+                strategy="backward",
+                tolerance="20d",
             )
         else:
-            temp_with_byvars = temp_base
+            temp_with_byvars_pl = _to_polars(temp_base)
 
-        if "capyr" in self.byvar_list and "cap" in temp_with_byvars.columns:
-            cap = temp_with_byvars["cap"]
-            cap_label = np.select(
-                [cap == 1, cap == 2], ["LargeCap", "MediumCap"], default="SmallCap"
-            )
-            temp_with_byvars["capyr"] = np.where(
-                cap.notna(), cap_label + "_" + temp_with_byvars["year"].astype("str"), np.nan
-            )
+        # Handle capyr in Polars
+        if "capyr" in self.byvar_list and "cap" in temp_with_byvars_pl.columns:
+            temp_with_byvars_pl = temp_with_byvars_pl.with_columns([
+                pl.when(pl.col("cap") == 1).then(pl.lit("LargeCap"))
+                .when(pl.col("cap") == 2).then(pl.lit("MediumCap"))
+                .otherwise(pl.lit("SmallCap")).alias("cap_label")
+            ])
+            temp_with_byvars_pl = temp_with_byvars_pl.with_columns([
+                pl.when(pl.col("cap").is_not_null())
+                .then(pl.col("cap_label") + "_" + pl.col("year").cast(pl.Utf8))
+                .otherwise(pl.lit(None))
+                .alias("capyr")
+            ]).drop("cap_label")
 
         daily_stats, daily_stats2, turnover = (
             pd.DataFrame(),
             pd.DataFrame(),
             pd.DataFrame(),
         )
-        temp_iter = temp_with_byvars
+        
+        # temp_with_byvars_pl is already in Polars (no additional conversion needed)
+        
         for byvar in self.byvar_list:
 
             if self.verbose:
                 print(f"Processing byvar: {byvar}")
 
+            # Zero-copy Polars filtering (vs expensive Pandas boolean indexing)
             if byvar not in ["overall", "year"]:
-                temp_iter = temp_iter[temp_iter[byvar].notna()]
-            temp = temp_iter
+                temp_pl = temp_with_byvars_pl.filter(pl.col(byvar).is_not_null())
+            else:
+                temp_pl = temp_with_byvars_pl
 
+            # Pass Polars DataFrame directly to backtest (no conversion)
             if byvar == "overall":
-                combo, daily_stats, turnover = self.backtest(temp, byvar)
+                combo, daily_stats, turnover = self.backtest(temp_pl, byvar)
 
             elif byvar == "cap":
-                combo, daily_stats2 = self.backtest(temp, byvar)
+                combo, daily_stats2 = self.backtest(temp_pl, byvar)
             else:
-                combo = self.backtest(temp, byvar)
+                combo = self.backtest(temp_pl, byvar)
             result.append(combo)
 
         if self.earnings_window:
-            temp2 = temp_iter.merge(self.window_file, on=["security_id", "date"])
-            combo = self.backtest(temp2, "earning_window")
+            # Join in Polars (edge case)
+            window_pl = _to_polars(self.window_file)
+            temp2_pl = temp_with_byvars_pl.join(window_pl, on=["security_id", "date"], how="inner")
+            combo = self.backtest(temp2_pl, "earning_window")
             result.append(combo)
 
         if self.byvix:
@@ -2162,8 +2235,10 @@ class BacktestFast:
                     f"vix > {vix_median}",
                     f"vix <= {vix_median}",
                 )
-                temp2 = temp_iter.merge(vix, on=["date"])
-                combo = self.backtest(temp2, "vix")
+                # Join in Polars
+                vix_pl = _to_polars(vix)
+                temp2_pl = temp_with_byvars_pl.join(vix_pl, on=["date"], how="inner")
+                combo = self.backtest(temp2_pl, "vix")
                 result.append(combo)
             except:
                 if self.verbose:
