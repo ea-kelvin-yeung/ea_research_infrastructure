@@ -34,9 +34,11 @@ class SuiteResult:
     ic_series: Optional[pd.DataFrame] = None  # Daily IC time series
 
 
-def _run_single_config(signal_df, catalog, lag, residualize):
+def _run_single_config(signal_df, catalog, lag, residualize, byvar_list=None):
     """Helper to run a single config (for parallel execution)."""
-    config = BacktestConfig(lag=lag, residualize=residualize)
+    if byvar_list is None:
+        byvar_list = ['overall', 'year', 'cap']
+    config = BacktestConfig(lag=lag, residualize=residualize, byvar_list=byvar_list)
     try:
         result = run_backtest(signal_df, catalog, config, validate=False)
         return config.config_key(), result
@@ -53,6 +55,7 @@ def run_suite(
     n_jobs: int = 1,
     baseline_start_date: str = DEFAULT_START_DATE,
     baseline_end_date: str = DEFAULT_END_DATE,
+    byvar_list: list = None,
 ) -> SuiteResult:
     """
     Run a suite of backtests across a config grid.
@@ -65,10 +68,13 @@ def run_suite(
         n_jobs: Number of parallel jobs (1 = sequential)
         baseline_start_date: Start date for baseline signals (default: 2017-01-01)
         baseline_end_date: End date for baseline signals (default: 2018-12-31)
+        byvar_list: Analysis slices (default: ['overall', 'year', 'cap'])
         
     Returns:
         SuiteResult with all results, summary table, and correlations
     """
+    if byvar_list is None:
+        byvar_list = ['overall', 'year', 'cap']
     if grid is None:
         grid = DEFAULT_GRID
     
@@ -85,13 +91,13 @@ def run_suite(
         # Sequential
         results = {}
         for lag, resid in configs:
-            key, result = _run_single_config(signal_df, catalog, lag, resid)
+            key, result = _run_single_config(signal_df, catalog, lag, resid, byvar_list)
             if result is not None:
                 results[key] = result
     else:
         # Parallel
         raw_results = Parallel(n_jobs=n_jobs)(
-            delayed(_run_single_config)(signal_df, catalog, lag, resid)
+            delayed(_run_single_config)(signal_df, catalog, lag, resid, byvar_list)
             for lag, resid in configs
         )
         results = {k: v for k, v in raw_results if v is not None}

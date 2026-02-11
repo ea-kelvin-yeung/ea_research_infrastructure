@@ -122,6 +122,14 @@ def main():
             default=['off'],
             help="off=raw signal, industry=demean by industry, factor=regress on risk factors, all=both"
         )
+        byvar_list = st.multiselect(
+            "Analysis Slices",
+            ['overall', 'year', 'cap'],
+            default=['overall'],
+            help="overall=aggregate stats, year=by year, cap=by market cap"
+        )
+        if not byvar_list:
+            byvar_list = ['overall']
         include_baselines = st.checkbox("Include Baselines", value=False, help="Run baseline backtests (required for PnL correlation)")
         log_to_mlflow = st.checkbox("Log to MLflow", value=True)
         
@@ -234,6 +242,7 @@ def main():
                     include_baselines=include_baselines,
                     baseline_start_date=start_str,
                     baseline_end_date=end_str,
+                    byvar_list=byvar_list,
                 )
                 baselines_note = f" + {len(result.baselines)} baselines" if include_baselines else ""
                 log_step(f"Run suite ({num_configs} configs{baselines_note})", time.time() - step_start, 0.75)
@@ -557,6 +566,7 @@ def main():
                         include_baselines=include_baselines,
                         baseline_start_date=start_str,
                         baseline_end_date=end_str,
+                        byvar_list=byvar_list,
                     )
                     baselines_note = f" + {len(result.baselines)} baselines" if include_baselines else ""
                     log_step(f"Run suite ({num_configs} configs{baselines_note})", time.time() - step_start, 0.75)
