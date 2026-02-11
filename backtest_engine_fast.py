@@ -942,58 +942,6 @@ class BacktestFast:
             out[col + suffix] = taken
         return out
 
-    def _fast_join_master(self, df, cols, how='inner', source='auto'):
-        """
-        Fast join using pre-computed Polars DataFrames.
-        
-        Column family semantics:
-        - ret columns (ret, resret, openret, resopenret): Use cached retfile_pl
-          (preserves rows that exist in ret but not risk)
-        - Other columns (factors, mcap, etc.): Use cached master_pl (ret∩risk)
-        
-        Args:
-            df: DataFrame with security_id and date columns
-            cols: List of columns to retrieve
-            how: Join type ('inner' or 'left')
-            source: Data source - 'auto' (default), 'ret', 'risk', or 'master'
-                   'auto' uses retfile for ret columns, otherwise master_data
-            
-        Returns:
-            DataFrame with requested columns joined
-        """
-        ret_cols = {'ret', 'resret', 'openret', 'resopenret', 'vol', 'adv', 'close_adj'}
-        
-        # For ret/resret columns, use cached retfile_pl to preserve row count
-        # (master_pl is ret∩risk which may exclude rows that exist only in ret)
-        if source == 'auto' and set(cols) <= ret_cols:
-            retfile_pl = self._get_retfile_pl()
-            available = [c for c in cols if c in retfile_pl.columns]
-            if available:
-                df_pl = _to_polars(df)
-                ret_subset = retfile_pl.select(['security_id', 'date'] + available)
-                result_pl = df_pl.join(ret_subset, on=['security_id', 'date'], how=how)
-                return _to_pandas(result_pl)
-        
-        # For non-ret columns, use pre-computed master_pl
-        master_pl = self._get_master_pl()
-        if master_pl is not None:
-            available_cols = [c for c in cols if c in master_pl.columns]
-            if available_cols:
-                df_pl = _to_polars(df)
-                result_pl = _polars_join_master(df_pl, master_pl, available_cols, how=how)
-                return _to_pandas(result_pl)
-        
-        # Final fallback: use otherfile_pl
-        otherfile_pl = self._get_otherfile_pl()
-        available_cols = [c for c in cols if c in otherfile_pl.columns]
-        if available_cols:
-            df_pl = _to_polars(df)
-            other_subset = otherfile_pl.select(['security_id', 'date'] + available_cols)
-            result_pl = df_pl.join(other_subset, on=['security_id', 'date'], how=how)
-            return _to_pandas(result_pl)
-        
-        return df
-
     def _fast_join_master_pl(self, df_pl: pl.DataFrame, cols: list, 
                               how: str = 'inner', source: str = 'auto') -> pl.DataFrame:
         """
@@ -1474,11 +1422,6 @@ class BacktestFast:
 
         return temp_pl
 
-    def portfolio_ls(self, sig_file, byvar):
-        """Legacy wrapper that accepts Pandas and returns Pandas."""
-        temp_pl = _to_polars(sig_file)
-        result_pl = self._portfolio_ls_pl(temp_pl, byvar)
-        return _to_pandas(result_pl)
 
     def _gen_weight_ls_pl(self, port_pl: pl.DataFrame, byvar: str) -> pl.DataFrame:
         """
@@ -1547,11 +1490,6 @@ class BacktestFast:
 
         return port2_pl
 
-    def gen_weight_ls(self, port, byvar):
-        """Legacy wrapper that accepts Pandas and returns Pandas."""
-        port_pl = _to_polars(port)
-        result_pl = self._gen_weight_ls_pl(port_pl, byvar)
-        return _to_pandas(result_pl)
 
     def backtest(self, sigfile, byvar):
         """
