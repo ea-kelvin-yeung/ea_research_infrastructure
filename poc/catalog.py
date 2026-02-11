@@ -529,6 +529,7 @@ def load_catalog(
     snapshot_path: str = "snapshots/default",
     use_master: bool = True,
     verify_integrity: bool = False,
+    universe_only: bool = False,
 ) -> dict:
     """
     Load data catalog from a snapshot directory.
@@ -540,6 +541,8 @@ def load_catalog(
         snapshot_path: Path to snapshot directory containing parquet files
         use_master: If True, load master_data for fast backtest joins
         verify_integrity: If True, verify content hashes match manifest (slower)
+        universe_only: If True, filter master/risk to only universe_flag=1 rows.
+                      Reduces memory ~44% (30M → 17M rows) and speeds up joins.
         
     Returns:
         dict with keys: 'ret', 'risk', 'dates', 'snapshot_id', 'manifest', 'fingerprint'
@@ -602,6 +605,16 @@ def load_catalog(
         risk_df = _normalize_dataframe(risk_df, 'risk')
         dates_df = _normalize_datefile(dates_df)
     
+    # Filter to universe_flag=1 if requested (reduces 30M → 17M rows, ~44% reduction)
+    # We store the filtered keys as a DataFrame for fast merge-based filtering
+    universe_keys_df = None
+    if universe_only and 'universe_flag' in risk_df.columns:
+        original_rows = len(risk_df)
+        risk_df = risk_df[risk_df['universe_flag'] == 1].copy()
+        # Store keys as DataFrame for efficient merge-based filtering (much faster than set)
+        universe_keys_df = risk_df[['security_id', 'date']].drop_duplicates()
+        print(f"Universe filter: {original_rows:,} → {len(risk_df):,} rows ({len(risk_df)/original_rows*100:.1f}%)")
+    
     # Extract fingerprint from manifest (v3+)
     fingerprint = manifest.get('fingerprint', None)
     # Handle both old format (dict with meta_hash) and new format (string)
@@ -635,13 +648,27 @@ def load_catalog(
         master_path = path / 'master.parquet'
         try:
             master_df = _load_table('master', 'master.parquet')
+            
+            # Apply universe filter using Polars (10x faster than Pandas set membership)
+            if universe_only and universe_keys_df is not None:
+                import polars as pl
+                original_master = len(master_df)
+                
+                # Load master as Polars, filter via semi-join, convert back
+                master_pl = pl.from_pandas(master_df)
+                keys_pl = pl.from_pandas(universe_keys_df)
+                master_pl = master_pl.join(keys_pl, on=['security_id', 'date'], how='semi')
+                master_df = master_pl.to_pandas()
+                print(f"Master universe filter: {original_master:,} → {len(master_df):,} rows")
+            
             # Restore MultiIndex (cheap operation - skip sort_index for speed)
             if 'security_id' in master_df.columns:
                 master_df = master_df.set_index(['security_id', 'date'])
+            
             catalog['master'] = master_df
         except FileNotFoundError:
             if not is_v2:
-                # Fallback for v1: create master on the fly
+                # Fallback for v1: create master on the fly (already uses filtered risk_df)
                 catalog['master'] = _create_master_data(ret_df, risk_df)
                 catalog['master'].reset_index().to_parquet(master_path, index=False)
                 print(f"Created master.parquet: {len(catalog['master'])} rows")
@@ -698,29 +725,19 @@ def load_catalog(
         }
         
         # Pre-compute Polars DataFrames to avoid expensive runtime conversions
-        # Load directly from parquet as Polars to avoid memory duplication
         try:
             import polars as pl
             
-            # Master as Polars - load directly from parquet (avoids reset_index)
-            master_parquet = path / 'master.parquet'
-            if master_parquet.exists():
-                catalog['master_pl'] = pl.read_parquet(master_parquet)
-            elif 'master' in catalog and catalog['master'] is not None:
-                # Fallback: convert from Pandas
+            # Master as Polars - convert from already-filtered Pandas master
+            # (We already filtered during Pandas load, so just convert that)
+            if 'master' in catalog and catalog['master'] is not None:
                 catalog['master_pl'] = pl.from_pandas(catalog['master'].reset_index())
-            
-            # Otherfile (risk) as Polars - load from parquet
-            risk_parquet = path / 'risk.parquet'
-            if risk_parquet.exists():
-                catalog['otherfile_pl'] = pl.read_parquet(risk_parquet)
             else:
-                # Check partitioned
-                risk_partitions = path / 'partitions' / 'risk'
-                if risk_partitions.exists():
-                    catalog['otherfile_pl'] = pl.read_parquet(risk_partitions)
-                else:
-                    catalog['otherfile_pl'] = pl.from_pandas(risk_df)
+                catalog['master_pl'] = None
+            
+            # Otherfile (risk) as Polars - use already-filtered risk_df
+            # (risk_df was filtered above if universe_only=True)
+            catalog['otherfile_pl'] = pl.from_pandas(risk_df)
             
             # Retfile as Polars - for ret column joins that need retfile rows
             ret_parquet = path / 'ret.parquet'

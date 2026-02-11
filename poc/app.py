@@ -22,9 +22,9 @@ from poc.suite import get_best_config
 
 
 @st.cache_resource(show_spinner="Loading data snapshot...")
-def get_cached_catalog(snapshot_path: str):
+def get_cached_catalog(snapshot_path: str, universe_only: bool = False):
     """Load catalog once and cache in memory across reruns."""
-    return load_catalog(snapshot_path, use_master=True)
+    return load_catalog(snapshot_path, use_master=True, universe_only=universe_only)
 
 
 @st.cache_data(ttl=10, show_spinner=False)
@@ -89,6 +89,17 @@ def main():
             return
         
         selected_snapshot = st.selectbox("Data Snapshot", snapshots, help="Pre-built market data (returns, risk factors, dates)")
+        
+        # Universe filter for performance
+        universe_only_data = st.checkbox(
+            "🚀 Universe only (2x faster)", 
+            value=True,
+            help="Load only investable universe (universe_flag=1). Reduces data 44% and speeds up backtests ~2x."
+        )
+        if universe_only_data:
+            st.caption("Loading ~17M rows (investable universe)")
+        else:
+            st.caption("Loading ~30M rows (all securities)")
         
         # Cache controls
         with st.expander("Data Cache", expanded=False):
@@ -189,7 +200,7 @@ def main():
                 
                 # Step 3: Load catalog (cached in memory after first load)
                 step_start = time.time()
-                catalog = get_cached_catalog(f"snapshots/{selected_snapshot}")
+                catalog = get_cached_catalog(f"snapshots/{selected_snapshot}", universe_only=universe_only_data)
                 catalog = filter_catalog(catalog, start_str, end_str)
                 log_step(f"Load catalog ({len(catalog['ret']):,} ret rows)", time.time() - step_start, 0.25)
                 
@@ -512,7 +523,7 @@ def main():
                     # Step 3: Load catalog
                     step_start = time.time()
                     snapshot_id = rerun_cfg.get('snapshot') or selected_snapshot
-                    catalog = get_cached_catalog(f"snapshots/{snapshot_id}")
+                    catalog = get_cached_catalog(f"snapshots/{snapshot_id}", universe_only=universe_only_data)
                     catalog = filter_catalog(catalog, start_str, end_str)
                     log_step(f"Load catalog ({len(catalog['ret']):,} ret rows)", time.time() - step_start, 0.25)
                     
