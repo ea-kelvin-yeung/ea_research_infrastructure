@@ -24,8 +24,12 @@ UNIVERSE_ONLY = True
 
 def create_signal(catalog: dict) -> pd.DataFrame:
     """Create signal for benchmarking."""
-    ret = catalog['ret']
-    securities = ret['security_id'].unique()
+    # Use master table for securities (respects universe_only filter)
+    if 'master' in catalog and catalog['master'] is not None:
+        securities = catalog['master'].index.get_level_values('security_id').unique()
+    else:
+        securities = catalog['ret']['security_id'].unique()
+    
     if N_SECURITIES is not None and len(securities) > N_SECURITIES:
         securities = np.random.choice(securities, N_SECURITIES, replace=False)
     
