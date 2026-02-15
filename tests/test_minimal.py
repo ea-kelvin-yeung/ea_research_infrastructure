@@ -146,23 +146,17 @@ def main():
     N_DAYS = 1260
     master, datefile, sig = make_synth_data(N_SECURITIES, N_DAYS, seed=0)
 
+    from backtest_engine_fast import BacktestFast
+    from backtest_engine_minimal_fast import BacktestFastMinimal, BacktestConfig
+
     # -----------------------------
     # A) OLD ENGINE (your BacktestFast)
     # -----------------------------
-    # You must have your big code available as importable symbols:
-    # from your_module import BacktestFast
-    #
-    # For fairness, keep settings similar (no yfinance, no statsmodels).
-    #
-    # NOTE: your BacktestFast signature expects:
-    # infile, retfile, otherfile, datefile, sigvar, ... plus options
     def run_old():
-        from backtest_engine_fast import BacktestFast  # <-- change this
-
         bt = BacktestFast(
             infile=sig,
             retfile=master,
-            otherfile=master,     # simplest: reuse master as otherfile
+            otherfile=master,
             datefile=datefile,
             sigvar="my_signal",
             method="long_short",
@@ -170,8 +164,8 @@ def main():
             input_type="value",
             weight="equal",
             tc_model="naive",
-            byvar_list=["overall"],   # keep it minimal for apples-to-apples
-            resid=False,              # set True to benchmark residualization
+            byvar_list=["overall"],
+            resid=False,
             sort_method="single",
             verbose=False,
             master_data=None,
@@ -180,15 +174,12 @@ def main():
             byvix=False,
             earnings_window=False,
         )
-        bt.gen_result()
+        return bt.gen_result()
 
     # -----------------------------
     # B) MINIMAL ENGINE (BacktestFastMinimal)
     # -----------------------------
-    # You must have backtest_min.py (the minimal implementation) available.
     def run_new():
-        from backtest_engine_minimal_fast import BacktestFastMinimal, BacktestConfig  # <-- change paths if needed
-
         cfg = BacktestConfig(
             sigvar="my_signal",
             method="long_short",
@@ -198,19 +189,71 @@ def main():
             mincos=10,
             sort_method="single",
             weight="equal",
-            resid=False,         # set True to benchmark residualization
+            resid=False,
             tc_model="naive",
             byvars=("overall",),
         )
         bt = BacktestFastMinimal(master=pl.from_pandas(master), datefile=pl.from_pandas(datefile), cfg=cfg)
-        bt.run(pl.from_pandas(sig))
+        return bt.run(pl.from_pandas(sig))
 
+    # -----------------------------
+    # Equivalence Test
+    # -----------------------------
+    print(f"Rows in master: {len(master):,} | rows in signal: {len(sig):,}")
+    print("\n" + "="*60)
+    print("EQUIVALENCE TEST")
+    print("="*60)
+    
+    old_result = run_old()
+    new_result = run_new()
+    
+    # Extract stats from old engine (returns tuple: combo, daily_stats, turnover_raw for overall)
+    old_stats = old_result[0]
+    
+    # Extract stats from new engine
+    new_stats = new_result["summary"]
+    
+    # Compare key metrics
+    metrics_to_compare = [
+        ("sharpe_ret", "sharpe_ret", 0.01),      # 1% tolerance
+        ("ret_ann", "ret_ann", 0.01),
+        ("ret_std", "ret_std", 0.01),
+        ("turnover", "turnover", 0.01),
+        ("numcos_l", "numcos_l", 0.01),
+        ("numcos_s", "numcos_s", 0.01),
+    ]
+    
+    print(f"\n{'Metric':<15} {'OLD':>12} {'NEW':>12} {'Diff':>12} {'Match':>8}")
+    print("-" * 60)
+    
+    all_match = True
+    for old_col, new_col, rel_tol in metrics_to_compare:
+        if old_col in old_stats.columns and new_col in new_stats.columns:
+            old_val = old_stats[old_col].iloc[0]
+            new_val = new_stats[new_col].item()
+            diff = abs(old_val - new_val)
+            tol = max(abs(old_val) * rel_tol, 1e-6)
+            match = diff < tol
+            all_match = all_match and match
+            status = "OK" if match else "FAIL"
+            print(f"{old_col:<15} {old_val:>12.6f} {new_val:>12.6f} {diff:>12.6f} {status:>8}")
+        else:
+            print(f"{old_col:<15} {'N/A':>12} {'N/A':>12} {'N/A':>12} {'SKIP':>8}")
+    
+    print("-" * 60)
+    if all_match:
+        print("EQUIVALENCE: PASSED - All metrics match")
+    else:
+        print("EQUIVALENCE: FAILED - Some metrics differ")
+    
     # -----------------------------
     # Benchmark
     # -----------------------------
-    print(f"Rows in master: {len(master):,} | rows in signal: {len(sig):,}")
-    time_it(run_old, repeats=3, warmup=1, name="OLD BacktestFast")
-    time_it(run_new, repeats=5, warmup=2, name="NEW Minimal")
+    print("\n" + "="*60)
+    print("SPEED BENCHMARK")
+    print("="*60)
+    time_it(lambda: run_old(), repeats=3, warmup=1, name="OLD BacktestFast")
+    time_it(lambda: run_new(), repeats=5, warmup=2, name="NEW Minimal")
 
 
 if __name__ == "__main__":

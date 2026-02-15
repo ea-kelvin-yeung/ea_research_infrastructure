@@ -505,22 +505,51 @@ class BacktestFastMinimal:
 
         w = w.join(ok_days, on=[byvar, "date"], how="inner")
 
-        # Compute turnover via self-join with shifted n (outer join captures both entries and exits)
-        cur = w.select(["security_id", byvar, "n", "weight"])
-        prev = cur.with_columns((pl.col("n") + 1).alias("n")).rename({"weight": "weight_prev"})
+        # Compute turnover via left join + exits (matches OLD engine exactly)
+        cur = w.select(["security_id", byvar, "n", "date", "weight"])
+        prev = (
+            cur.select(["security_id", byvar, "n", "weight"])
+               .with_columns((pl.col("n") + 1).alias("n"))
+               .rename({"weight": "weight_prev"})
+               .unique(subset=["security_id", byvar, "n"], keep="last")
+        )
 
+        # Left join: current positions with their previous weights
         diff = (
-            cur.join(prev, on=["security_id", byvar, "n"], how="outer")
+            cur.join(prev, on=["security_id", byvar, "n"], how="left")
                .with_columns([
-                   pl.col("weight").fill_null(0.0),
                    pl.col("weight_prev").fill_null(0.0),
-                   (pl.col("weight") - pl.col("weight_prev")).abs().alias("weight_diff"),
+                   (pl.col("weight") - pl.col("weight_prev").fill_null(0.0)).abs().alias("weight_diff"),
+               ])
+        )
+        
+        # Handle exits: positions in prev that don't exist in cur
+        current_keys = cur.select(["security_id", byvar, "n"]).unique()
+        exits = (
+            prev.join(current_keys, on=["security_id", byvar, "n"], how="anti")
+               .with_columns([
+                   pl.lit(0.0).alias("weight"),
+                   pl.col("weight_prev").abs().alias("weight_diff"),
                ])
                .join(self.date_df.select(["date", "n"]).lazy(), on="n", how="left")
         )
+        
+        # Concat entries/exits
+        diff = pl.concat([diff, exits], how="diagonal_relaxed")
+        
+        # Zero out first day turnover
+        diff = diff.with_columns([
+            pl.col("n").min().over(byvar).alias("n_min")
+        ]).with_columns([
+            pl.when(pl.col("n") == pl.col("n_min")).then(0.0)
+              .otherwise(pl.col("weight_diff")).alias("weight_diff")
+        ])
 
-        # turnover per day
-        turnover_daily = diff.group_by([byvar, "date"]).agg(pl.sum("weight_diff").alias("turnover"))
+        # turnover per day (sum weight_diff using over(), then deduplicate)
+        diff = diff.with_columns([
+            pl.col("weight_diff").sum().over([byvar, "date"]).alias("turnover")
+        ])
+        turnover_daily = diff.select([byvar, "date", "turnover"]).unique().drop_nulls()
 
         # transaction costs - join required columns from master
         if cfg.tc_model == "naive":
@@ -652,14 +681,14 @@ class BacktestFastMinimal:
                 ])
             )
 
-            # turnover + counts summary
+            # turnover + counts summary (divide by 4 to match OLD engine convention)
             turnover_sum = (
                 self._apply_insample_filter(
                     turnover_daily.join(counts_daily, on=[byvar, "date"], how="left").lazy()
                 )
                 .group_by(byvar)
                 .agg([
-                    pl.mean("turnover").alias("turnover"),
+                    (pl.mean("turnover") / 4.0).alias("turnover"),
                     pl.mean("numcos_l").alias("numcos_l"),
                     pl.mean("numcos_s").alias("numcos_s"),
                 ])
