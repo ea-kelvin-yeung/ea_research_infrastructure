@@ -136,17 +136,19 @@ def run_suite(
     # Compute correlations (reuse baseline_signals to avoid regenerating)
     correlations = _compute_correlations(signal_df, catalog, results, baselines, baseline_signals)
     
-    # Compute factor exposures
-    print("Computing factor exposures...")
-    factor_exposures = _compute_factor_exposures(signal_df, catalog)
+    # Run analytics in parallel for speed
+    from concurrent.futures import ThreadPoolExecutor
     
-    # Compute coverage metrics
-    print("Computing coverage metrics...")
-    coverage = _compute_coverage(signal_df, catalog)
+    print("Computing analytics (parallel)...")
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        future_exposures = executor.submit(_compute_factor_exposures, signal_df, catalog)
+        future_coverage = executor.submit(_compute_coverage, signal_df, catalog)
+        future_ic = executor.submit(_compute_ic, signal_df, catalog)
+        
+        factor_exposures = future_exposures.result()
+        coverage = future_coverage.result()
+        ic_stats, ic_series = future_ic.result()
     
-    # Compute Information Coefficient (IC)
-    print("Computing IC...")
-    ic_stats, ic_series = _compute_ic(signal_df, catalog)
     if ic_stats:
         print(f"  IC mean: {ic_stats['mean']:.4f}, t-stat: {ic_stats['t_stat']:.2f}, hit rate: {ic_stats['hit_rate']:.1f}%")
     
@@ -248,86 +250,56 @@ def _compute_factor_exposures(signal_df: pd.DataFrame, catalog: dict) -> pd.Data
     """
     Compute correlations between signal and risk factors.
     
-    Uses pre-indexed factors DataFrame from catalog if available (10x faster).
-    Falls back to risk DataFrame merge if factors not pre-computed.
+    Uses Polars for fast vectorized correlation computation.
     
     Returns DataFrame with columns: factor, correlation, abs_correlation
     """
+    import polars as pl
+    
     # Check required signal columns
     signal_cols = ['security_id', 'date_sig', 'signal']
     if not all(c in signal_df.columns for c in signal_cols):
         return pd.DataFrame()
     
-    # Try to use pre-indexed factors (much faster)
-    factors_df = catalog.get('factors')
-    if factors_df is not None and len(factors_df) > 0:
-        # Fast path: use pre-indexed factors with get_indexer + take
-        signal_subset = signal_df[signal_cols].copy()
-        
-        # Build MultiIndex for lookup
-        lookup_idx = pd.MultiIndex.from_arrays(
-            [signal_subset['security_id'].values, signal_subset['date_sig'].values],
-            names=['security_id', 'date']
-        )
-        
-        # Get positions in factors index
-        positions = factors_df.index.get_indexer(lookup_idx)
-        valid_mask = positions >= 0
-        
-        if valid_mask.sum() < 100:
-            return pd.DataFrame()
-        
-        # Get signal values for valid matches
-        signal_values = signal_subset['signal'].values[valid_mask]
-        
-        # Compute correlations using numpy for speed
-        rows = []
-        for factor in factors_df.columns:
-            factor_values = factors_df[factor].values[positions[valid_mask]]
-            # Remove NaN pairs
-            valid_pairs = ~(np.isnan(signal_values) | np.isnan(factor_values))
-            if valid_pairs.sum() < 100:
-                corr = np.nan
-            else:
-                corr = np.corrcoef(signal_values[valid_pairs], factor_values[valid_pairs])[0, 1]
-            rows.append({
-                'factor': factor,
-                'correlation': corr,
-                'abs_correlation': abs(corr) if not np.isnan(corr) else np.nan,
-            })
-    else:
-        # Fallback: use risk DataFrame with merge
+    # Convert signal to Polars
+    signal_pl = pl.from_pandas(signal_df[signal_cols]).rename({'date_sig': 'date'})
+    signal_pl = signal_pl.with_columns(pl.col('security_id').cast(pl.Int32))
+    
+    # Get risk data - prefer master_pl from catalog
+    master_pl = catalog.get('master_pl')
+    if master_pl is None:
         risk_df = catalog.get('risk')
         if risk_df is None:
             return pd.DataFrame()
-        
-        signal_subset = signal_df[signal_cols].copy()
-        
-        # Get available risk factors
-        available_factors = [f for f in RISK_FACTORS if f in risk_df.columns]
-        if not available_factors:
-            return pd.DataFrame()
-        
-        # Prepare risk data with renamed date column
-        risk_cols = ['security_id', 'date'] + available_factors
-        risk_subset = risk_df[risk_cols].rename(columns={'date': 'date_sig'})
-        
-        # Merge signal with risk factors
-        merged = signal_subset.merge(risk_subset, on=['security_id', 'date_sig'], how='inner')
-        
-        if len(merged) < 100:
-            return pd.DataFrame()
-        
-        # Compute correlations
-        rows = []
-        for factor in available_factors:
-            if factor in merged.columns:
-                corr = merged['signal'].corr(merged[factor])
-                rows.append({
-                    'factor': factor,
-                    'correlation': corr,
-                    'abs_correlation': abs(corr) if not np.isnan(corr) else np.nan,
-                })
+        master_pl = pl.from_pandas(risk_df)
+    
+    # Get available factors
+    available_factors = [f for f in RISK_FACTORS if f in master_pl.columns]
+    if not available_factors:
+        return pd.DataFrame()
+    
+    # Join signal with factors
+    factor_cols = ['security_id', 'date'] + available_factors
+    merged = signal_pl.join(
+        master_pl.select([c for c in factor_cols if c in master_pl.columns]),
+        on=['security_id', 'date'],
+        how='inner'
+    )
+    
+    if len(merged) < 100:
+        return pd.DataFrame()
+    
+    # Compute correlations using Polars (vectorized)
+    rows = []
+    for factor in available_factors:
+        if factor in merged.columns:
+            # Use select with pearson_corr expression
+            corr = merged.select(pl.corr('signal', factor)).item()
+            rows.append({
+                'factor': factor,
+                'correlation': corr,
+                'abs_correlation': abs(corr) if corr is not None and not np.isnan(corr) else np.nan,
+            })
     
     result = pd.DataFrame(rows)
     if len(result) > 0:
@@ -338,35 +310,46 @@ def _compute_factor_exposures(signal_df: pd.DataFrame, catalog: dict) -> pd.Data
 
 def _compute_coverage(signal_df: pd.DataFrame, catalog: dict) -> Dict:
     """
-    Compute signal coverage metrics.
+    Compute signal coverage metrics using Polars for speed.
     
     Returns dict with:
         - avg_securities_per_day: Average number of securities with signal per day
         - coverage_pct: Percentage of universe covered
         - total_days: Number of days with signal
     """
+    import polars as pl
+    
     if 'date_sig' not in signal_df.columns or 'security_id' not in signal_df.columns:
         return {}
     
-    # Securities per day
-    securities_per_day = signal_df.groupby('date_sig')['security_id'].nunique()
-    avg_securities = securities_per_day.mean()
+    # Convert to Polars for fast aggregation
+    signal_pl = pl.from_pandas(signal_df[['date_sig', 'security_id']])
     
-    # Total unique securities in signal
-    unique_signal_securities = signal_df['security_id'].nunique()
+    # Securities per day (fast Polars groupby)
+    per_day = signal_pl.group_by('date_sig').agg(pl.col('security_id').n_unique().alias('n_securities'))
+    avg_securities = per_day['n_securities'].mean()
+    total_days = len(per_day)
     
-    # Try to get universe size from risk file
-    risk_df = catalog.get('risk')
-    if risk_df is not None and 'security_id' in risk_df.columns:
-        unique_universe_securities = risk_df['security_id'].nunique()
-        coverage_pct = 100 * unique_signal_securities / unique_universe_securities if unique_universe_securities > 0 else np.nan
+    # Unique securities in signal
+    unique_signal_securities = signal_pl['security_id'].n_unique()
+    
+    # Try to get universe size from master_pl or risk file
+    master_pl = catalog.get('master_pl')
+    if master_pl is not None and 'security_id' in master_pl.columns:
+        unique_universe_securities = master_pl['security_id'].n_unique()
     else:
-        coverage_pct = np.nan
+        risk_df = catalog.get('risk')
+        if risk_df is not None and 'security_id' in risk_df.columns:
+            unique_universe_securities = risk_df['security_id'].nunique()
+        else:
+            unique_universe_securities = None
+    
+    coverage_pct = 100 * unique_signal_securities / unique_universe_securities if unique_universe_securities else np.nan
     
     return {
-        'avg_securities_per_day': avg_securities,
-        'coverage_pct': coverage_pct,
-        'total_days': securities_per_day.count(),
+        'avg_securities_per_day': float(avg_securities) if avg_securities is not None else np.nan,
+        'coverage_pct': float(coverage_pct) if coverage_pct is not None else np.nan,
+        'total_days': total_days,
         'unique_securities': unique_signal_securities,
     }
 
@@ -376,137 +359,84 @@ def _compute_ic(signal_df: pd.DataFrame, catalog: dict) -> tuple:
     Compute Information Coefficient (IC) - daily cross-sectional Spearman correlation
     between signal and forward returns.
     
+    Uses Polars for fast vectorized computation.
+    
     Returns:
         Tuple of (ic_stats dict, ic_series DataFrame)
-        
-        ic_stats contains:
-        - mean: Mean daily IC
-        - std: Std dev of daily IC
-        - t_stat: t-statistic (mean / (std / sqrt(n)))
-        - hit_rate: % of days with positive IC
-        - ir: Information Ratio (mean / std)
-        
-        ic_series contains:
-        - date: Trading date
-        - ic: Daily IC value
     """
+    import polars as pl
+    
     if 'date_sig' not in signal_df.columns or 'security_id' not in signal_df.columns:
         return None, None
     
     if 'signal' not in signal_df.columns:
         return None, None
     
-    # Determine which date column to use for the signal date
-    # We'll group IC by this date for the time series
-    if 'date_avail' in signal_df.columns:
-        sig_date_col = 'date_avail'
-    else:
-        sig_date_col = 'date_sig'
+    # Determine which date column to use
+    sig_date_col = 'date_avail' if 'date_avail' in signal_df.columns else 'date_sig'
     
-    # Get returns data - prefer master_data (pre-indexed)
-    master_data = catalog.get('master')
-    if master_data is not None:
-        # Fast path: use pre-indexed master_data
-        signal = signal_df[['security_id', sig_date_col, 'signal']].copy()
-        signal['security_id'] = signal['security_id'].astype(np.int32)
-        signal[sig_date_col] = pd.to_datetime(signal[sig_date_col])
-        
-        # Look up forward return: return on the NEXT trading day after signal is available
-        # This ensures IC measures predictive power, not contemporaneous correlation
-        # Note: Using calendar day + 1; for exact trading day alignment, would need datefile
-        signal['lookup_date'] = signal[sig_date_col] + pd.Timedelta(days=1)
-        
-        # Build lookup index using the forward-looking date
-        lookup_idx = pd.MultiIndex.from_arrays(
-            [signal['security_id'].values, signal['lookup_date'].values],
-            names=['security_id', 'date']
-        )
-        
-        # Get positions
-        positions = master_data.index.get_indexer(lookup_idx)
-        valid_mask = positions >= 0
-        
-        if valid_mask.sum() == 0:
-            return None, None
-        
-        # Build merged DataFrame using numpy take
-        merged = signal.loc[valid_mask].copy()
-        merged['fwd_ret'] = np.take(master_data['ret'].values, positions[valid_mask])
-        # Use signal date for grouping IC by date (not the return date)
-        merged['date_sig'] = merged[sig_date_col]
-    else:
-        # Fallback to merge
-        ret_df = catalog.get('ret')
-        if ret_df is None or 'ret' not in ret_df.columns:
-            return None, None
-        
-        signal = signal_df[['security_id', sig_date_col, 'signal']].copy()
-        signal[sig_date_col] = pd.to_datetime(signal[sig_date_col])
-        
-        # Look up forward return: return on the NEXT day after signal is available
-        signal['lookup_date'] = signal[sig_date_col] + pd.Timedelta(days=1)
-        
-        ret = ret_df[['security_id', 'date', 'ret']].copy()
-        ret['date'] = pd.to_datetime(ret['date'])
-        
-        merged = signal.merge(
-            ret.rename(columns={'date': 'lookup_date', 'ret': 'fwd_ret'}),
-            on=['security_id', 'lookup_date'],
-            how='inner'
-        )
-        merged['date_sig'] = merged[sig_date_col]
+    # Convert signal to Polars
+    signal_pl = pl.from_pandas(signal_df[['security_id', sig_date_col, 'signal']])
+    signal_pl = signal_pl.with_columns([
+        pl.col('security_id').cast(pl.Int32),
+        pl.col(sig_date_col).cast(pl.Datetime).alias('sig_date'),
+        (pl.col(sig_date_col).cast(pl.Datetime) + pl.duration(days=1)).alias('lookup_date'),
+    ])
+    
+    # Get returns data - prefer master_pl
+    master_pl = catalog.get('master_pl')
+    if master_pl is None:
+        master_data = catalog.get('master')
+        if master_data is not None:
+            if isinstance(master_data, pd.DataFrame):
+                if isinstance(master_data.index, pd.MultiIndex):
+                    master_pl = pl.from_pandas(master_data.reset_index())
+                else:
+                    master_pl = pl.from_pandas(master_data)
+            else:
+                master_pl = master_data
+        else:
+            ret_df = catalog.get('ret')
+            if ret_df is None or 'ret' not in ret_df.columns:
+                return None, None
+            master_pl = pl.from_pandas(ret_df)
+    
+    # Join to get forward returns - cast datetime to same precision
+    ret_subset = (
+        master_pl.select(['security_id', 'date', 'ret'])
+        .rename({'date': 'lookup_date', 'ret': 'fwd_ret'})
+        .with_columns(pl.col('lookup_date').cast(pl.Datetime('us')))
+    )
+    signal_pl = signal_pl.with_columns(pl.col('lookup_date').cast(pl.Datetime('us')))
+    merged = signal_pl.join(ret_subset, on=['security_id', 'lookup_date'], how='inner')
     
     if len(merged) == 0:
         return None, None
     
-    # Compute daily IC using vectorized numpy (faster than groupby.apply)
-    # Sort by date for efficient groupby
-    merged = merged.sort_values('date_sig')
+    # Compute daily IC using Polars group_by with rank correlation
+    # Spearman = Pearson correlation on ranks
+    ic_daily = (
+        merged
+        .filter(pl.col('signal').is_not_null() & pl.col('fwd_ret').is_not_null())
+        .with_columns([
+            pl.col('signal').rank().over('sig_date').alias('sig_rank'),
+            pl.col('fwd_ret').rank().over('sig_date').alias('ret_rank'),
+            pl.len().over('sig_date').alias('n_obs'),
+        ])
+        .filter(pl.col('n_obs') >= 10)  # Minimum observations per day
+        .group_by('sig_date')
+        .agg([
+            pl.corr('sig_rank', 'ret_rank').alias('ic'),
+        ])
+        .sort('sig_date')
+        .drop_nulls()
+    )
     
-    dates = merged['date_sig'].values
-    signals = merged['signal'].values.astype(np.float64)
-    returns = merged['fwd_ret'].values.astype(np.float64)
-    
-    # Find unique dates and their boundaries
-    unique_dates, start_indices = np.unique(dates, return_index=True)
-    end_indices = np.append(start_indices[1:], len(dates))
-    
-    # Compute IC for each date using numpy
-    ic_values = []
-    ic_dates = []
-    for date, start, end in zip(unique_dates, start_indices, end_indices):
-        sig_day = signals[start:end]
-        ret_day = returns[start:end]
-        
-        # Remove NaNs
-        valid = ~(np.isnan(sig_day) | np.isnan(ret_day))
-        if valid.sum() < 10:
-            continue
-        
-        sig_valid = sig_day[valid]
-        ret_valid = ret_day[valid]
-        
-        # Spearman correlation = Pearson on ranks
-        sig_ranks = sig_valid.argsort().argsort()
-        ret_ranks = ret_valid.argsort().argsort()
-        
-        n = len(sig_ranks)
-        sig_mean = sig_ranks.mean()
-        ret_mean = ret_ranks.mean()
-        
-        cov = np.sum((sig_ranks - sig_mean) * (ret_ranks - ret_mean))
-        sig_std = np.sqrt(np.sum((sig_ranks - sig_mean) ** 2))
-        ret_std = np.sqrt(np.sum((ret_ranks - ret_mean) ** 2))
-        
-        if sig_std > 0 and ret_std > 0:
-            corr = cov / (sig_std * ret_std)
-            ic_values.append(corr)
-            ic_dates.append(date)
-    
-    if len(ic_values) == 0:
+    if len(ic_daily) == 0:
         return None, None
     
-    ic_by_date = pd.Series(ic_values, index=ic_dates)
+    # Convert to pandas for output
+    ic_by_date = ic_daily.to_pandas().set_index('sig_date')['ic']
     ic_series = pd.DataFrame({
         'date': ic_by_date.index,
         'ic': ic_by_date.values
