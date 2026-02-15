@@ -237,6 +237,10 @@ class BacktestFastMinimal:
         # Cache schemas for fast lookup
         self._master_schema = set(self.master_df.columns)
         self._date_schema = set(self.date_df.columns)
+        
+        # Pre-select commonly used subsets for faster joins
+        self._date_n = self.date_df.select(["date", "n"])
+        self._cap_df = self.master_df.select(["security_id", "date", "cap"]) if "cap" in self._master_schema else None
 
         # cache sorted for asof join
         self._asof_sorted: Optional[pl.DataFrame] = None
@@ -440,15 +444,16 @@ class BacktestFastMinimal:
             ])
             return lf
 
-        # need mcap/adv for value/volume weights
-        need = ["mcap", "adv"]
-        lf = self._join_master(lf, need, how="inner")
-
+        # Equal weights: no need to join mcap/adv
         if cfg.weight == "equal":
             lf = lf.with_columns([
                 (pl.col("position").cast(pl.Float64) / pl.len().over(group)).alias("weight")
             ])
             return lf
+
+        # need mcap/adv for value/volume weights
+        need = ["mcap", "adv"]
+        lf = self._join_master(lf, need, how="inner")
 
         if cfg.weight == "value":
             x = "mcap"
@@ -480,7 +485,7 @@ class BacktestFastMinimal:
 
         w = (
             weights.select(["security_id", "date", byvar, "weight"])
-                   .join(self.date_df.select(["date", "n"]).lazy(), on="date", how="left")
+                   .join(self._date_n.lazy(), on="date", how="left")
         )
 
         # counts (from current holdings only)
@@ -505,67 +510,63 @@ class BacktestFastMinimal:
 
         w = w.join(ok_days, on=[byvar, "date"], how="inner")
 
-        # Compute turnover via left join + exits (matches OLD engine exactly)
-        cur = w.select(["security_id", byvar, "n", "date", "weight"])
-        prev = (
-            cur.select(["security_id", byvar, "n", "weight"])
-               .with_columns((pl.col("n") + 1).alias("n"))
-               .rename({"weight": "weight_prev"})
-               .unique(subset=["security_id", byvar, "n"], keep="last")
-        )
-
-        # Left join: current positions with their previous weights
-        diff = (
-            cur.join(prev, on=["security_id", byvar, "n"], how="left")
-               .with_columns([
-                   pl.col("weight_prev").fill_null(0.0),
-                   (pl.col("weight") - pl.col("weight_prev").fill_null(0.0)).abs().alias("weight_diff"),
-               ])
-        )
+        # Fast turnover: use left join + separate exits handling
+        # But collect counts first to avoid repeated lazy computation
+        counts_df = counts.collect()
+        w_df = w.collect()
         
-        # Handle exits: positions in prev that don't exist in cur
-        current_keys = cur.select(["security_id", byvar, "n"]).unique()
+        cur = w_df.select(["security_id", byvar, "n", "weight"])
+        prev = cur.with_columns((pl.col("n") + 1).alias("n")).rename({"weight": "weight_prev"})
+
+        # Left join for current positions
+        diff = cur.join(prev, on=["security_id", byvar, "n"], how="left").with_columns([
+            pl.col("weight_prev").fill_null(0.0),
+            (pl.col("weight") - pl.col("weight_prev").fill_null(0.0)).abs().alias("weight_diff"),
+        ])
+        
+        # Anti-join for exits (positions in prev not in cur)
         exits = (
-            prev.join(current_keys, on=["security_id", byvar, "n"], how="anti")
+            prev.join(cur.select(["security_id", byvar, "n"]).unique(), on=["security_id", byvar, "n"], how="anti")
                .with_columns([
                    pl.lit(0.0).alias("weight"),
                    pl.col("weight_prev").abs().alias("weight_diff"),
                ])
-               .join(self.date_df.select(["date", "n"]).lazy(), on="n", how="left")
         )
         
-        # Concat entries/exits
+        # Concat and add date
         diff = pl.concat([diff, exits], how="diagonal_relaxed")
+        diff = diff.join(self._date_n, on="n", how="left").drop_nulls(subset=["date"])
         
-        # Zero out first day turnover
+        # Zero out first day
+        n_min = diff["n"].min()
         diff = diff.with_columns([
-            pl.col("n").min().over(byvar).alias("n_min")
-        ]).with_columns([
-            pl.when(pl.col("n") == pl.col("n_min")).then(0.0)
-              .otherwise(pl.col("weight_diff")).alias("weight_diff")
+            pl.when(pl.col("n") == n_min).then(0.0).otherwise(pl.col("weight_diff")).alias("weight_diff")
         ])
 
-        # turnover per day (sum weight_diff using over(), then deduplicate)
-        diff = diff.with_columns([
-            pl.col("weight_diff").sum().over([byvar, "date"]).alias("turnover")
-        ])
-        turnover_daily = diff.select([byvar, "date", "turnover"]).unique().drop_nulls()
+        # turnover per day
+        turnover_daily = diff.group_by([byvar, "date"]).agg(pl.sum("weight_diff").alias("turnover"))
 
-        # transaction costs - join required columns from master
+        # transaction costs - join required columns from master (use eager joins)
         if cfg.tc_model == "naive":
-            diff = self._join_master(diff, ["cap"], how="left")
+            cap_df = self._cap_df
+            diff = diff.join(cap_df, on=["security_id", "date"], how="left")
             tc_big = cfg.tc_level["big"] / 10000.0
             tc_med = cfg.tc_level["median"] / 10000.0
             tc_small = cfg.tc_level["small"] / 10000.0
-            diff = diff.with_columns([
-                pl.when(pl.col("cap") == 1).then(tc_big)
-                  .when(pl.col("cap") == 2).then(tc_med)
-                  .otherwise(tc_small)
-                  .alias("tc_rate")
-            ])
-            tc = diff.with_columns((pl.col("tc_rate") * pl.col("weight_diff")).alias("tc")).group_by([byvar, "date"]).agg(pl.sum("tc").alias("tc"))
+            tc = (
+                diff.with_columns([
+                    pl.when(pl.col("cap") == 1).then(tc_big)
+                      .when(pl.col("cap") == 2).then(tc_med)
+                      .otherwise(tc_small)
+                      .alias("tc_rate")
+                ])
+                .with_columns((pl.col("tc_rate") * pl.col("weight_diff")).alias("tc"))
+                .group_by([byvar, "date"])
+                .agg(pl.sum("tc").alias("tc"))
+            )
         else:
-            diff = self._join_master(diff, ["vol", "adv", "close_adj"], how="left")
+            tc_cols_df = self.master_df.select(["security_id", "date", "vol", "adv", "close_adj"])
+            diff = diff.join(tc_cols_df, on=["security_id", "date"], how="left")
             beta, alpha = cfg.tc_value
             tc = (
                 diff.with_columns([
@@ -578,7 +579,7 @@ class BacktestFastMinimal:
                 .agg(pl.sum("tc").alias("tc"))
             )
 
-        return turnover_daily.lazy(), tc.lazy(), counts.lazy()
+        return turnover_daily.lazy(), tc.lazy(), counts_df.lazy()
 
     # --------------------------
     # Main run per byvar
@@ -621,14 +622,12 @@ class BacktestFastMinimal:
             # turnover + tc
             turnover_daily, tc_daily, counts_daily = self._turnover_and_tc(weighted_df.lazy(), byvar)
 
-            # daily portfolio return - join needed columns from master
-            weighted_cols = set(weighted_df.columns)
-            need = ["ret", "resret", *cfg.resid_vars]
-            missing = [c for c in need if c not in weighted_cols]
-            lf2 = self._join_master(weighted_df.lazy(), missing, how="left") if missing else weighted_df.lazy()
+            # daily portfolio return - ret/resret already in base from preprocess
+            lf2 = weighted_df.lazy()
 
             # Determine available factor columns
-            available_factors = [f for f in cfg.resid_vars if f in self._master_schema or f in weighted_cols]
+            weighted_cols = set(weighted_df.columns)
+            available_factors = [f for f in cfg.resid_vars if f in weighted_cols]
             
             port_daily = (
                 lf2.group_by([byvar, "date"])
@@ -650,17 +649,19 @@ class BacktestFastMinimal:
 
             port_daily = self._apply_insample_filter(port_daily.lazy()).collect()
 
-            # stats
+            # stats - compute directly on eager DataFrame for speed
             sqrt252 = float(np.sqrt(252.0))
+            port_sorted = port_daily.sort([byvar, "date"])
+            
+            # Compute drawdown efficiently
+            port_sorted = port_sorted.with_columns([
+                pl.col("ret").cum_sum().over(byvar).alias("cumret"),
+            ]).with_columns([
+                (pl.col("cumret") - pl.col("cumret").cum_max().over(byvar)).alias("drawdown")
+            ])
+            
             stats = (
-                port_daily.lazy()
-                .sort([byvar, "date"])
-                .with_columns([
-                    pl.col("ret").cum_sum().over(byvar).alias("cumret"),
-                    pl.col("ret_net").cum_sum().over(byvar).alias("cumretnet"),
-                ])
-                .with_columns((pl.col("cumret") - pl.col("cumret").cum_max().over(byvar)).alias("drawdown"))
-                .group_by(byvar)
+                port_sorted.group_by(byvar)
                 .agg([
                     pl.len().alias("num_date"),
                     (pl.mean("ret") * 252).alias("ret_ann"),
@@ -692,22 +693,18 @@ class BacktestFastMinimal:
                     pl.mean("numcos_l").alias("numcos_l"),
                     pl.mean("numcos_s").alias("numcos_s"),
                 ])
+                .collect()
             )
 
             # exposure summary (means of factor exposures if present)
             port_cols = set(port_daily.columns)
             exp_cols = [f for f in cfg.resid_vars if f in port_cols]
-            exposure = (
-                port_daily.lazy()
-                .group_by(byvar)
-                .agg([pl.mean(c).alias(c) for c in exp_cols])
-            )
+            exposure = port_daily.group_by(byvar).agg([pl.mean(c).alias(c) for c in exp_cols])
 
             combo = (
                 stats.join(turnover_sum, on=byvar, how="left")
                      .join(exposure, on=byvar, how="left")
                      .rename({byvar: "group"})
-                     .collect()
             )
 
             if byvar == "overall":
