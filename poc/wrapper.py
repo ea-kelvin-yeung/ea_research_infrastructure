@@ -1,5 +1,5 @@
 """
-Backtest Wrapper: Thin wrapper around Backtest/BacktestFast classes.
+Backtest Wrapper: Thin wrapper around Backtest/BacktestFastV2 classes.
 """
 
 import pandas as pd
@@ -12,7 +12,7 @@ from pathlib import Path
 # Add parent directory to path to import backtest engines
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from backtest_engine import Backtest
-from backtest_engine_fast import BacktestFast
+from backtest_engine_minimal_fast import BacktestFastV2
 
 from .contract import prepare_signal
 
@@ -125,9 +125,9 @@ def run_backtest(
     resid = config.residualize != 'off'
     resid_style = config.residualize if resid else 'all'
     
-    # Use BacktestFast if master data is available (3-4x faster)
+    # Use BacktestFastV2 if master data is available (1.8x faster than BacktestFast)
     use_fast = 'master' in catalog and catalog['master'] is not None
-    BacktestClass = BacktestFast if use_fast else Backtest
+    BacktestClass = BacktestFastV2 if use_fast else Backtest
     
     # Instantiate and run backtest
     bt_kwargs = {
