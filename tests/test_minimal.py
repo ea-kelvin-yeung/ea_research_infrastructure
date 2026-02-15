@@ -147,54 +147,46 @@ def main():
     master, datefile, sig = make_synth_data(N_SECURITIES, N_DAYS, seed=0)
 
     from backtest_engine_fast import BacktestFast
-    from backtest_engine_minimal_fast import BacktestFastMinimal, BacktestConfig
+    from backtest_engine_minimal_fast import BacktestFastV2
+
+    # Common backtest parameters
+    bt_params = dict(
+        infile=sig,
+        retfile=master,
+        otherfile=master,
+        datefile=datefile,
+        sigvar="my_signal",
+        method="long_short",
+        from_open=False,
+        input_type="value",
+        weight="equal",
+        tc_model="naive",
+        byvar_list=["overall"],
+        resid=False,
+        sort_method="single",
+        verbose=False,
+        master_data=None,
+        ff_result=False,
+        beta=False,
+    )
 
     # -----------------------------
-    # A) OLD ENGINE (your BacktestFast)
+    # A) OLD ENGINE (BacktestFast)
     # -----------------------------
     def run_old():
         bt = BacktestFast(
-            infile=sig,
-            retfile=master,
-            otherfile=master,
-            datefile=datefile,
-            sigvar="my_signal",
-            method="long_short",
-            from_open=False,
-            input_type="value",
-            weight="equal",
-            tc_model="naive",
-            byvar_list=["overall"],
-            resid=False,
-            sort_method="single",
-            verbose=False,
-            master_data=None,
-            ff_result=False,
-            beta=False,
+            **bt_params,
             byvix=False,
             earnings_window=False,
         )
         return bt.gen_result()
 
     # -----------------------------
-    # B) MINIMAL ENGINE (BacktestFastMinimal)
+    # B) NEW ENGINE (BacktestFastV2) - Same interface!
     # -----------------------------
     def run_new():
-        cfg = BacktestConfig(
-            sigvar="my_signal",
-            method="long_short",
-            input_type="value",
-            from_open=False,
-            fractile=(10.0, 90.0),
-            mincos=10,
-            sort_method="single",
-            weight="equal",
-            resid=False,
-            tc_model="naive",
-            byvars=("overall",),
-        )
-        bt = BacktestFastMinimal(master=pl.from_pandas(master), datefile=pl.from_pandas(datefile), cfg=cfg)
-        return bt.run(pl.from_pandas(sig))
+        bt = BacktestFastV2(**bt_params)
+        return bt.gen_result()
 
     # -----------------------------
     # Equivalence Test
@@ -207,11 +199,9 @@ def main():
     old_result = run_old()
     new_result = run_new()
     
-    # Extract stats from old engine (returns tuple: combo, daily_stats, turnover_raw for overall)
+    # Both engines now return tuple: (combo, daily_stats, turnover_raw)
     old_stats = old_result[0]
-    
-    # Extract stats from new engine
-    new_stats = new_result["summary"]
+    new_stats = new_result[0]
     
     # Compare key metrics
     metrics_to_compare = [
@@ -230,7 +220,7 @@ def main():
     for old_col, new_col, rel_tol in metrics_to_compare:
         if old_col in old_stats.columns and new_col in new_stats.columns:
             old_val = old_stats[old_col].iloc[0]
-            new_val = new_stats[new_col].item()
+            new_val = new_stats[new_col].iloc[0]
             diff = abs(old_val - new_val)
             tol = max(abs(old_val) * rel_tol, 1e-6)
             match = diff < tol
