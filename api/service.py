@@ -125,7 +125,12 @@ class BacktestService:
         end_date: Optional[str] = None,
         compact: bool = True,
     ):
-        """Load master + dates with optional date filtering and compaction."""
+        """
+        Load master + dates with optional date filtering and compaction.
+        
+        LEAN LOADING: Only loads master.parquet and dates.parquet directly,
+        skipping ret/risk to avoid ~6GB of intermediate memory usage.
+        """
         t0 = time.perf_counter()
         
         date_range = ""
@@ -134,7 +139,79 @@ class BacktestService:
         mode = "compact" if compact else "full"
         print(f"Loading: snapshots/{self.snapshot}{date_range} ({mode})")
         
-        # Load catalog
+        snapshot_path = Path(f"snapshots/{self.snapshot}")
+        
+        # LEAN LOAD: Only load master and dates directly (skip ret/risk)
+        # This saves ~6GB of intermediate memory vs load_catalog
+        master_path = snapshot_path / "master.parquet"
+        dates_path = snapshot_path / "trading_date.parquet"
+        
+        if not master_path.exists():
+            # Fallback to full catalog load if no master.parquet
+            self._load_data_full_catalog(start_date, end_date, compact)
+            return
+        
+        # Load master with Polars for predicate pushdown (only loads matching rows)
+        import polars as pl
+        
+        # Build filter expression
+        filters = []
+        if start_date:
+            filters.append(pl.col("date") >= pl.lit(start_date).str.to_datetime())
+        if end_date:
+            filters.append(pl.col("date") <= pl.lit(end_date).str.to_datetime())
+        
+        if filters:
+            filter_expr = filters[0]
+            for f in filters[1:]:
+                filter_expr = filter_expr & f
+            master_pl = pl.scan_parquet(master_path).filter(filter_expr).collect()
+        else:
+            master_pl = pl.read_parquet(master_path)
+        
+        # Convert to Pandas
+        master = master_pl.to_pandas()
+        del master_pl
+        gc.collect()
+        
+        # Flatten if MultiIndex
+        if isinstance(master.index, pd.MultiIndex):
+            master = master.reset_index()
+        
+        # Downcast dtypes to save ~50% memory
+        if compact:
+            master = self._compact_dtypes(master)
+        
+        self._master = master
+        
+        # Load dates (small, no filtering needed at load time)
+        dates = pd.read_parquet(dates_path)
+        if start_date or end_date:
+            mask = np.ones(len(dates), dtype=bool)
+            if start_date:
+                mask &= (dates['date'] >= start_date).values
+            if end_date:
+                mask &= (dates['date'] <= end_date).values
+            dates = dates[mask]
+        self._dates = dates
+        
+        gc.collect()
+        
+        self._load_time = time.perf_counter() - t0
+        
+        rows = len(self._master) if self._master is not None else 0
+        mem_mb = self._master.memory_usage(deep=True).sum() / 1024 / 1024 if self._master is not None else 0
+        print(f"Loaded in {self._load_time:.1f}s: {rows:,} rows, {mem_mb:.0f} MB")
+    
+    def _load_data_full_catalog(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        compact: bool = True,
+    ):
+        """Fallback: Load via full catalog (slower, more memory)."""
+        print("  (fallback: using full catalog load)")
+        
         catalog = load_catalog(
             f"snapshots/{self.snapshot}",
             use_master=True,
@@ -156,7 +233,6 @@ class BacktestService:
                     mask &= (master['date'] <= end_date).values
                 master = master[mask]
             
-            # Downcast dtypes to save ~50% memory
             if compact:
                 master = self._compact_dtypes(master)
             
@@ -173,15 +249,8 @@ class BacktestService:
             dates = dates[mask]
         self._dates = dates
         
-        # Drop everything else (saves ~7GB)
         del catalog
         gc.collect()
-        
-        self._load_time = time.perf_counter() - t0
-        
-        rows = len(self._master) if self._master is not None else 0
-        mem_mb = self._master.memory_usage(deep=True).sum() / 1024 / 1024 if self._master is not None else 0
-        print(f"Loaded in {self._load_time:.1f}s: {rows:,} rows, {mem_mb:.0f} MB")
     
     @staticmethod
     def _compact_dtypes(df: pd.DataFrame) -> pd.DataFrame:
