@@ -237,6 +237,44 @@ lf2 = (
 
 ---
 
+### 10. Conditional Filters: Match Exact Branching Logic
+
+**Problem:** No-resid equivalence failed with real data (sharpe -0.09 vs -0.27) despite synthetic data passing.
+
+**Root cause:**
+
+```python
+# OLD engine (backtest_engine.py)
+if self.from_open:
+    temp = temp[temp["ret"] > -0.95]  # Only filters when from_open=True
+else:
+    # No filter applied!
+    pass
+
+# NEW engine (backtest_engine_minimal_fast.py) - WRONG
+lf = lf.filter(pl.col("ret") > -0.95)  # Always filters
+```
+
+**Debug approach:**
+1. Compare preprocessed row counts: OLD had 4 more rows than NEW
+2. Found the extra rows all had `ret = -0.95` exactly
+3. Traced filter logic in both engines
+
+**Fix:**
+
+```python
+# ✅ GOOD: Match OLD engine's conditional filter
+if cfg.from_open:
+    lf = lf.rename({"openret": "ret", "resopenret": "resret"})
+    lf = lf.filter(pl.col("ret") > -0.95)  # Only when from_open
+```
+
+**Result:** Real data now matches exactly (0.00% diff on all metrics).
+
+**Lesson:** When porting conditional logic, test with real data that exercises edge cases. Synthetic data often doesn't have extreme values like -95% returns.
+
+---
+
 ## What Didn't Work
 
 ### ❌ Shift-Based Turnover (Missed Exits)

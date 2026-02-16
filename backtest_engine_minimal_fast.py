@@ -307,7 +307,8 @@ class BacktestFastMinimal:
 
         if cfg.from_open:
             lf = lf.rename({"openret": "ret", "resopenret": "resret"})
-        lf = lf.filter(pl.col("ret") > -0.95)
+            # OLD engine only filters extreme returns when from_open=True
+            lf = lf.filter(pl.col("ret") > -0.95)
 
         # Add standard grouping vars
         lf = lf.with_columns([
