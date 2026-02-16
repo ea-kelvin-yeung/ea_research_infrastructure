@@ -441,14 +441,9 @@ result = service.run(signal, calc_turnover=False)
 
 ### Memory Optimization
 
-The service uses minimal memory mode by default, loading only what's needed:
+The service minimizes memory through two techniques:
 
-| Mode | Memory | Reduction |
-|------|--------|-----------|
-| Full | 11.6 GB | baseline |
-| **Minimal (default)** | **4.1 GB** | **65% savings** |
-
-**What's dropped in minimal mode:**
+**1. Drop redundant tables** (always on):
 
 | Data | Size | Reason |
 |------|------|--------|
@@ -456,7 +451,20 @@ The service uses minimal memory mode by default, loading only what's needed:
 | `risk` | 3.9 GB | Already in `master` |
 | `factors` | 1.5 GB | Columns already in `master` |
 
-The `BacktestService` automatically drops redundant data after loading, keeping only `master` + `dates`.
+**2. Compact dtypes** (`compact=True`, default):
+
+| Optimization | Columns | Savings |
+|--------------|---------|---------|
+| float64 → float32 | returns, factors, mcap, adv | ~1.6 GB |
+| int64 → int32 | industry_id, sector_id, cap | ~0.35 GB |
+
+**Total memory by mode:**
+
+| Mode | Memory | vs Full Catalog |
+|------|--------|-----------------|
+| Full catalog | 11.6 GB | baseline |
+| Minimal (drop redundant) | 4.1 GB | 65% savings |
+| **Compact (default)** | **2.2 GB** | **81% savings** |
 
 ---
 

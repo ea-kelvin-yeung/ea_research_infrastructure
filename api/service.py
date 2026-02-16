@@ -54,6 +54,7 @@ class BacktestService:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         force_reload: bool = False,
+        compact: bool = True,
     ) -> "BacktestService":
         """
         Get or create the singleton BacktestService.
@@ -63,6 +64,7 @@ class BacktestService:
             start_date: Filter data from this date (e.g., "2012-01-01")
             end_date: Filter data to this date (e.g., "2021-12-31")
             force_reload: Force reload even if already loaded
+            compact: Downcast dtypes to save ~50% memory (default: True)
             
         Returns:
             BacktestService singleton
@@ -83,7 +85,7 @@ class BacktestService:
             )
             
             if needs_reload:
-                cls._instance = cls(snapshot, start_date, end_date)
+                cls._instance = cls(snapshot, start_date, end_date, compact)
             elif start_date or end_date:
                 cls._instance._filter_dates(start_date, end_date)
             
@@ -104,6 +106,7 @@ class BacktestService:
         snapshot: str,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
+        compact: bool = True,
     ):
         """Initialize service (use get() instead)."""
         self.snapshot = snapshot
@@ -111,22 +114,25 @@ class BacktestService:
         self._dates: Optional[pd.DataFrame] = None
         self._load_time: float = 0
         self._run_count: int = 0
+        self._compact: bool = compact
         self._lock = threading.Lock()
         
-        self._load_data(start_date, end_date)
+        self._load_data(start_date, end_date, compact)
     
     def _load_data(
         self,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
+        compact: bool = True,
     ):
-        """Load master + dates with optional date filtering."""
+        """Load master + dates with optional date filtering and compaction."""
         t0 = time.perf_counter()
         
         date_range = ""
         if start_date or end_date:
             date_range = f" [{start_date or '*'} to {end_date or '*'}]"
-        print(f"Loading: snapshots/{self.snapshot}{date_range}")
+        mode = "compact" if compact else "full"
+        print(f"Loading: snapshots/{self.snapshot}{date_range} ({mode})")
         
         # Load catalog
         catalog = load_catalog(
@@ -150,6 +156,10 @@ class BacktestService:
                     mask &= (master['date'] <= end_date).values
                 master = master[mask]
             
+            # Downcast dtypes to save ~50% memory
+            if compact:
+                master = self._compact_dtypes(master)
+            
             self._master = master
         
         # Extract and filter dates
@@ -170,7 +180,31 @@ class BacktestService:
         self._load_time = time.perf_counter() - t0
         
         rows = len(self._master) if self._master is not None else 0
-        print(f"Loaded in {self._load_time:.1f}s: {rows:,} rows")
+        mem_mb = self._master.memory_usage(deep=True).sum() / 1024 / 1024 if self._master is not None else 0
+        print(f"Loaded in {self._load_time:.1f}s: {rows:,} rows, {mem_mb:.0f} MB")
+    
+    @staticmethod
+    def _compact_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+        """Downcast dtypes to save memory (~50% reduction)."""
+        # Columns safe to downcast to float32
+        float_cols = [
+            'ret', 'resret', 'openret', 'resopenret',
+            'size', 'value', 'growth', 'leverage', 'volatility', 'momentum', 'yield',
+            'mcap', 'adv',
+        ]
+        
+        # Columns safe to downcast to int32
+        int_cols = ['industry_id', 'sector_id', 'cap']
+        
+        for col in float_cols:
+            if col in df.columns and df[col].dtype == np.float64:
+                df[col] = df[col].astype(np.float32)
+        
+        for col in int_cols:
+            if col in df.columns and df[col].dtype == np.int64:
+                df[col] = df[col].astype(np.int32)
+        
+        return df
     
     def _filter_dates(
         self,
