@@ -223,8 +223,8 @@ results = Parallel(n_jobs=4, backend='threading')(
 For maximum throughput with true parallelism (bypasses GIL):
 
 ```python
-# See tests/test_multiprocess.py for full implementation
-from tests.test_multiprocess import BacktestWorkerPool, serialize_signal_arrow
+# See tests/test_server_parallel.py for full implementation
+from tests.test_server_parallel import BacktestWorkerPool, serialize_signal_arrow
 
 # Start worker pool (each loads data independently)
 pool = BacktestWorkerPool(n_workers=2, use_arrow=True)
@@ -316,10 +316,8 @@ api/
 └── backtest_config.yaml   # Configuration file
 
 tests/
-├── test_server.py         # Service persistence tests
-├── test_parallel.py       # Threading parallel tests
-├── test_multiprocess.py   # Multi-process worker pool (true parallelism)
-└── test_equivalence.py    # Result equivalence tests
+├── test_server_parallel.py  # Multi-process worker pool (true parallelism)
+└── test_equivalence.py      # Result equivalence tests
 
 docker/
 ├── Dockerfile             # Container definition

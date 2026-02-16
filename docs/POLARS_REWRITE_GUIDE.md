@@ -524,7 +524,7 @@ The service minimizes memory through two techniques:
 **Solution: Worker pool with lean loading + Arrow transfer**
 
 ```python
-# See tests/test_multiprocess.py for full implementation
+# See tests/test_server_parallel.py for full implementation
 
 # 1. Workers start SEQUENTIALLY (avoid parallel memory spikes)
 for i in range(n_workers):
