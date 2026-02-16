@@ -71,9 +71,33 @@ def load_signal_from_csv(signal_path: str, start_date: str, end_date: str, noise
     return sig
 
 
-def worker_process(worker_id: int, task_queue: Queue, result_queue: Queue, ready_queue: Queue):
+def serialize_signal_arrow(df: pd.DataFrame) -> bytes:
+    """Serialize DataFrame to Arrow IPC bytes (fast, compact)."""
+    import polars as pl
+    import io
+    
+    pl_df = pl.from_pandas(df)
+    buffer = io.BytesIO()
+    pl_df.write_ipc(buffer)
+    return buffer.getvalue()
+
+
+def deserialize_signal_arrow(data: bytes) -> pd.DataFrame:
+    """Deserialize Arrow IPC bytes back to DataFrame."""
+    import polars as pl
+    import io
+    
+    buffer = io.BytesIO(data)
+    pl_df = pl.read_ipc(buffer)
+    return pl_df.to_pandas()
+
+
+def worker_process(worker_id: int, task_queue: Queue, result_queue: Queue, ready_queue: Queue, use_arrow: bool = False):
     """
     Worker process: loads data once, processes signals until shutdown.
+    
+    Args:
+        use_arrow: If True, expect Arrow IPC bytes in task queue instead of CSV paths
     """
     from api import BacktestService
     
@@ -113,12 +137,17 @@ def worker_process(worker_id: int, task_queue: Queue, result_queue: Queue, ready
         if task is None:  # Shutdown signal
             break
         
-        task_id, signal_path, noise_seed = task
+        task_id, signal_data, noise_seed = task
         
         mem_before = get_memory_gb()
         
-        # Read signal locally (no serialization from main process)
-        signal = load_signal_from_csv(signal_path, START_DATE, END_DATE, noise_seed)
+        # Get signal DataFrame
+        if use_arrow:
+            # Deserialize Arrow IPC bytes (fast)
+            signal = deserialize_signal_arrow(signal_data)
+        else:
+            # Read from CSV path (slower but no main process overhead)
+            signal = load_signal_from_csv(signal_data, START_DATE, END_DATE, noise_seed)
         
         # Run backtest
         t0 = time.perf_counter()
@@ -140,10 +169,14 @@ class BacktestWorkerPool:
     Pool of persistent backtest workers.
     
     Workers are started SEQUENTIALLY to avoid parallel memory spikes.
+    Supports two modes:
+    - CSV path mode: Pass file paths, workers read CSV locally
+    - Arrow mode: Pass serialized Polars DataFrames (faster transfer)
     """
     
-    def __init__(self, n_workers: int = 2):
+    def __init__(self, n_workers: int = 2, use_arrow: bool = False):
         self.n_workers = n_workers
+        self.use_arrow = use_arrow
         self.task_queue = Queue()
         self.result_queue = Queue()
         self.ready_queue = Queue()
@@ -159,16 +192,17 @@ class BacktestWorkerPool:
             sequential: If True, wait for each worker to finish loading before
                        starting the next. Prevents parallel memory spikes.
         """
-        print(f"Starting {self.n_workers} worker processes...")
-        mode = "SEQUENTIAL" if sequential else "PARALLEL"
-        print(f"  Mode: {mode} startup (avoid memory spikes)")
+        mode_str = "Arrow" if self.use_arrow else "CSV path"
+        print(f"Starting {self.n_workers} worker processes ({mode_str} mode)...")
+        startup_mode = "SEQUENTIAL" if sequential else "PARALLEL"
+        print(f"  Startup: {startup_mode} (avoid memory spikes)")
         t0 = time.perf_counter()
         
         total_mem = 0
         for i in range(self.n_workers):
             p = Process(
                 target=worker_process,
-                args=(i, self.task_queue, self.result_queue, self.ready_queue)
+                args=(i, self.task_queue, self.result_queue, self.ready_queue, self.use_arrow)
             )
             p.start()
             self.workers.append(p)
@@ -193,12 +227,21 @@ class BacktestWorkerPool:
         print(f"Total worker memory: {total_mem:.2f}GB")
         return total_mem
     
-    def submit(self, signal_path: str, noise_seed: int = None) -> int:
-        """Submit a backtest task. Returns task ID."""
+    def submit(self, signal_data, noise_seed: int = None) -> int:
+        """
+        Submit a backtest task.
+        
+        Args:
+            signal_data: CSV path (str) or Arrow bytes (bytes) depending on mode
+            noise_seed: Random seed for signal noise (only used in CSV mode)
+        
+        Returns:
+            Task ID
+        """
         task_id = self.task_counter
         self.task_counter += 1
         self.pending_tasks += 1
-        self.task_queue.put((task_id, signal_path, noise_seed))
+        self.task_queue.put((task_id, signal_data, noise_seed))
         return task_id
     
     def collect_one(self, timeout: float = None):
@@ -228,14 +271,17 @@ def main():
     parser.add_argument("--n-workers", type=int, default=2, help="Number of worker processes")
     parser.add_argument("--n-signals", type=int, default=4, help="Number of signals to test")
     parser.add_argument("--parallel-start", action="store_true", help="Start workers in parallel (may spike memory)")
+    parser.add_argument("--arrow", action="store_true", help="Use Arrow IPC instead of CSV paths (faster transfer)")
     args = parser.parse_args()
+    
+    transfer_mode = "Arrow IPC" if args.arrow else "CSV path"
     
     print("="*70)
     print(f"MULTI-PROCESS BACKTEST SERVICE")
     print(f"  Workers: {args.n_workers}")
     print(f"  Signals: {args.n_signals}")
     print(f"  Date range: {START_DATE} to {END_DATE}")
-    print(f"  Startup mode: {'PARALLEL' if args.parallel_start else 'SEQUENTIAL'}")
+    print(f"  Transfer mode: {transfer_mode}")
     print("="*70)
     
     # =========================================================================
@@ -245,23 +291,48 @@ def main():
     print("-" * 50)
     
     pool_start = time.perf_counter()
-    pool = BacktestWorkerPool(n_workers=args.n_workers)
+    pool = BacktestWorkerPool(n_workers=args.n_workers, use_arrow=args.arrow)
     total_mem = pool.start(sequential=not args.parallel_start)
     startup_time = time.perf_counter() - pool_start
     
     # =========================================================================
-    # 2. Submit tasks (fast - just queue file paths)
+    # 2. Prepare and submit tasks
     # =========================================================================
     print(f"\n2. SUBMITTING {args.n_signals} TASKS")
     print("-" * 50)
     
-    # Create variant signals with different noise seeds
-    noise_seeds = [None] + [42 + i for i in range(1, args.n_signals)]
+    if args.arrow:
+        # Pre-load and serialize signals in main process
+        print("  Preparing Arrow-serialized signals...")
+        t0 = time.perf_counter()
+        
+        base_signal = load_signal_from_csv(SIGNAL_FILE, START_DATE, END_DATE)
+        signals_arrow = []
+        
+        for i in range(args.n_signals):
+            sig = base_signal.copy()
+            if i > 0:
+                rng = np.random.default_rng(42 + i)
+                sig['signal'] = sig['signal'] + rng.normal(0, 0.01, size=len(sig))
+            signals_arrow.append(serialize_signal_arrow(sig))
+        
+        prep_time = time.perf_counter() - t0
+        arrow_size_mb = len(signals_arrow[0]) / (1024 * 1024)
+        print(f"  Prepared {args.n_signals} signals in {prep_time:.2f}s ({arrow_size_mb:.1f}MB each)")
+        
+        t0 = time.perf_counter()
+        for arrow_bytes in signals_arrow:
+            pool.submit(arrow_bytes)
+        submit_time = time.perf_counter() - t0
+    else:
+        # CSV path mode - just pass file paths
+        noise_seeds = [None] + [42 + i for i in range(1, args.n_signals)]
+        
+        t0 = time.perf_counter()
+        for seed in noise_seeds:
+            pool.submit(SIGNAL_FILE, noise_seed=seed)
+        submit_time = time.perf_counter() - t0
     
-    t0 = time.perf_counter()
-    for seed in noise_seeds:
-        pool.submit(SIGNAL_FILE, noise_seed=seed)
-    submit_time = time.perf_counter() - t0
     print(f"Submitted {args.n_signals} tasks in {submit_time*1000:.1f}ms")
     
     # =========================================================================
@@ -287,8 +358,10 @@ def main():
     # =========================================================================
     # Summary
     # =========================================================================
-    avg_time = sum(r[3] for r in results) / len(results)
+    effective_time_per_signal = process_time / len(results)
     throughput = len(results) / process_time
+    
+    transfer_desc = "Arrow IPC bytes (fast)" if args.arrow else "CSV path (worker reads)"
     
     print("\n" + "="*70)
     print("SUMMARY")
@@ -299,16 +372,15 @@ def main():
 | Workers | {args.n_workers} |
 | Signals processed | {args.n_signals} |
 | Total worker memory | {total_mem:.2f}GB |
-| Startup time | {startup_time:.1f}s |
+| Startup time (one-time) | {startup_time:.1f}s |
 | Processing time | {process_time:.1f}s |
-| Avg time per signal | {avg_time:.2f}s |
+| **Effective time/signal** | **{effective_time_per_signal:.2f}s** |
 | Throughput | {throughput:.2f} signals/sec |
-| Effective speedup | {avg_time * len(results) / process_time:.1f}x |
 
-Notes:
-  - Sequential startup prevents parallel memory spikes
-  - Each worker loads ~{total_mem/args.n_workers:.1f}GB of data
-  - Workers stay warm for subsequent signals
+Data flow:
+  - Each worker preloads master data at startup (stays in memory)
+  - Signal passed via {transfer_desc}
+  - Worker runs backtest with preloaded master
 """)
     print("="*70)
     

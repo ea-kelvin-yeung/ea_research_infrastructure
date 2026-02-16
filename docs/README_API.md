@@ -191,7 +191,9 @@ defaults:
 
 ## Parallel Execution
 
-Run multiple signals in parallel using joblib with threading backend:
+### Option 1: Threading (Simple, Shared Memory)
+
+For quick parallelism with shared memory:
 
 ```python
 from api import BacktestService
@@ -216,19 +218,56 @@ results = Parallel(n_jobs=4, backend='threading')(
 )
 ```
 
-### Parallel Performance
+### Option 2: Multi-Process Worker Pool (True Parallelism)
 
-| Workers | Speedup | Memory |
-|---------|---------|--------|
-| 1 (sequential) | 1.0x | ~200 MB |
-| 2 | 2.0x | ~200 MB |
-| 4 | 2.4x | ~200 MB |
+For maximum throughput with true parallelism (bypasses GIL):
 
-**Key points:**
-- Use `backend='threading'` to share memory (no data copying)
-- Don't reset the service between parallel runs
-- GIL limits speedup to ~2-3x for CPU-bound work
-- Polars releases GIL for most operations, enabling parallelism
+```python
+# See tests/test_multiprocess.py for full implementation
+from tests.test_multiprocess import BacktestWorkerPool, serialize_signal_arrow
+
+# Start worker pool (each loads data independently)
+pool = BacktestWorkerPool(n_workers=2, use_arrow=True)
+pool.start(sequential=True)  # Sequential startup avoids memory spikes
+
+# Prepare signals as Arrow bytes (fast transfer)
+signals_arrow = [serialize_signal_arrow(sig) for sig in signals]
+
+# Submit tasks
+for arrow_bytes in signals_arrow:
+    pool.submit(arrow_bytes)
+
+# Collect results
+results = pool.collect_all()
+for task_id, worker_id, sharpe, elapsed, mem_delta in results:
+    print(f"Task {task_id}: sharpe={sharpe:.2f}, time={elapsed:.2f}s")
+
+pool.shutdown()
+```
+
+### Parallel Performance (10 years of data, 8 signals)
+
+| Mode | Workers | Effective time/signal | Throughput | Memory |
+|------|---------|----------------------|------------|--------|
+| Sequential | 1 | 4.91s | 0.20/sec | 5GB |
+| Threading | 2 | 2.64s | 0.38/sec | 10GB |
+| **Multi-Process + Arrow** | 2 | **1.36s** | **0.74/sec** | 10GB |
+
+### Signal Transfer Modes
+
+| Mode | When to Use | Overhead |
+|------|-------------|----------|
+| **CSV path** | Signals on disk | ~1s read per signal |
+| **Arrow IPC** | Signals in memory | ~0.1s serialize/deserialize |
+
+Arrow mode is **2.2x faster** when signals are already in DataFrames.
+
+### Key Points
+
+- **Threading**: Simple, shares memory, GIL-limited (~1.8x speedup)
+- **Multi-Process**: True parallelism, separate memory per worker
+- **Sequential startup**: Start workers one-at-a-time to avoid memory spikes
+- **Arrow IPC**: Fastest transfer for in-memory DataFrames
 
 ### Alternative: Skip Turnover for Screening
 
@@ -278,7 +317,8 @@ api/
 
 tests/
 ├── test_server.py         # Service persistence tests
-├── test_parallel.py       # Parallel execution tests
+├── test_parallel.py       # Threading parallel tests
+├── test_multiprocess.py   # Multi-process worker pool (true parallelism)
 └── test_equivalence.py    # Result equivalence tests
 
 docker/

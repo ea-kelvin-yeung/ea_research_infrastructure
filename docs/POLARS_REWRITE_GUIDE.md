@@ -439,6 +439,50 @@ result = service.run(signal, calc_turnover=False)
 | Cached schemas/subsets | ~1.2x | Avoid repeated introspection |
 | Strategic eager collects | ~1.1x | Reduce DAG overhead |
 
+### Lean Loading: Polars Predicate Pushdown
+
+**Problem:** `load_catalog()` loads ALL tables (ret: 2GB, risk: 4GB, master: 1GB) even when only master is needed. This caused 15GB memory spikes in multi-process workers.
+
+**Solution:** Load master.parquet directly with Polars predicate pushdown:
+
+```python
+# ✅ GOOD: Lean loading with predicate pushdown
+import polars as pl
+
+# Build filter expression
+filters = []
+if start_date:
+    filters.append(pl.col("date") >= pl.lit(start_date).str.to_datetime())
+if end_date:
+    filters.append(pl.col("date") <= pl.lit(end_date).str.to_datetime())
+
+if filters:
+    filter_expr = filters[0]
+    for f in filters[1:]:
+        filter_expr = filter_expr & f
+    # scan_parquet + filter = predicate pushdown (only reads matching row groups)
+    master_pl = pl.scan_parquet(master_path).filter(filter_expr).collect()
+else:
+    master_pl = pl.read_parquet(master_path)
+```
+
+**Results (2-year date range):**
+
+| Method | Load Time | Peak Memory |
+|--------|-----------|-------------|
+| Full catalog (`load_catalog()`) | 31s | 15GB |
+| **Lean Polars** | **1s** | **3.4GB** |
+
+**Why it works:**
+- `scan_parquet()` creates a lazy scan (no data loaded)
+- `.filter()` adds predicate pushdown (Parquet row groups filtered at read time)
+- `.collect()` only materializes matching rows
+- Skips ret/risk entirely (only loads master.parquet)
+
+This is now the default in `BacktestService._load_data()`.
+
+---
+
 ### Memory Optimization
 
 The service minimizes memory through two techniques:
@@ -468,8 +512,73 @@ The service minimizes memory through two techniques:
 
 ---
 
+### Multi-Process Parallelism
+
+**Problem:** Threading is GIL-limited (~1.8x speedup). True parallelism requires multiple processes, but naive multiprocessing caused 80GB memory blowups.
+
+**Root causes of memory explosion:**
+1. Each worker loads full catalog (15GB each)
+2. Parallel startup = parallel memory spikes
+3. DataFrame serialization through queues
+
+**Solution: Worker pool with lean loading + Arrow transfer**
+
+```python
+# See tests/test_multiprocess.py for full implementation
+
+# 1. Workers start SEQUENTIALLY (avoid parallel memory spikes)
+for i in range(n_workers):
+    p = Process(target=worker_process, args=(i, task_queue, result_queue, ready_queue, use_arrow))
+    p.start()
+    # Wait for this worker to finish loading before starting next
+    worker_id, load_time, n_rows, mem_gb = ready_queue.get()
+
+# 2. Each worker uses lean loading (Polars predicate pushdown)
+service = BacktestService.get(SNAPSHOT, start_date=START_DATE, end_date=END_DATE)
+
+# 3. Signals passed as Arrow IPC bytes (no DataFrame serialization)
+def serialize_signal_arrow(df: pd.DataFrame) -> bytes:
+    import polars as pl
+    import io
+    pl_df = pl.from_pandas(df)
+    buffer = io.BytesIO()
+    pl_df.write_ipc(buffer)
+    return buffer.getvalue()
+
+# Worker deserializes Arrow bytes (~0.1s vs ~1s for CSV read)
+def deserialize_signal_arrow(data: bytes) -> pd.DataFrame:
+    import polars as pl
+    import io
+    buffer = io.BytesIO(data)
+    pl_df = pl.read_ipc(buffer)
+    return pl_df.to_pandas()
+```
+
+**Results (10 years of data, 8 signals):**
+
+| Mode | Effective time/signal | Memory/worker | Total Memory |
+|------|----------------------|---------------|--------------|
+| Sequential | 4.91s | 5GB | 5GB |
+| Threading (2w) | 2.64s | 5GB shared | 10GB |
+| **Multi-Process + Arrow (2w)** | **1.36s** | 5GB each | 10GB |
+
+**Key optimizations:**
+1. **Sequential startup**: Workers load one-at-a-time (avoids 2× peak memory)
+2. **Lean Polars loading**: 1s load vs 31s (skip full catalog)
+3. **Arrow IPC transfer**: 0.1s vs 1s CSV read (2.2x faster)
+4. **True parallelism**: No GIL limitation
+
+---
+
 ## Checklist for Future Polars Migrations
 
+### Data Loading
+- [ ] Use `scan_parquet().filter().collect()` for predicate pushdown
+- [ ] Load only needed tables (skip ret/risk if master exists)
+- [ ] Apply date filters at load time, not after
+- [ ] Compact dtypes after loading (float64 → float32)
+
+### Polars Usage
 - [ ] Convert Pandas↔Polars only at boundaries
 - [ ] Cache column schemas and commonly-used subsets at init
 - [ ] Pre-sort any tables used in `join_asof`
@@ -477,8 +586,16 @@ The service minimizes memory through two techniques:
 - [ ] Filter data early (universe, date range) to shrink working set
 - [ ] Collect at sensible boundaries (after preprocess, after weights)
 - [ ] Use NumPy/Numba for per-group loops with small arrays
+
+### Equivalence Testing
 - [ ] Match join dates exactly (date_sig vs date_ret can differ!)
 - [ ] Test numerical equivalence before optimizing further
 - [ ] Debug row-level data when equivalence fails (the bug is often in the data, not the algorithm)
 - [ ] Profile to find actual bottlenecks (usually joins, not conversions)
+
+### Parallelism
+- [ ] Use threading for simple parallelism (shared memory, GIL-limited)
+- [ ] Use multi-process for true parallelism (separate memory per worker)
+- [ ] Start workers sequentially to avoid memory spikes
+- [ ] Use Arrow IPC for signal transfer (2x faster than CSV)
 - [ ] Reuse engine instance for multi-signal testing (precompute once, run many)
