@@ -53,6 +53,7 @@ class BacktestFastV2:
         resid=False,
         resid_style="all",
         resid_varlist=None,
+        calc_turnover=True,
         beta=False,
         benchmark="sp500",
         ff_result=False,
@@ -93,6 +94,7 @@ class BacktestFastV2:
         self.resid_varlist = resid_varlist if resid_varlist is not None else [
             "size", "value", "growth", "leverage", "volatility", "momentum", "yields"
         ]
+        self.calc_turnover = calc_turnover
         self.beta = beta
         self.ff_result = ff_result
         self.output = output
@@ -168,6 +170,7 @@ class BacktestFastV2:
             resid=self.resid,
             resid_style=self.resid_style,
             resid_vars=tuple(self.resid_varlist),
+            calc_turnover=self.calc_turnover,
             tc_model=self.tc_model,
             tc_level=self.tc_level,
             tc_value=tuple(self.tc_value) if self.tc_value else (0.35, 0.4),

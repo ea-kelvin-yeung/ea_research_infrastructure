@@ -202,6 +202,8 @@ class BacktestConfig:
     resid_style: ResidStyle = "all"
     resid_vars: Tuple[str, ...] = ("size", "value", "growth", "leverage", "volatility", "momentum", "yield")
 
+    calc_turnover: bool = True  # compute turnover and transaction costs (can skip for speed)
+
     tc_model: TCModel = "naive"
     tc_level: Dict[str, float] = None  # bps dict for naive: {"big":2,"median":5,"small":10}
     tc_value: Tuple[float, float] = (0.35, 0.4)  # (beta, alpha) for power-law
@@ -663,8 +665,13 @@ class BacktestFastMinimal:
             # Collect weighted data for faster downstream operations
             weighted_df = lf.collect()
 
-            # turnover + tc
-            turnover_daily, tc_daily, counts_daily = self._turnover_and_tc(weighted_df.lazy(), byvar)
+            # turnover + tc (optional)
+            if cfg.calc_turnover:
+                turnover_daily, tc_daily, counts_daily = self._turnover_and_tc(weighted_df.lazy(), byvar)
+            else:
+                turnover_daily = None
+                tc_daily = None
+                counts_daily = None
 
             # daily portfolio return - ret/resret already in base from preprocess
             lf2 = weighted_df.lazy()
@@ -683,13 +690,26 @@ class BacktestFastMinimal:
                            for f in available_factors
                        ],
                    ])
-                   .join(tc_daily, on=[byvar, "date"], how="left")
-                   .with_columns(pl.col("tc").fill_null(0.0))
-                   .with_columns([
-                       (pl.col("ret") - pl.col("tc")).alias("ret_net"),
-                       (pl.col("resret") - pl.col("tc")).alias("resret_net"),
-                   ])
             )
+            
+            # Add transaction costs if calculated
+            if tc_daily is not None:
+                port_daily = (
+                    port_daily
+                    .join(tc_daily, on=[byvar, "date"], how="left")
+                    .with_columns(pl.col("tc").fill_null(0.0))
+                    .with_columns([
+                        (pl.col("ret") - pl.col("tc")).alias("ret_net"),
+                        (pl.col("resret") - pl.col("tc")).alias("resret_net"),
+                    ])
+                )
+            else:
+                # No TC: net returns = gross returns
+                port_daily = port_daily.with_columns([
+                    pl.lit(0.0).alias("tc"),
+                    pl.col("ret").alias("ret_net"),
+                    pl.col("resret").alias("resret_net"),
+                ])
 
             port_daily = self._apply_insample_filter(port_daily.lazy()).collect()
 
@@ -727,18 +747,28 @@ class BacktestFastMinimal:
             )
 
             # turnover + counts summary (divide by 4 to match OLD engine convention)
-            turnover_sum = (
-                self._apply_insample_filter(
-                    turnover_daily.join(counts_daily, on=[byvar, "date"], how="left").lazy()
+            if turnover_daily is not None and counts_daily is not None:
+                turnover_sum = (
+                    self._apply_insample_filter(
+                        turnover_daily.join(counts_daily, on=[byvar, "date"], how="left").lazy()
+                    )
+                    .group_by(byvar)
+                    .agg([
+                        (pl.mean("turnover") / 4.0).alias("turnover"),
+                        pl.mean("numcos_l").alias("numcos_l"),
+                        pl.mean("numcos_s").alias("numcos_s"),
+                    ])
+                    .collect()
                 )
-                .group_by(byvar)
-                .agg([
-                    (pl.mean("turnover") / 4.0).alias("turnover"),
-                    pl.mean("numcos_l").alias("numcos_l"),
-                    pl.mean("numcos_s").alias("numcos_s"),
+            else:
+                # No turnover: create empty summary with nulls
+                turnover_sum = pl.DataFrame({
+                    byvar: port_daily[byvar].unique().to_list(),
+                }).with_columns([
+                    pl.lit(None).cast(pl.Float64).alias("turnover"),
+                    pl.lit(None).cast(pl.Float64).alias("numcos_l"),
+                    pl.lit(None).cast(pl.Float64).alias("numcos_s"),
                 ])
-                .collect()
-            )
 
             # exposure summary (means of factor exposures if present)
             port_cols = set(port_daily.columns)
@@ -753,7 +783,7 @@ class BacktestFastMinimal:
 
             if byvar == "overall":
                 daily_overall = port_daily.select(["date", "ret", "ret_net", "resret", "resret_net"])
-                turnover_overall = turnover_daily.collect()
+                turnover_overall = turnover_daily.collect() if turnover_daily is not None else None
 
             results.append(combo)
 

@@ -358,6 +358,7 @@ class BacktestService:
         resid_style: str = "all",
         from_open: bool = False,
         mincos: int = 10,
+        calc_turnover: bool = True,
     ) -> tuple:
         """
         Run backtest with minimal overhead using BacktestFastV2 directly.
@@ -413,6 +414,7 @@ class BacktestService:
             resid_style=resid_style,
             from_open=from_open,
             mincos=mincos,
+            calc_turnover=calc_turnover,
             tc_model="naive",
             input_type="value",
             verbose=False,
