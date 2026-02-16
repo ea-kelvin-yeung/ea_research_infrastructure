@@ -80,7 +80,11 @@ def gen_date_trading(
 # -----------------------------------------------------------------------------
 def _resid_by_date_industry(dates: np.ndarray, y: np.ndarray, ind: np.ndarray) -> np.ndarray:
     """
-    Residualize y by subtracting industry mean within each date.
+    Residualize y using OLS with industry dummies, within each date.
+    
+    This matches statsmodels: sigvar ~ C(industry_id)
+    which is equivalent to demeaning by industry mean.
+    
     dates must be sorted.
     ind should be integer codes (0..K-1); NaN/None should already be dropped.
     """
@@ -94,7 +98,7 @@ def _resid_by_date_industry(dates: np.ndarray, y: np.ndarray, ind: np.ndarray) -
         ind_d = ind[s:e]
         if yd.size == 0:
             continue
-        # local remap so bincount is tight
+        # Demean by industry (equivalent to OLS with industry dummies)
         _, inv = np.unique(ind_d, return_inverse=True)
         cnt = np.bincount(inv).astype(np.float64)
         cnt[cnt == 0] = 1.0
@@ -112,9 +116,13 @@ def _resid_by_date_industry_factors(
     ridge: float = 1e-10,
 ) -> np.ndarray:
     """
-    Residualize y on factors X *within industry*, within each date:
-    - demean y and each X column by industry
-    - OLS (with tiny ridge for stability)
+    Residualize y on industry dummies + factors, within each date.
+    
+    This matches statsmodels: sigvar ~ factor1 + factor2 + ... + C(industry_id)
+    
+    Design matrix: [intercept, factors, industry_dummies (N-1)]
+    Uses single OLS regression per date.
+    
     dates must be sorted.
     """
     n = len(y)
@@ -126,34 +134,39 @@ def _resid_by_date_industry_factors(
         yd = y[s:e]
         Xd = X[s:e]
         ind_d = ind[s:e]
-        if yd.size == 0:
+        m = yd.size
+        if m == 0:
             continue
 
-        _, inv = np.unique(ind_d, return_inverse=True)
-        k = inv.max() + 1
-        cnt = np.bincount(inv, minlength=k).astype(np.float64)
-        cnt[cnt == 0] = 1.0
-
-        ysum = np.bincount(inv, weights=yd, minlength=k)
-        ymean = ysum / cnt
-        ydm = yd - ymean[inv]
-
-        Xdm = np.empty_like(Xd, dtype=np.float64)
-        for j in range(Xd.shape[1]):
-            x = Xd[:, j]
-            xsum = np.bincount(inv, weights=x, minlength=k)
-            xmean = xsum / cnt
-            Xdm[:, j] = x - xmean[inv]
-
-        # solve (X'X + ridge I) b = X'y
-        XT = Xdm.T
-        XTX = XT @ Xdm
-        XTX.flat[:: XTX.shape[0] + 1] += ridge
+        # Remap industry codes to 0..k-1
+        uniq_ind, inv = np.unique(ind_d, return_inverse=True)
+        k = len(uniq_ind)
+        
+        # Build design matrix: [intercept, factors, industry_dummies]
+        # Industry dummies: k-1 columns (drop first for identifiability, like statsmodels)
+        n_factors = Xd.shape[1]
+        n_dummies = k - 1  # Drop first industry as reference
+        
+        # Design matrix: intercept + factors + industry dummies
+        design = np.empty((m, 1 + n_factors + n_dummies), dtype=np.float64)
+        design[:, 0] = 1.0  # Intercept
+        design[:, 1:1+n_factors] = Xd  # Factors
+        
+        # Industry dummies (one-hot, drop first category)
+        for j in range(n_dummies):
+            design[:, 1 + n_factors + j] = (inv == (j + 1)).astype(np.float64)
+        
+        # OLS: (X'X + ridge*I) β = X'y
+        XT = design.T
+        XTX = XT @ design
+        XTX.flat[:: XTX.shape[0] + 1] += ridge  # Ridge for stability
+        
         try:
-            b = np.linalg.solve(XTX, XT @ ydm)
-            out[s:e] = ydm - Xdm @ b
+            beta = np.linalg.solve(XTX, XT @ yd)
+            out[s:e] = yd - design @ beta
         except np.linalg.LinAlgError:
             out[s:e] = np.nan
+    
     return out
 
 
@@ -324,22 +337,51 @@ class BacktestFastMinimal:
             if cfg.input_type != "value":
                 raise ValueError("Residualization only applies when input_type='value'.")
 
-            # Need industry_id + factors (source: asof_vars if provided, else master on trade-date)
-            need_cols = ["industry_id", *cfg.resid_vars]
-            lf2 = self._join_master(lf, need_cols, how="inner") if self._asof_sorted is None else lf
+            # OLD engine uses merge_asof on date_sig for factors with 5-day tolerance
+            # We need to replicate this behavior exactly
+            factor_cols = ["industry_id", *cfg.resid_vars]
+            
+            # Get factors from master via join_asof on date_sig (like OLD engine)
+            # Master columns needed: security_id, date, industry_id, + factor vars
+            master_factor_cols = ["security_id", "date", "industry_id"] + list(cfg.resid_vars)
+            # Filter to only cols that exist in master
+            available = set(self.master_df.columns)
+            master_factor_cols = [c for c in master_factor_cols if c in available]
+            
+            factor_df = (
+                self.master_df
+                .select(master_factor_cols)
+                .rename({"date": "date_sig"})
+                .sort("date_sig")
+            )
+            
+            # Join factors via merge_asof on date_sig with 5-day tolerance (like OLD engine)
+            lf2 = (
+                lf.sort("date_sig")
+                .join_asof(
+                    factor_df.lazy(),
+                    by="security_id",
+                    on="date_sig",
+                    strategy="backward",
+                    tolerance="5d",
+                )
+                .drop_nulls()
+            )
 
             # Collect only necessary columns to NumPy, residualize, then reattach in Polars
+            # Include "overall" and "year" for grouping
             df = (
-                lf2.select(["security_id", "date_sig", "date", "ret", "resret", cfg.sigvar, "industry_id", *cfg.resid_vars])
+                lf2.select(["security_id", "date_sig", "date", "ret", "resret", cfg.sigvar, 
+                           "overall", "year", "industry_id", *cfg.resid_vars])
                    .sort(["date", "security_id"])
                    .collect()
             )
             dates = df["date"].to_numpy()
             y = df[cfg.sigvar].to_numpy().astype(np.float64, copy=False)
 
-            ind_raw = df["industry_id"].to_numpy()
-            # factorize to int codes
-            _, ind = np.unique(ind_raw, return_inverse=True)
+            # Pass original industry_id values - residualization functions 
+            # factorize per-date internally
+            ind = df["industry_id"].to_numpy()
 
             if cfg.resid_style == "industry":
                 y_res = _resid_by_date_industry(dates, y, ind)
@@ -720,14 +762,19 @@ class BacktestFastMinimal:
         }
 
 
-# -----------------------------------------------------------------------------
-# Backward compatibility: import wrapper from new location
-# -----------------------------------------------------------------------------
-from backtest_wrapper import BacktestFastV2
-
 __all__ = [
     "gen_date_trading",
     "BacktestConfig",
     "BacktestFastMinimal",
-    "BacktestFastV2",
 ]
+
+
+# -----------------------------------------------------------------------------
+# Backward compatibility: lazy import wrapper
+# -----------------------------------------------------------------------------
+def __getattr__(name):
+    """Lazy import BacktestFastV2 for backward compatibility."""
+    if name == "BacktestFastV2":
+        from backtest_wrapper import BacktestFastV2
+        return BacktestFastV2
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

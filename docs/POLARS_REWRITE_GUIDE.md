@@ -175,6 +175,68 @@ turnover_daily = diff.group_by([byvar, "date"]).agg((pl.sum("weight_diff") / 4.0
 
 ---
 
+### 9. Residualization: Match Factor Join Date (Critical Bug Fix)
+
+**Problem:** Residualization was producing different results despite using the "same" algorithm.
+
+**Root cause (debugging journey):**
+
+1. **Initial hypothesis:** Different OLS formula (two-step vs single regression)
+   - Fixed by implementing single OLS with intercept + factors + industry dummies
+   - Still failed!
+
+2. **Second hypothesis:** Global vs per-date industry factorization
+   - Code was pre-factorizing industry_id globally before passing to residualization
+   - Fixed by passing original industry_id values
+   - Still failed!
+
+3. **Actual bug (found via row-level debugging):**
+   - OLD engine: `pd.merge_asof(on="date_sig", tolerance="5d")` — factors from **signal date**
+   - NEW engine: `join(on="date")` — factors from **trade date** (date_ret)
+   - These are different dates! Signal date can be days before trade date.
+
+**Debug commands that revealed the issue:**
+
+```python
+# Check what date OLD engine uses for factor join
+# OLD: pd.merge_asof(on="date_sig", tolerance="5d")  ← SIGNAL DATE
+# NEW: join(on="date")  ← TRADE DATE (wrong!)
+
+# For signal row: security_id=75, date_sig=2020-01-03, date_ret=2020-01-06
+# OLD gets factors from master @ 2020-01-03 (or earlier within 5d)
+# NEW was getting factors from master @ 2020-01-06 (WRONG!)
+```
+
+**Fix:**
+
+```python
+# ✅ GOOD: Match OLD engine's merge_asof on date_sig
+factor_df = (
+    self.master_df
+    .select(["security_id", "date", "industry_id", *cfg.resid_vars])
+    .rename({"date": "date_sig"})
+    .sort("date_sig")
+)
+
+lf2 = (
+    lf.sort("date_sig")
+    .join_asof(
+        factor_df.lazy(),
+        by="security_id",
+        on="date_sig",
+        strategy="backward",
+        tolerance="5d",  # Match OLD engine exactly
+    )
+    .drop_nulls()
+)
+```
+
+**Result:** Exact equivalence achieved. Speedup: **12.5x** (1.9s → 0.15s)
+
+**Lesson:** When debugging equivalence failures, trace row-level data through both pipelines. The bug was not in the algorithm but in **which data** was being fed to it.
+
+---
+
 ## What Didn't Work
 
 ### ❌ Shift-Based Turnover (Missed Exits)
@@ -248,7 +310,7 @@ def _turnover_and_tc(self, weights, byvar):
 | Pre-joined master table | ~1.3x | Fewer join operations |
 | Cached schemas/subsets | ~1.2x | Avoid repeated introspection |
 | Strategic eager collects | ~1.1x | Reduce DAG overhead |
-| NumPy residualization | ~1.5x (when used) | Tight loops beat Polars group_by |
+| NumPy residualization | **~12.5x** | NumPy OLS vs statsmodels per-date |
 | Boundary-only conversion | ~1.05x | Negligible once done right |
 
 **Key insight:** Once conversions were fixed, **~97% of runtime was dominated by joins against the master table**, not conversion overhead. The wins came from:
@@ -266,5 +328,7 @@ def _turnover_and_tc(self, weights, byvar):
 - [ ] Filter data early (universe, date range) to shrink working set
 - [ ] Collect at sensible boundaries (after preprocess, after weights)
 - [ ] Use NumPy/Numba for per-group loops with small arrays
+- [ ] Match join dates exactly (date_sig vs date_ret can differ!)
 - [ ] Test numerical equivalence before optimizing further
+- [ ] Debug row-level data when equivalence fails (the bug is often in the data, not the algorithm)
 - [ ] Profile to find actual bottlenecks (usually joins, not conversions)
