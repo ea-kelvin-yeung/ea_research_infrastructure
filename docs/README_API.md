@@ -60,71 +60,70 @@ curl http://localhost:8000/health
 
 ## API Reference
 
-### BacktestClient
+### BacktestService
 
 ```python
-from api import BacktestClient
+from api import BacktestService
 
-client = BacktestClient(
+service = BacktestService.get(
     snapshot="2026-02-10-v1",  # Data snapshot (default: latest)
-    server_url=None,           # HTTP server URL (default: direct mode)
     start_date="2020-01-01",   # Filter data start (optional)
     end_date="2023-12-31",     # Filter data end (optional)
+    compact=True,              # Use float32 to save memory (default)
 )
 ```
 
 #### Methods
 
-**`run(signal, **config)`** - Run a single backtest
+**`run(signal, **config)`** - Run a backtest
 
 ```python
-result = client.run(
+result = service.run(
     signal=signal_df,
-    lag=0,              # Trading lag in days
-    resid="off",        # "off", "industry", "all"
-    byvar_list=["overall", "year", "cap"],
-    fractile=(10, 90),  # Long/short percentiles
-    weight="equal",     # "equal", "value", "volume"
-    tc_model="naive",   # "naive", "power_law"
+    sigvar="signal",            # Signal column name
+    byvar_list=["overall"],     # Analysis groups
+    fractile=(10, 90),          # Long/short percentiles
+    weight="equal",             # "equal", "value", "volume"
+    resid=False,                # Enable residualization
+    resid_style="all",          # "all" or "industry"
+    from_open=False,            # Trade at open vs close
+    mincos=10,                  # Min companies per side
+    calc_turnover=True,         # Set False for faster screening
 )
+# Returns: (summary_df, daily_df, turnover_df, tc_df)
 ```
 
-**`run_suite(signal, lags, resid_modes)`** - Run multiple configs
+**`stats()`** - Get service statistics
 
 ```python
-results = client.run_suite(
-    signal=signal_df,
-    lags=[0, 1, 2],
-    resid_modes=["off", "all"],
-)
-# Returns dict: {"lag0_residoff": BacktestResult, "lag0_residall": BacktestResult, ...}
+service.stats()
+# {'snapshot': '2026-02-10-v1', 'run_count': 5, 'master_rows': 2522327, ...}
 ```
 
-**`batch(signals)`** - Run on multiple signals
+**`reset()`** - Clear singleton and free memory
 
 ```python
-signals = [signal1, signal2, signal3]
-results = client.batch(signals, lag=0)  # List of BacktestResult
+BacktestService.reset()
 ```
 
-**`compare(signals)`** - Compare multiple signals
+### Result Format
+
+`service.run()` returns a tuple of 4 DataFrames:
 
 ```python
-signals = {"momentum": mom_signal, "value": val_signal}
-comparison = client.compare(signals)  # DataFrame with Sharpe, Return, etc.
-```
+summary, daily, turnover, tc = service.run(signal_df)
 
-### BacktestResult
+# Summary DataFrame - key metrics by group
+summary.iloc[0]['sharpe_ret']    # Sharpe ratio
+summary.iloc[0]['ret_ann']       # Annualized return
+summary.iloc[0]['ret_std']       # Return std dev
+summary.iloc[0]['maxdd']         # Max drawdown
+summary.iloc[0]['turnover']      # Average turnover
 
-```python
-result.sharpe         # Overall Sharpe ratio (float)
-result.annual_return  # Annualized return (float)
-result.max_drawdown   # Maximum drawdown (float)
-result.turnover       # Average turnover (float)
-result.summary        # DataFrame with all metrics by group
-result.daily          # DataFrame with daily returns
-result.fractile       # DataFrame with fractile analysis
-result.config         # Dict of config used
+# Daily DataFrame - time series
+daily['date']      # Trading dates
+daily['ret']       # Daily returns
+daily['ret_net']   # Returns net of TC
 ```
 
 ### Server API (HTTP)
@@ -272,13 +271,17 @@ top_signals = [s for s, r in zip(signals, results) if r > 1.5]
 
 ```
 api/
-├── __init__.py            # Package exports (BacktestClient, BacktestService)
-├── client.py              # Python SDK
-├── service.py             # Core singleton service
-├── server.py              # FastAPI HTTP server
+├── __init__.py            # Package exports (BacktestService)
+├── service.py             # Core singleton service (~300 lines)
+├── server.py              # FastAPI HTTP server (optional)
 └── backtest_config.yaml   # Configuration file
 
+tests/
+├── test_server.py         # Service persistence tests
+├── test_parallel.py       # Parallel execution tests
+└── test_equivalence.py    # Result equivalence tests
+
 docker/
-├── Dockerfile        # Container definition
-└── docker-compose.yml # Docker orchestration
+├── Dockerfile             # Container definition
+└── docker-compose.yml     # Docker orchestration
 ```
