@@ -38,3 +38,4 @@ mlruns/
 .cache/
 
 mlflow.db
+.cursor/*
