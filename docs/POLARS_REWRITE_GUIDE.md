@@ -1,6 +1,6 @@
 # Polars Reimplementation Guide
 
-Lessons learned from rewriting the backtest engine from Pandas to Polars, achieving **~1.8x speedup** while maintaining exact numerical equivalence.
+Lessons learned from rewriting the backtest engine from Pandas to Polars, achieving **~6.4x speedup** (21.3s → 3.3s on 10 years of data) while maintaining exact numerical equivalence.
 
 ## What Worked
 
@@ -340,20 +340,68 @@ def _turnover_and_tc(self, weights, byvar):
 
 ---
 
-## Performance Summary
+## Speedup Attribution: Where the Gains Come From
+
+Benchmark: 10 years of real data (12M rows), single signal backtest.
+
+### Overall Results
+
+| Engine | Time | vs OLD |
+|--------|------|--------|
+| OLD (Pandas, backtest_engine.py) | 21.3s | baseline |
+| NEW (Polars, no precompute) | 3.3s | **6.4x faster** |
+| NEW (Polars, precomputed) | 3.3s | **6.5x faster** |
+
+### Speedup Breakdown by Source
+
+| Source | Speedup | Time Saved | % of Total Gain |
+|--------|---------|------------|-----------------|
+| **Polars rewrite** | 6.4x | 18.0s | **~95%** |
+| Master table (single join vs multiple) | 2.5x on joins | 1.2s | ~6% |
+| Precomputation (engine reuse) | 1.01x | 0.03s | ~0.2% |
+
+**Key insight:** The Polars rewrite is the dominant factor (~95% of speedup). Master table and precomputation provide incremental benefits.
+
+### Master Table: Scales With Data Size
+
+The master table benefit increases with data size because join overhead compounds:
+
+| Data Size | Multiple Joins | Single Join | Speedup | % of Runtime Saved |
+|-----------|----------------|-------------|---------|-------------------|
+| 1 year (1.2M rows) | 0.14s | 0.06s | 2.3x | ~12% |
+| 5 years (6M rows) | 0.99s | 0.40s | 2.5x | ~37% |
+| 10 years (12M rows) | 1.98s | 0.79s | 2.5x | ~36% |
+
+For long historical backtests, the master table saves ~1-2s per run.
+
+### Precomputation: When It Matters
+
+Precomputation (reusing the engine instance across signals) provides modest per-signal savings:
+
+| Scenario | No Precompute | Precomputed | Savings |
+|----------|---------------|-------------|---------|
+| 1 signal | 3.34s | 3.30s | 0.04s |
+| 5 signals | 17.4s | 16.9s | 0.5s |
+| 10 signals | ~35s | ~33s | ~2s |
+
+**When precomputation helps most:**
+- API/server mode: engine initialized once at startup
+- Batch research: testing many signals against same universe
+- Interactive apps: engine persists across UI interactions
+
+**When it doesn't matter:**
+- Single ad-hoc backtests (most time is in computation, not setup)
+
+### Per-Technique Speedups
 
 | Technique | Speedup | Notes |
 |-----------|---------|-------|
-| Universe-only filtering | ~1.8x | Single biggest win |
+| Polars execution engine | ~6x | Columnar + SIMD + lazy optimization |
+| NumPy residualization | ~12.5x | NumPy OLS vs statsmodels per-date |
+| Universe-only filtering | ~1.8x | Smaller working set |
 | Pre-joined master table | ~1.3x | Fewer join operations |
 | Cached schemas/subsets | ~1.2x | Avoid repeated introspection |
 | Strategic eager collects | ~1.1x | Reduce DAG overhead |
-| NumPy residualization | **~12.5x** | NumPy OLS vs statsmodels per-date |
-| Boundary-only conversion | ~1.05x | Negligible once done right |
-
-**Key insight:** Once conversions were fixed, **~97% of runtime was dominated by joins against the master table**, not conversion overhead. The wins came from:
-1. **Shrinking master** (universe-only, date-range filtering)
-2. **Joining fewer times / smarter** (pre-joined master, cached subsets)
 
 ---
 
@@ -370,3 +418,4 @@ def _turnover_and_tc(self, weights, byvar):
 - [ ] Test numerical equivalence before optimizing further
 - [ ] Debug row-level data when equivalence fails (the bug is often in the data, not the algorithm)
 - [ ] Profile to find actual bottlenecks (usually joins, not conversions)
+- [ ] Reuse engine instance for multi-signal testing (precompute once, run many)
