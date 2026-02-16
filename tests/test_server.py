@@ -41,11 +41,11 @@ def load_real_signal(start_year: int = 2012, end_year: int = 2021) -> pd.DataFra
 
 
 def test_with_service(args):
-    """Test using BacktestService.run_fast()."""
-    from api.service import BacktestService
+    """Test using BacktestService.run()."""
+    from api import BacktestService
     
     print("="*70)
-    print("BACKTEST SERVICE TEST (using run_fast)")
+    print("BACKTEST SERVICE TEST")
     print("="*70)
     
     # Reset and load with date filtering at init
@@ -61,7 +61,7 @@ def test_with_service(args):
     
     print(f"\n1. COLD START:")
     print(f"   Data load:   {load_time:.1f}s")
-    print(f"   Master rows: {len(service._master_pd):,}")
+    print(f"   Master rows: {len(service._master):,}")
     
     # Load signal
     sig = load_real_signal(args.start_year, args.end_year)
@@ -70,7 +70,7 @@ def test_with_service(args):
     
     # First run
     t0 = time.perf_counter()
-    result = service.run_fast(sig, sigvar='signal', byvar_list=['overall'])
+    result = service.run(sig, sigvar='signal', byvar_list=['overall'])
     first_run = time.perf_counter() - t0
     
     cold_total = load_time + first_run
@@ -82,7 +82,7 @@ def test_with_service(args):
     warm_times = []
     for i in range(args.num_runs):
         t0 = time.perf_counter()
-        result = service.run_fast(sig, sigvar='signal', byvar_list=['overall'])
+        result = service.run(sig, sigvar='signal', byvar_list=['overall'])
         elapsed = time.perf_counter() - t0
         warm_times.append(elapsed)
         
@@ -173,8 +173,8 @@ def test_direct(args):
 def main():
     parser = argparse.ArgumentParser(description="Test BacktestService persistence")
     parser.add_argument("--use-service", action="store_true", 
-                        help="Use BacktestService.run_fast() instead of direct")
-    parser.add_argument("--snapshot", default=None, help="Snapshot to use")
+                        help="Use BacktestService instead of direct")
+    parser.add_argument("--snapshot", default="2026-02-10-v1", help="Snapshot to use")
     parser.add_argument("--num-runs", type=int, default=3, help="Number of warm runs")
     parser.add_argument("--start-year", type=int, default=2012, help="Start year")
     parser.add_argument("--end-year", type=int, default=2021, help="End year")

@@ -394,28 +394,29 @@ Precomputation (reusing the engine instance across signals) provides modest per-
 
 ### Data Persistence: Avoid Reloading
 
-The biggest persistence benefit comes from **loading data once** with date filtering and using `run_fast()`:
+The biggest persistence benefit comes from **loading data once** with date filtering:
 
 | Method | Time | Notes |
 |--------|------|-------|
 | Cold start (load + first run) | 33s | One-time cost |
-| Warm run with `run_fast()` | **1.8s** | Direct engine, minimal overhead |
+| Warm run with `service.run()` | **1.8s** | Direct engine, minimal overhead |
 | Speedup | **18x** | After first run |
 
 *Benchmark: Real signal (reversal_signal_analyst.csv), 6.4M rows, 2012-2021*
 
 ```python
-from api.service import BacktestService
+from api import BacktestService
 
 # Load data once with date filtering (~33s cold start)
 service = BacktestService.get(
+    '2026-02-10-v1',
     start_date='2012-01-01',
     end_date='2021-12-31',
 )
 
-# Fast path: use run_fast() with pre-aligned signal (~1.8s each)
+# Run backtests (~1.8s each)
 for signal in signals:
-    result = service.run_fast(
+    result = service.run(
         signal,                    # Must have date_ret column
         sigvar='signal',
         byvar_list=['overall'],
@@ -423,13 +424,9 @@ for signal in signals:
     summary, daily, turnover, tc = result
     print(f"Sharpe: {summary.iloc[0]['sharpe_ret']:.2f}")
 
-# Standard path: use run() if signal needs alignment (~5s each)
-result = service.run(raw_signal, lag=0, resid='off')
+# Skip turnover for faster screening (~0.15s for 2yr data)
+result = service.run(signal, calc_turnover=False)
 ```
-
-**When to use each:**
-- `run_fast()`: Signal already has `date_ret` column, batch testing many signals (18x faster)
-- `run()`: Raw signal needs date alignment, validation needed (~5s overhead)
 
 ### Per-Technique Speedups
 
@@ -441,6 +438,25 @@ result = service.run(raw_signal, lag=0, resid='off')
 | Pre-joined master table | ~1.3x | Fewer join operations |
 | Cached schemas/subsets | ~1.2x | Avoid repeated introspection |
 | Strategic eager collects | ~1.1x | Reduce DAG overhead |
+
+### Memory Optimization
+
+The service uses minimal memory mode by default, loading only what's needed:
+
+| Mode | Memory | Reduction |
+|------|--------|-----------|
+| Full | 11.6 GB | baseline |
+| **Minimal (default)** | **4.1 GB** | **65% savings** |
+
+**What's dropped in minimal mode:**
+
+| Data | Size | Reason |
+|------|------|--------|
+| `ret` | 2.2 GB | Already in `master` |
+| `risk` | 3.9 GB | Already in `master` |
+| `factors` | 1.5 GB | Columns already in `master` |
+
+The `BacktestService` automatically drops redundant data after loading, keeping only `master` + `dates`.
 
 ---
 
