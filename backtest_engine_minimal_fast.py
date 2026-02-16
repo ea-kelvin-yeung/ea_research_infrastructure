@@ -582,9 +582,10 @@ class BacktestFastMinimal:
         
         # Zero out first day
         n_min = diff["n"].min()
-        diff = diff.with_columns([
-            pl.when(pl.col("n") == n_min).then(0.0).otherwise(pl.col("weight_diff")).alias("weight_diff")
-        ])
+        if n_min is not None:
+            diff = diff.with_columns([
+                pl.when(pl.col("n") == n_min).then(0.0).otherwise(pl.col("weight_diff")).alias("weight_diff")
+            ])
 
         # turnover per day
         turnover_daily = diff.group_by([byvar, "date"]).agg(pl.sum("weight_diff").alias("turnover"))

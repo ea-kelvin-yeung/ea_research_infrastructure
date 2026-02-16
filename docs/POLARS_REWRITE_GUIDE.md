@@ -392,6 +392,45 @@ Precomputation (reusing the engine instance across signals) provides modest per-
 **When it doesn't matter:**
 - Single ad-hoc backtests (most time is in computation, not setup)
 
+### Data Persistence: Avoid Reloading
+
+The biggest persistence benefit comes from **loading data once** with date filtering and using `run_fast()`:
+
+| Method | Time | Notes |
+|--------|------|-------|
+| Cold start (load + first run) | 33s | One-time cost |
+| Warm run with `run_fast()` | **1.8s** | Direct engine, minimal overhead |
+| Speedup | **18x** | After first run |
+
+*Benchmark: Real signal (reversal_signal_analyst.csv), 6.4M rows, 2012-2021*
+
+```python
+from api.service import BacktestService
+
+# Load data once with date filtering (~33s cold start)
+service = BacktestService.get(
+    start_date='2012-01-01',
+    end_date='2021-12-31',
+)
+
+# Fast path: use run_fast() with pre-aligned signal (~1.8s each)
+for signal in signals:
+    result = service.run_fast(
+        signal,                    # Must have date_ret column
+        sigvar='signal',
+        byvar_list=['overall'],
+    )
+    summary, daily, turnover, tc = result
+    print(f"Sharpe: {summary.iloc[0]['sharpe_ret']:.2f}")
+
+# Standard path: use run() if signal needs alignment (~5s each)
+result = service.run(raw_signal, lag=0, resid='off')
+```
+
+**When to use each:**
+- `run_fast()`: Signal already has `date_ret` column, batch testing many signals (18x faster)
+- `run()`: Raw signal needs date alignment, validation needed (~5s overhead)
+
 ### Per-Technique Speedups
 
 | Technique | Speedup | Notes |

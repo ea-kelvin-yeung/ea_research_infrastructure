@@ -105,6 +105,8 @@ class BacktestService:
         config: Optional[ServiceConfig] = None,
         config_file: Optional[str] = "api/backtest_config.yaml",
         force_reload: bool = False,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
     ) -> "BacktestService":
         """
         Get or create the singleton BacktestService instance.
@@ -114,6 +116,8 @@ class BacktestService:
             config: Service configuration (uses defaults if None)
             config_file: Path to YAML config file (default: backtest_config.yaml)
             force_reload: Force reload data even if already loaded
+            start_date: Optional start date to filter data during load (e.g., "2012-01-01")
+            end_date: Optional end date to filter data during load (e.g., "2021-12-31")
             
         Returns:
             BacktestService singleton instance
@@ -157,7 +161,10 @@ class BacktestService:
             if needs_reload:
                 if cls._instance is not None:
                     print(f"Reloading data (snapshot: {snapshot})...")
-                cls._instance = cls(snapshot, config)
+                cls._instance = cls(snapshot, config, start_date, end_date)
+            elif start_date or end_date:
+                # Filter existing instance if date range specified
+                cls._instance.filter_dates(start_date, end_date)
             
             return cls._instance
     
@@ -169,7 +176,13 @@ class BacktestService:
                 cls._instance._catalog = None
                 cls._instance = None
     
-    def __init__(self, snapshot: str, config: ServiceConfig):
+    def __init__(
+        self,
+        snapshot: str,
+        config: ServiceConfig,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ):
         """Initialize service (use get() instead of calling directly)."""
         self.snapshot = snapshot
         self.config = config
@@ -178,29 +191,75 @@ class BacktestService:
         self._run_count: int = 0
         self._run_lock = threading.Lock()
         
-        # Load data
-        self._load_data()
+        # Cached data for fast path
+        self._master_pd: Optional[pd.DataFrame] = None
+        self._datefile_pd: Optional[pd.DataFrame] = None
+        self._engine_cache: Dict[str, Any] = {}  # Cache engines by config hash
+        
+        # Store date range for info
+        self._start_date = start_date
+        self._end_date = end_date
+        
+        # Load data (with optional filtering)
+        self._load_data(start_date, end_date)
     
-    def _load_data(self):
-        """Load data from snapshot."""
+    def _load_data(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ):
+        """Load data from snapshot with optional date filtering."""
         start = time.perf_counter()
         
         snapshot_path = f"snapshots/{self.snapshot}"
-        print(f"Loading snapshot: {snapshot_path}")
+        date_range = ""
+        if start_date or end_date:
+            date_range = f" [{start_date or '*'} to {end_date or '*'}]"
+        print(f"Loading snapshot: {snapshot_path}{date_range}")
         
         # Load catalog with memory optimization
         self._catalog = load_catalog(
             snapshot_path,
             use_master=True,
             verify_integrity=False,
-            universe_only=False,  # Load full universe for flexibility
+            universe_only=False,
         )
+        
+        # Flatten master immediately and filter in single pass
+        master = self._catalog.get('master')
+        if master is not None:
+            if isinstance(master.index, pd.MultiIndex):
+                master = master.reset_index()
+            
+            # Filter during load for efficiency
+            if start_date or end_date:
+                mask = np.ones(len(master), dtype=bool)
+                if start_date:
+                    mask &= (master['date'] >= start_date).values
+                if end_date:
+                    mask &= (master['date'] <= end_date).values
+                master = master[mask]
+            
+            self._master_pd = master
+            self._catalog['master'] = master  # Update catalog too
+        
+        # Filter dates
+        dates = self._catalog.get('dates')
+        if dates is not None and (start_date or end_date):
+            mask = np.ones(len(dates), dtype=bool)
+            if start_date:
+                mask &= (dates['date'] >= start_date).values
+            if end_date:
+                mask &= (dates['date'] <= end_date).values
+            dates = dates[mask]
+            self._catalog['dates'] = dates
+        self._datefile_pd = dates
         
         self._load_time = time.perf_counter() - start
         
         # Report stats
-        master_rows = len(self._catalog.get('master', pd.DataFrame()))
-        dates_rows = len(self._catalog.get('dates', pd.DataFrame()))
+        master_rows = len(self._master_pd) if self._master_pd is not None else 0
+        dates_rows = len(self._datefile_pd) if self._datefile_pd is not None else 0
         print(f"Loaded in {self._load_time:.1f}s: {master_rows:,} master rows, {dates_rows:,} dates")
     
     @property
@@ -288,6 +347,79 @@ class BacktestService:
         # Run backtest using wrapper
         return run_backtest(signal, self._catalog, bt_config, validate=validate)
     
+    def run_fast(
+        self,
+        signal: pd.DataFrame,
+        sigvar: str = "signal",
+        byvar_list: Optional[List[str]] = None,
+        fractile: tuple = (10, 90),
+        weight: str = "equal",
+        resid: bool = False,
+        resid_style: str = "all",
+        from_open: bool = False,
+        mincos: int = 10,
+    ) -> tuple:
+        """
+        Run backtest with minimal overhead using BacktestFastV2 directly.
+        
+        This method bypasses prepare_signal() and uses cached data for maximum
+        performance. Use this when:
+        - Signal is already aligned (has date_ret column)
+        - You need maximum throughput for batch testing
+        
+        Args:
+            signal: Pre-aligned signal DataFrame with columns:
+                   [security_id, date_sig, date_avail, date_ret, <sigvar>]
+            sigvar: Name of the signal column (default: "signal")
+            byvar_list: Analysis slices (default: ["overall"])
+            fractile: Long/short percentile thresholds (default: (10, 90))
+            weight: Weighting method: "equal", "value", "volume"
+            resid: Enable residualization (default: False)
+            resid_style: Residualization style: "all", "industry"
+            from_open: Trade at open vs close (default: False)
+            mincos: Minimum companies per side (default: 10)
+            
+        Returns:
+            Tuple: (summary_df, daily_df, turnover_df, tc_df)
+        """
+        if not self.is_ready:
+            raise RuntimeError("Service not initialized. Call BacktestService.get() first.")
+        
+        if self._master_pd is None:
+            raise RuntimeError("Master data not loaded. Use run() instead.")
+        
+        if byvar_list is None:
+            byvar_list = ["overall"]
+        
+        # Import here to avoid circular imports
+        from backtest_wrapper import BacktestFastV2
+        
+        # Thread-safe run count
+        with self._run_lock:
+            self._run_count += 1
+        
+        # Use BacktestFastV2 directly with cached data
+        bt = BacktestFastV2(
+            infile=signal,
+            retfile=self._master_pd,
+            otherfile=self._master_pd,
+            datefile=self._datefile_pd,
+            sigvar=sigvar,
+            method="long_short",
+            byvar_list=byvar_list,
+            fractile=list(fractile),
+            weight=weight,
+            resid=resid,
+            resid_style=resid_style,
+            from_open=from_open,
+            mincos=mincos,
+            tc_model="naive",
+            input_type="value",
+            verbose=False,
+        )
+        
+        return bt.gen_result()
+    
     def run_suite(
         self,
         signal: pd.DataFrame,
@@ -340,45 +472,46 @@ class BacktestService:
         if not self.is_ready:
             raise RuntimeError("Service not initialized.")
         
-        if start_date:
-            self._catalog['ret'] = self._catalog['ret'][
-                self._catalog['ret']['date'] >= start_date
-            ]
-            self._catalog['risk'] = self._catalog['risk'][
-                self._catalog['risk']['date'] >= start_date
-            ]
-            self._catalog['dates'] = self._catalog['dates'][
-                self._catalog['dates']['date'] >= start_date
-            ]
-            if 'master' in self._catalog and self._catalog['master'] is not None:
-                master = self._catalog['master']
-                if isinstance(master.index, pd.MultiIndex):
-                    master = master.reset_index()
-                    master = master[master['date'] >= start_date]
-                    master = master.set_index(['security_id', 'date'])
-                else:
-                    master = master[master['date'] >= start_date]
-                self._catalog['master'] = master
+        if start_date is None and end_date is None:
+            return self
         
-        if end_date:
-            self._catalog['ret'] = self._catalog['ret'][
-                self._catalog['ret']['date'] <= end_date
-            ]
-            self._catalog['risk'] = self._catalog['risk'][
-                self._catalog['risk']['date'] <= end_date
-            ]
-            self._catalog['dates'] = self._catalog['dates'][
-                self._catalog['dates']['date'] <= end_date
-            ]
-            if 'master' in self._catalog and self._catalog['master'] is not None:
-                master = self._catalog['master']
-                if isinstance(master.index, pd.MultiIndex):
-                    master = master.reset_index()
-                    master = master[master['date'] <= end_date]
-                    master = master.set_index(['security_id', 'date'])
-                else:
-                    master = master[master['date'] <= end_date]
-                self._catalog['master'] = master
+        # Build combined mask for efficiency (single pass)
+        def filter_df(df: pd.DataFrame, date_col: str = 'date') -> pd.DataFrame:
+            if df is None or len(df) == 0:
+                return df
+            mask = np.ones(len(df), dtype=bool)
+            if start_date:
+                mask &= (df[date_col] >= start_date).values
+            if end_date:
+                mask &= (df[date_col] <= end_date).values
+            return df[mask]
+        
+        # Filter catalog entries in single pass each
+        if 'ret' in self._catalog and self._catalog['ret'] is not None:
+            self._catalog['ret'] = filter_df(self._catalog['ret'])
+        
+        if 'risk' in self._catalog and self._catalog['risk'] is not None:
+            self._catalog['risk'] = filter_df(self._catalog['risk'])
+        
+        if 'dates' in self._catalog and self._catalog['dates'] is not None:
+            self._catalog['dates'] = filter_df(self._catalog['dates'])
+        
+        # Filter and flatten master in single pass (avoid reset_index/set_index churn)
+        if 'master' in self._catalog and self._catalog['master'] is not None:
+            master = self._catalog['master']
+            if isinstance(master.index, pd.MultiIndex):
+                master = master.reset_index()
+            # Single combined filter
+            mask = np.ones(len(master), dtype=bool)
+            if start_date:
+                mask &= (master['date'] >= start_date).values
+            if end_date:
+                mask &= (master['date'] <= end_date).values
+            master = master[mask]
+            self._catalog['master'] = master
+            self._master_pd = master  # Already flattened
+        
+        self._datefile_pd = self._catalog.get('dates')
         
         return self
 
