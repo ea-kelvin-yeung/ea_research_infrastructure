@@ -7,19 +7,22 @@ Run backtests programmatically without the Streamlit UI. The API loads data once
 ### Option 1: Direct Python (Recommended for Jupyter/Scripts)
 
 ```python
-from api import BacktestClient
+from api import BacktestService
 
 # Initialize (loads data once, ~30s first time, instant after)
-client = BacktestClient()
+service = BacktestService.get(
+    '2026-02-10-v1',
+    start_date='2020-01-01',
+    end_date='2021-12-31',
+)
 
-# Run a backtest
-result = client.run(signal_df, lag=0, resid="off")
-print(f"Sharpe: {result.sharpe:.2f}")
-print(f"Annual Return: {result.annual_return:.2%}")
+# Run a backtest (~0.5s per signal)
+result = service.run(signal_df, sigvar='signal')
+summary, daily, turnover, tc = result
 
-# Access detailed results
-result.summary  # DataFrame with stats by group (overall, year, cap)
-result.daily    # DataFrame with daily returns
+# Access results
+sharpe = summary.iloc[0]['sharpe_ret']
+print(f"Sharpe: {sharpe:.2f}")
 ```
 
 ### Option 2: Local Server (For multiple scripts/notebooks)
@@ -187,13 +190,69 @@ defaults:
   byvar_list: ["overall", "year", "cap"]
 ```
 
+## Parallel Execution
+
+Run multiple signals in parallel using joblib with threading backend:
+
+```python
+from api import BacktestService
+from joblib import Parallel, delayed
+
+# Load data once
+service = BacktestService.get(
+    '2026-02-10-v1',
+    start_date='2020-01-01',
+    end_date='2021-12-31',
+)
+
+def run_backtest(signal):
+    """Worker function - uses shared service."""
+    result = service.run(signal, sigvar='signal', byvar_list=['overall'])
+    return result[0].iloc[0]['sharpe_ret']
+
+# Run in parallel (threading backend shares memory)
+signals = [signal1, signal2, signal3, signal4]
+results = Parallel(n_jobs=4, backend='threading')(
+    delayed(run_backtest)(sig) for sig in signals
+)
+```
+
+### Parallel Performance
+
+| Workers | Speedup | Memory |
+|---------|---------|--------|
+| 1 (sequential) | 1.0x | ~200 MB |
+| 2 | 2.0x | ~200 MB |
+| 4 | 2.4x | ~200 MB |
+
+**Key points:**
+- Use `backend='threading'` to share memory (no data copying)
+- Don't reset the service between parallel runs
+- GIL limits speedup to ~2-3x for CPU-bound work
+- Polars releases GIL for most operations, enabling parallelism
+
+### Alternative: Skip Turnover for Screening
+
+For fast signal screening, disable turnover calculation:
+
+```python
+# Fast screening pass (~0.15s per signal)
+results = []
+for signal in signals:
+    result = service.run(signal, calc_turnover=False)
+    results.append(result[0].iloc[0]['sharpe_ret'])
+
+# Full backtest only on top candidates
+top_signals = [s for s, r in zip(signals, results) if r > 1.5]
+```
+
 ## Memory Usage
 
 | Mode | RAM Usage | Notes |
 |------|-----------|-------|
-| Direct (default) | ~500MB | Hot data in memory |
-| With residualization | ~1.2GB | Risk factors loaded |
-| Memory-mapped | ~100MB | Uses disk, slower |
+| Compact (default) | ~200 MB | float32 dtypes, 2-year data |
+| Full 10-year data | ~1 GB | Compact mode |
+| Full dtypes | ~2 GB | float64 dtypes |
 
 ## Troubleshooting
 
