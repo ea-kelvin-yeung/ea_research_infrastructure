@@ -1,0 +1,47 @@
+# Docker ignore file
+# Place in project root when building: cp docker/.dockerignore .dockerignore
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+.cursor/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Test data (use mounted volumes instead)
+snapshots/
+
+# Notebooks
+*.ipynb
+.ipynb_checkpoints/
+
+# Documentation
+*.md
+!README.md
+
+# Docker files (avoid recursive inclusion)
+docker/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/

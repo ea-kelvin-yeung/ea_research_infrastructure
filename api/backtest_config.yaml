@@ -1,0 +1,37 @@
+# Backtest Service Configuration
+# Copy this file and customize for your setup
+
+# Data snapshot to use
+snapshot: "2026-02-10-v1"
+
+# Server settings (for backtest_server.py)
+server:
+  host: "127.0.0.1"  # Use "0.0.0.0" for external access
+  port: 8000
+  workers: 1  # Keep at 1 for shared state
+
+# Memory optimization
+memory:
+  use_mmap: true  # Use memory-mapped files for large data
+  cache_size: 10  # LRU cache size for recent signals
+  preload_factors: false  # Preload risk factors (uses more RAM)
+
+# Default backtest settings
+defaults:
+  lag: 0
+  resid: "off"  # Options: "off", "industry", "all"
+  byvar_list:
+    - "overall"
+    - "year"
+    - "cap"
+  fractile: [10, 90]
+  weight: "equal"  # Options: "equal", "value", "volume"
+  tc_model: "naive"  # Options: "naive", "power_law"
+  from_open: false
+  mincos: 10
+
+# Date range filter (optional)
+# Uncomment to filter data on load
+# date_range:
+#   start: "2020-01-01"
+#   end: "2023-12-31"

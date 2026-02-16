@@ -18,7 +18,7 @@ import json
 import hashlib
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, List
 
 
 # Standard risk factors used for signal quality assessment
@@ -764,6 +764,93 @@ def load_catalog(
             pass
     
     return catalog
+
+
+def load_minimal(
+    snapshot_path: str = "snapshots/default",
+    columns: Optional[List[str]] = None,
+    use_mmap: bool = True,
+) -> dict:
+    """
+    Load minimal hot data for fast backtest execution with low memory footprint.
+    
+    This function loads only the essential columns needed for backtesting:
+    - ret, resret (returns)
+    - cap, industry_id (for residualization and slicing)
+    - mcap, adv (for value/volume weighting if needed)
+    
+    Uses Polars memory-mapped parquet for efficient memory usage.
+    
+    Args:
+        snapshot_path: Path to snapshot directory
+        columns: Specific columns to load (default: essential backtest columns)
+        use_mmap: Use memory-mapped loading (default: True)
+        
+    Returns:
+        dict with keys:
+        - 'master_pl': Polars DataFrame with hot columns
+        - 'dates_pl': Polars DataFrame with trading dates
+        - 'snapshot_id': Snapshot identifier
+        
+    Example:
+        catalog = load_minimal("snapshots/2026-02-10-v1")
+        # Uses ~400MB instead of ~1.2GB
+    """
+    try:
+        import polars as pl
+    except ImportError:
+        raise ImportError("Polars required for load_minimal: pip install polars")
+    
+    path = Path(snapshot_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Snapshot not found: {snapshot_path}")
+    
+    # Default hot columns for backtesting
+    if columns is None:
+        columns = [
+            "security_id", "date",
+            "ret", "resret",  # Returns
+            "cap", "industry_id",  # Grouping/residualization
+            "mcap", "adv",  # Weighting
+        ]
+    
+    # Load manifest
+    manifest_path = path / 'manifest.json'
+    if manifest_path.exists():
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+    else:
+        manifest = {'snapshot_id': path.name}
+    
+    # Load master with selected columns only
+    master_path = path / 'master.parquet'
+    if master_path.exists():
+        # Use memory-mapped loading
+        if use_mmap:
+            master_pl = pl.read_parquet(master_path, columns=columns, memory_map=True)
+        else:
+            master_pl = pl.read_parquet(master_path, columns=columns)
+    else:
+        # Fallback: load from partitions
+        partitions_path = path / 'partitions' / 'master'
+        if partitions_path.exists():
+            master_pl = pl.read_parquet(partitions_path, columns=columns)
+        else:
+            raise FileNotFoundError(f"No master data found in {snapshot_path}")
+    
+    # Load dates (always small, no mmap needed)
+    dates_path = path / 'trading_date.parquet'
+    if dates_path.exists():
+        dates_pl = pl.read_parquet(dates_path)
+    else:
+        raise FileNotFoundError(f"No trading_date.parquet found in {snapshot_path}")
+    
+    return {
+        'master_pl': master_pl,
+        'dates_pl': dates_pl,
+        'snapshot_id': manifest.get('snapshot_id', path.name),
+        'manifest': manifest,
+    }
 
 
 def create_snapshot(

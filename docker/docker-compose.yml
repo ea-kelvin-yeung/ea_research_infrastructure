@@ -1,0 +1,51 @@
+# Docker Compose for Backtest Server
+# Run from project root: docker-compose -f docker/docker-compose.yml up -d
+# Or from docker/: docker-compose up -d (with context set to parent)
+
+version: '3.8'
+
+services:
+  backtest-server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: backtest-server
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount snapshots directory (read-only for safety)
+      - ../snapshots:/app/snapshots:ro
+      # Optional: Override config file
+      # - ../api/backtest_config.yaml:/app/api/backtest_config.yaml:ro
+    environment:
+      # Server configuration
+      - BACKTEST_HOST=0.0.0.0
+      - BACKTEST_PORT=8000
+      # Snapshot to load (optional, defaults to latest)
+      # - BACKTEST_SNAPSHOT=2026-02-10-v1
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    # Resource limits (adjust based on your data size)
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
+
+  # Optional: Redis cache for signal caching (future enhancement)
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: backtest-redis
+  #   ports:
+  #     - "6379:6379"
+  #   volumes:
+  #     - redis-data:/data
+
+# volumes:
+#   redis-data:
