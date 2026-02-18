@@ -348,6 +348,26 @@ def get_run_history(experiment_name: str = 'backtest-poc', max_results: int = 10
         return []
 
 
+def rename_run(run_id: str, new_name: str) -> bool:
+    """
+    Rename a run by updating its signal_name tag.
+    
+    Args:
+        run_id: MLflow run ID
+        new_name: New name for the signal
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        client = mlflow.tracking.MlflowClient()
+        client.set_tag(run_id, 'signal_name', new_name)
+        return True
+    except Exception as e:
+        print(f"Failed to rename run {run_id}: {e}")
+        return False
+
+
 def delete_runs(run_ids: list, experiment_name: str = 'backtest-poc') -> dict:
     """
     Delete multiple MLflow runs.

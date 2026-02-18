@@ -122,21 +122,43 @@ def _build_metrics_diff(run_a: Dict, run_b: Dict) -> pd.DataFrame:
     
     all_metrics = set(a_metrics.keys()) | set(b_metrics.keys())
     
-    # Filter to key metrics (exclude per-config metrics for cleaner display)
-    key_metrics = ['best_sharpe']
-    # Add Sharpe metrics for common configs
-    for m in all_metrics:
-        if m.startswith('sharpe_') and m in a_metrics and m in b_metrics:
-            key_metrics.append(m)
+    # Headline metrics to always include (in order)
+    headline_metrics = [
+        'best_sharpe', 'best_ann_ret', 'best_max_dd', 'best_turnover',
+    ]
+    
+    # Start with headline metrics
+    key_metrics = [m for m in headline_metrics if m in a_metrics or m in b_metrics]
+    
+    # Add Sharpe, ann_ret, turnover metrics for common configs
+    for m in sorted(all_metrics):
+        if m in key_metrics:
+            continue
+        # Include key per-config metrics
+        if any(m.startswith(prefix) for prefix in ['sharpe_lag', 'ann_ret_lag', 'turnover_lag', 'max_dd_lag']):
+            if m in a_metrics and m in b_metrics:
+                key_metrics.append(m)
+    
+    # Metrics where lower is better
+    lower_is_better = {'best_max_dd', 'best_turnover', 'max_dd', 'turnover'}
     
     rows = []
-    for metric in sorted(key_metrics):
+    for metric in key_metrics:
         a_val = a_metrics.get(metric)
         b_val = b_metrics.get(metric)
+        
+        # Determine if lower is better for this metric
+        is_lower_better = any(lb in metric for lb in lower_is_better)
         
         if a_val is not None and b_val is not None:
             diff = b_val - a_val
             pct_diff = (diff / abs(a_val) * 100) if a_val != 0 else 0
+            
+            # Determine which is better
+            if is_lower_better:
+                better = 'B' if diff < 0 else ('A' if diff > 0 else 'Same')
+            else:
+                better = 'B' if diff > 0 else ('A' if diff < 0 else 'Same')
             
             rows.append({
                 'Metric': metric.replace('_', ' ').title(),
@@ -144,7 +166,7 @@ def _build_metrics_diff(run_a: Dict, run_b: Dict) -> pd.DataFrame:
                 'Run B': b_val,
                 'Diff': diff,
                 'Diff %': pct_diff,
-                'Better': 'B' if diff > 0 else ('A' if diff < 0 else 'Same'),
+                'Better': better,
             })
         elif a_val is not None:
             rows.append({
@@ -245,6 +267,87 @@ def get_overlay_data(daily_a: pd.DataFrame, daily_b: pd.DataFrame,
         
         subset['run'] = label_b
         dfs.append(subset)
+    
+    if dfs:
+        return pd.concat(dfs, ignore_index=True)
+    return pd.DataFrame()
+
+
+def compute_rolling_sharpe(daily_df: pd.DataFrame, window_years: int = 3,
+                           config: Optional[str] = None) -> pd.DataFrame:
+    """
+    Compute rolling Sharpe ratio over a specified window.
+    
+    Args:
+        daily_df: Daily DataFrame with 'date' and 'ret' columns
+        window_years: Rolling window size in years (default 3)
+        config: Specific config to use (default: 'lag0_residoff' or first available)
+        
+    Returns:
+        DataFrame with date and rolling_sharpe columns
+    """
+    if daily_df is None or 'ret' not in daily_df.columns:
+        return pd.DataFrame()
+    
+    # Get the right config's data
+    if 'config' in daily_df.columns and 'type' in daily_df.columns:
+        signal_data = daily_df[daily_df['type'] == 'signal']
+        if len(signal_data) > 0:
+            target_config = config or _get_default_config(signal_data)
+            df = signal_data[signal_data['config'] == target_config][['date', 'ret']].copy()
+            if len(df) == 0:
+                df = signal_data[['date', 'ret']].drop_duplicates('date')
+        else:
+            df = daily_df[['date', 'ret']].drop_duplicates('date')
+    else:
+        df = daily_df[['date', 'ret']].copy()
+    
+    df = df.sort_values('date').reset_index(drop=True)
+    
+    # Calculate rolling window in trading days (approx 252 per year)
+    window = window_years * 252
+    
+    if len(df) < window:
+        return pd.DataFrame()
+    
+    # Calculate rolling Sharpe (annualized)
+    sqrt252 = np.sqrt(252)
+    rolling_mean = df['ret'].rolling(window=window).mean() * 252
+    rolling_std = df['ret'].rolling(window=window).std() * sqrt252
+    df['rolling_sharpe'] = rolling_mean / rolling_std
+    
+    return df[['date', 'rolling_sharpe']].dropna()
+
+
+def get_rolling_sharpe_overlay(daily_a: pd.DataFrame, daily_b: pd.DataFrame,
+                                label_a: str = 'Run A', label_b: str = 'Run B',
+                                window_years: int = 3,
+                                config: Optional[str] = None) -> pd.DataFrame:
+    """
+    Compute rolling Sharpe for both runs and combine for overlay plotting.
+    
+    Args:
+        daily_a: Daily DataFrame from Run A
+        daily_b: Daily DataFrame from Run B
+        label_a: Label for Run A
+        label_b: Label for Run B
+        window_years: Rolling window size in years
+        config: Specific config to use
+        
+    Returns:
+        Combined DataFrame with 'run' column for coloring
+    """
+    dfs = []
+    
+    sharpe_a = compute_rolling_sharpe(daily_a, window_years, config)
+    if len(sharpe_a) > 0:
+        sharpe_a['run'] = label_a
+        dfs.append(sharpe_a)
+    
+    sharpe_b = compute_rolling_sharpe(daily_b, window_years, config)
+    if len(sharpe_b) > 0:
+        sharpe_b['run'] = label_b
+        dfs.append(sharpe_b)
     
     if dfs:
         return pd.concat(dfs, ignore_index=True)

@@ -35,7 +35,8 @@ from poc.charts import (
     plot_lag_sensitivity, plot_lag_sensitivity_from_summary, plot_decile_returns, 
     plot_factor_exposure_bars, plot_coverage_over_time, plot_ic_over_time
 )
-from poc.compare import compare_runs, get_overlay_data, compute_cumret_diff, clear_run_cache
+from poc.compare import compare_runs, get_overlay_data, compute_cumret_diff, clear_run_cache, get_rolling_sharpe_overlay
+from poc.tracking import rename_run
 
 
 st.set_page_config(page_title="Backtest Suite Runner", page_icon="📊", layout="wide")
@@ -445,6 +446,32 @@ def main():
                                     showlegend=False,
                                 )
                                 st.plotly_chart(fig_diff, width='stretch', key="compare_diff")
+                            
+                            # Rolling 3-Year Sharpe Comparison
+                            st.subheader("Rolling 3-Year Sharpe Ratio")
+                            rolling_sharpe_data = get_rolling_sharpe_overlay(
+                                result.daily_a, result.daily_b,
+                                label_a=result.run_a.get('signal_name', 'Run A'),
+                                label_b=result.run_b.get('signal_name', 'Run B'),
+                                window_years=3,
+                                config=selected_config
+                            )
+                            if len(rolling_sharpe_data) > 0:
+                                fig_sharpe = px.line(
+                                    rolling_sharpe_data, x='date', y='rolling_sharpe', color='run',
+                                    title='Rolling 3-Year Sharpe Ratio'
+                                )
+                                fig_sharpe.add_hline(y=0, line_dash="solid", line_color="gray", line_width=1)
+                                fig_sharpe.add_hline(y=1, line_dash="dash", line_color="green", line_width=1, 
+                                                    annotation_text="Sharpe=1", annotation_position="right")
+                                fig_sharpe.update_layout(
+                                    legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                                    yaxis_title="Sharpe Ratio",
+                                    xaxis_title="Date",
+                                )
+                                st.plotly_chart(fig_sharpe, width='stretch', key="compare_rolling_sharpe")
+                            else:
+                                st.caption("Insufficient data for rolling 3-year Sharpe (need at least 3 years of daily data)")
                         else:
                             st.info("No daily data available for overlay plot.")
                     else:
@@ -692,6 +719,21 @@ def main():
             selected_label = st.selectbox("Select an experiment to view", runs_df['label'].tolist())
             selected_run = runs_df[runs_df['label'] == selected_label].iloc[0]
             run_id = selected_run['run_id']
+            
+            # Rename experiment
+            with st.expander("Rename Experiment", expanded=False):
+                current_name = selected_run.get('tags.signal_name', 'unknown')
+                new_name = st.text_input("New name", value=current_name, key="rename_input")
+                if st.button("Rename", key="rename_btn"):
+                    if new_name and new_name != current_name:
+                        if rename_run(run_id, new_name):
+                            st.success(f"Renamed to '{new_name}'")
+                            get_cached_run_history.clear()
+                            st.rerun()
+                        else:
+                            st.error("Failed to rename experiment")
+                    elif new_name == current_name:
+                        st.info("Name unchanged")
             
             # Load artifacts from MLflow
             try:
