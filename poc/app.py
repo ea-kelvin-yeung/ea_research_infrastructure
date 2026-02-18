@@ -135,8 +135,8 @@ def main():
         
         # Date range for faster testing
         st.subheader("Date Range")
-        start_date = st.date_input("Start", value=pd.Timestamp('2018-01-01'))
-        end_date = st.date_input("End", value=pd.Timestamp('2018-06-30'))
+        start_date = st.date_input("Start", value=pd.Timestamp('2018-01-01'), min_value=pd.Timestamp('2002-01-01'))
+        end_date = st.date_input("End", value=pd.Timestamp('2018-06-30'), min_value=pd.Timestamp('2002-01-01'))
         
         # Universe filter
         st.subheader("Universe Filter")
@@ -862,8 +862,8 @@ def main():
                             key="rerun_snapshot"
                         )
                         
-                        rerun_start = st.date_input("Start Date", value=default_start, key="rerun_start")
-                        rerun_end = st.date_input("End Date", value=default_end, key="rerun_end")
+                        rerun_start = st.date_input("Start Date", value=default_start, min_value=pd.Timestamp('2002-01-01'), key="rerun_start")
+                        rerun_end = st.date_input("End Date", value=default_end, min_value=pd.Timestamp('2002-01-01'), key="rerun_end")
                         rerun_universe = st.radio(
                             "Universe Filter",
                             ["All Securities", "Investable Universe", "Non-Investable Universe"],

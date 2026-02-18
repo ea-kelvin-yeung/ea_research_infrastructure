@@ -1,9 +1,12 @@
 [server]
 # Max size of messages sent between browser and server (in MB)
-maxMessageSize = 500
+maxMessageSize = 1024
 
 # Max upload size for file uploader (in MB)
-maxUploadSize = 500
+maxUploadSize = 1024
+
+# Disable XSRF protection (can cause issues with large uploads)
+enableXsrfProtection = false
 
 [browser]
 # Disable usage statistics
