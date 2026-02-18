@@ -255,6 +255,12 @@ class BacktestFastV2:
         if out["daily_overall"] is not None:
             daily_pl = out["daily_overall"]
             daily_stats = daily_pl.to_pandas()
+            
+            # Add cumret and drawdown (required for tracking/visualization)
+            if 'ret' in daily_stats.columns and len(daily_stats) > 0:
+                daily_stats = daily_stats.sort_values('date').reset_index(drop=True)
+                daily_stats['cumret'] = daily_stats['ret'].cumsum()
+                daily_stats['drawdown'] = daily_stats['cumret'] - daily_stats['cumret'].cummax()
         
         # Build turnover_raw for overall
         turnover_raw = pd.DataFrame()
