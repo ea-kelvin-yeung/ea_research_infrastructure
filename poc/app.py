@@ -728,7 +728,12 @@ def main():
                     if new_name and new_name != current_name:
                         if rename_run(run_id, new_name):
                             st.success(f"Renamed to '{new_name}'")
+                            # Clear both caches so new name shows everywhere
                             get_cached_run_history.clear()
+                            clear_run_cache()
+                            # Clear compare result if it references this run
+                            if 'compare_result' in st.session_state:
+                                del st.session_state['compare_result']
                             st.rerun()
                         else:
                             st.error("Failed to rename experiment")
