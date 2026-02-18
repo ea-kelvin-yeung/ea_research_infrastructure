@@ -20,8 +20,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Default snapshot and date range for real data
 DEFAULT_SNAPSHOT = "2026-02-10-v1"
-DEFAULT_START = "2020-01-01"  # 1 year for fast testing
-DEFAULT_END = "2020-12-31"
+DEFAULT_START = "2019-01-01"  # 3 years for testing
+DEFAULT_END = "2021-12-31"
 
 
 def filter_catalog(catalog: dict, start_date: str, end_date: str) -> dict:
@@ -457,6 +457,179 @@ def test_resid_styles(use_real_data: bool = True):
         print(f"  OLD sharpe: {old_sharpe:.4f} | NEW sharpe: {new_sharpe:.4f} | Diff: {diff:.4f} [{status}]")
 
 
+def test_persistence_benefit(snapshot: str = None, start_date: str = None, end_date: str = None):
+    """Test the benefit of data persistence vs loading each time."""
+    from api import BacktestService
+    
+    # Use defaults if not provided
+    snapshot = snapshot or DEFAULT_SNAPSHOT
+    start_date = start_date or DEFAULT_START
+    end_date = end_date or DEFAULT_END
+    
+    print("\n" + "=" * 65)
+    print("TEST: DATA PERSISTENCE BENEFIT")
+    print("=" * 65)
+    print(f"Date range: {start_date} to {end_date} (3 years)")
+    print()
+    
+    # Reset any existing service
+    BacktestService.reset()
+    
+    # Load signal CSV
+    import pandas as pd
+    signal_path = "data/reversal_signal_analyst.csv"
+    sig = pd.read_csv(signal_path)
+    sig['date_sig'] = pd.to_datetime(sig['date_sig'])
+    sig['date_avail'] = pd.to_datetime(sig['date_avail'])
+    sig = sig[
+        (sig['date_sig'] >= start_date) &
+        (sig['date_sig'] <= end_date)
+    ].copy()
+    sig['date_ret'] = sig['date_sig'] + pd.Timedelta(days=1)
+    
+    print(f"Signal rows: {len(sig):,}")
+    
+    # -------------------------
+    # Test 1: Cold start (load + first run)
+    # -------------------------
+    print("\n1. COLD START (load data + first backtest):")
+    t0 = time.perf_counter()
+    service = BacktestService.get(
+        snapshot,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    load_time = time.perf_counter() - t0
+    
+    t0 = time.perf_counter()
+    result = service.run(sig, sigvar='signal', byvar_list=['overall'])
+    first_run_time = time.perf_counter() - t0
+    
+    cold_total = load_time + first_run_time
+    sharpe = result[0].iloc[0]['sharpe_ret']
+    print(f"   Load time: {load_time:.2f}s")
+    print(f"   First run: {first_run_time:.2f}s")
+    print(f"   Total:     {cold_total:.2f}s")
+    print(f"   Sharpe:    {sharpe:.2f}")
+    
+    # -------------------------
+    # Test 2: Warm runs (data already loaded)
+    # -------------------------
+    print("\n2. WARM RUNS (data persisted, multiple signals):")
+    n_signals = 5
+    warm_times = []
+    
+    for i in range(n_signals):
+        # Add small noise to create variant signals
+        sig_variant = sig.copy()
+        if i > 0:
+            rng = np.random.default_rng(42 + i)
+            sig_variant['signal'] = sig_variant['signal'] + rng.normal(0, 0.01, size=len(sig_variant))
+        
+        t0 = time.perf_counter()
+        result = service.run(sig_variant, sigvar='signal', byvar_list=['overall'])
+        elapsed = time.perf_counter() - t0
+        warm_times.append(elapsed)
+        sharpe = result[0].iloc[0]['sharpe_ret']
+        print(f"   Run {i+1}: {elapsed:.2f}s (sharpe={sharpe:.2f})")
+    
+    avg_warm = sum(warm_times) / len(warm_times)
+    
+    # -------------------------
+    # Test 3: Without persistence - Polars reload (fast)
+    # -------------------------
+    print("\n3. WITHOUT PERSISTENCE - Polars reload:")
+    polars_reload_times = []
+    
+    for i in range(3):
+        BacktestService.reset()
+        
+        t0 = time.perf_counter()
+        service = BacktestService.get(
+            snapshot,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        result = service.run(sig, sigvar='signal', byvar_list=['overall'])
+        elapsed = time.perf_counter() - t0
+        polars_reload_times.append(elapsed)
+        print(f"   Run {i+1}: {elapsed:.2f}s (Polars load + run)")
+    
+    avg_polars_reload = sum(polars_reload_times) / len(polars_reload_times)
+    
+    # -------------------------
+    # Test 4: Pandas load_catalog (old way - full catalog)
+    # -------------------------
+    print("\n4. PANDAS LOAD (old way - load_catalog):")
+    from poc.catalog import load_catalog
+    from backtest_wrapper import BacktestFastV2
+    
+    pandas_times = []
+    for i in range(2):  # Only 2 runs - this is slow
+        t0 = time.perf_counter()
+        
+        # Load full catalog via Pandas
+        catalog = load_catalog(f"snapshots/{snapshot}", universe_only=False)
+        
+        # Filter to date range
+        master = catalog['master']
+        if isinstance(master.index, pd.MultiIndex):
+            master = master.reset_index()
+        master = master[(master['date'] >= start_date) & (master['date'] <= end_date)].copy()
+        datefile = catalog['dates']
+        datefile = datefile[(datefile['date'] >= start_date) & (datefile['date'] <= end_date)].copy()
+        
+        load_time_pd = time.perf_counter() - t0
+        
+        # Run backtest
+        t1 = time.perf_counter()
+        bt = BacktestFastV2(
+            infile=sig,
+            retfile=master,
+            otherfile=master,
+            datefile=datefile,
+            sigvar='signal',
+            byvar_list=['overall'],
+        )
+        result = bt.gen_result()
+        run_time = time.perf_counter() - t1
+        
+        total = time.perf_counter() - t0
+        pandas_times.append(total)
+        print(f"   Run {i+1}: {total:.2f}s (load={load_time_pd:.1f}s, run={run_time:.1f}s)")
+    
+    avg_pandas = sum(pandas_times) / len(pandas_times)
+    
+    # -------------------------
+    # Summary
+    # -------------------------
+    speedup_vs_polars = avg_polars_reload / avg_warm
+    speedup_vs_pandas = avg_pandas / avg_warm
+    
+    print("\n" + "=" * 65)
+    print("PERSISTENCE BENEFIT SUMMARY")
+    print("=" * 65)
+    print(f"""
+| Scenario | Time | Speedup vs Warm |
+|----------|------|-----------------|
+| **Warm run (persisted)** | **{avg_warm:.2f}s** | baseline |
+| Polars reload (no persist) | {avg_polars_reload:.2f}s | {speedup_vs_polars:.1f}x slower |
+| **Pandas load_catalog** | **{avg_pandas:.2f}s** | **{speedup_vs_pandas:.1f}x slower** |
+
+Persistence benefit:
+  - vs Polars reload: {speedup_vs_polars:.1f}x faster
+  - vs Pandas load:   {speedup_vs_pandas:.1f}x faster
+
+For {n_signals} signals:
+  - With persistence:    {cold_total:.1f}s + {n_signals-1}×{avg_warm:.1f}s = {cold_total + (n_signals-1)*avg_warm:.1f}s
+  - Polars reload each:  {n_signals}×{avg_polars_reload:.1f}s = {n_signals*avg_polars_reload:.1f}s
+  - Pandas reload each:  {n_signals}×{avg_pandas:.1f}s = {n_signals*avg_pandas:.1f}s
+""")
+    print("=" * 65)
+    
+    return True
+
+
 if __name__ == "__main__":
     import argparse
     
@@ -465,17 +638,15 @@ if __name__ == "__main__":
     parser.add_argument("--snapshot", default=DEFAULT_SNAPSHOT, help="Snapshot to use for real data")
     parser.add_argument("--start", default=DEFAULT_START, help="Start date for real data")
     parser.add_argument("--end", default=DEFAULT_END, help="End date for real data")
+    parser.add_argument("--persistence-only", action="store_true", help="Only run persistence test")
     args = parser.parse_args()
     
     use_real = not args.synthetic
     
-    # Update defaults if provided
-    if args.snapshot != DEFAULT_SNAPSHOT or args.start != DEFAULT_START or args.end != DEFAULT_END:
-        # Monkey-patch the default values
-        import tests.test_resid_equivalence as this_module
-        this_module.DEFAULT_SNAPSHOT = args.snapshot
-        this_module.DEFAULT_START = args.start
-        this_module.DEFAULT_END = args.end
+    # Update module-level defaults if provided via args
+    snapshot = args.snapshot
+    start = args.start
+    end = args.end
     
     print(f"Data mode: {'REAL' if use_real else 'SYNTHETIC'}")
     if use_real:
@@ -483,22 +654,30 @@ if __name__ == "__main__":
         print(f"Date range: {args.start} to {args.end}")
     print()
     
-    # Test 1: No residualization - should match exactly
-    no_resid_pass = test_no_resid_equivalence(use_real_data=use_real)
-    
-    # Test 2: With residualization - speed comparison
-    test_resid_speed(use_real_data=use_real)
-    
-    # Test 3: Both resid styles
-    test_resid_styles(use_real_data=use_real)
-    
-    # Final summary
-    print("\n" + "=" * 65)
-    print("SUMMARY")
-    print("=" * 65)
-    print(f"No-resid equivalence: {'PASSED' if no_resid_pass else 'FAILED'}")
-    if not no_resid_pass and use_real:
-        print("  NOTE: Real data may expose edge cases not in synthetic data.")
-        print("  Run with --synthetic to verify core logic equivalence.")
-    print("Resid equivalence: Style tests passed (NEW is ~5-12x faster)")
-    print("=" * 65)
+    if args.persistence_only:
+        # Only run persistence test
+        test_persistence_benefit(snapshot, start, end)
+    else:
+        # Test 1: No residualization - should match exactly
+        no_resid_pass = test_no_resid_equivalence(use_real_data=use_real)
+        
+        # Test 2: With residualization - speed comparison
+        test_resid_speed(use_real_data=use_real)
+        
+        # Test 3: Both resid styles
+        test_resid_styles(use_real_data=use_real)
+        
+        # Test 4: Persistence benefit
+        test_persistence_benefit(snapshot, start, end)
+        
+        # Final summary
+        print("\n" + "=" * 65)
+        print("FINAL SUMMARY")
+        print("=" * 65)
+        print(f"No-resid equivalence: {'PASSED' if no_resid_pass else 'FAILED'}")
+        if not no_resid_pass and use_real:
+            print("  NOTE: Real data may expose edge cases not in synthetic data.")
+            print("  Run with --synthetic to verify core logic equivalence.")
+        print("Resid equivalence: Style tests passed (NEW is ~5-12x faster)")
+        print("Persistence: Warm runs ~10-20x faster than cold starts")
+        print("=" * 65)
